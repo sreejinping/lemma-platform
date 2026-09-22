@@ -32,20 +32,59 @@ _NEXT_STEP: dict[int, str] = {
     409: "Something with that name already exists — pick another, or update it.",
 }
 
+# A connector operation that failed *at the provider* comes back with the
+# provider's status, so a provider 403 is indistinguishable by status alone from
+# Lemma's own and the line above sent the user to audit pod grants and org roles
+# that were never the problem. The code is what names the actor: these
+# OPERATION_EXECUTION_* codes are set only for a failure the provider itself
+# described (see the backend's failure_translation), so the code decides the next
+# step and the status table is not consulted. A Lemma 403 carries no such code
+# and keeps its line.
+_PROVIDER_NEXT_STEP: dict[str, str] = {
+    "OPERATION_EXECUTION_UNAUTHORIZED": (
+        "The provider rejected the connected account's authorization — "
+        "reconnect the account, then retry."
+    ),
+    "OPERATION_EXECUTION_ACCESS_DENIED": (
+        "The provider refused this for the connected account or app — the "
+        "permission is missing at the provider, not in Lemma. Fix it there, "
+        "reconnect the account, then retry "
+        "(`lemma connectors overview` names the account and app)."
+    ),
+    "OPERATION_EXECUTION_NOT_FOUND": (
+        "The provider does not have the resource this operation names — check "
+        "the operation's inputs, and that the connected account can see it."
+    ),
+}
+
+
+def _retry_wait(exc: object) -> str:
+    """The "wait this long" clause, when the server advised one."""
+    retry_after = getattr(exc, "retry_after", None)
+    return (
+        f"Wait {retry_after:g}s and try again"
+        if isinstance(retry_after, (int, float))
+        else "Wait and try again"
+    )
+
 
 def next_step_for(exc: object) -> str | None:
     """The one-line "now do this" for an API error, or None if there isn't one."""
+    code = getattr(exc, "code", None)
+    if isinstance(code, str):
+        provider_step = _PROVIDER_NEXT_STEP.get(code)
+        if provider_step is not None:
+            return provider_step
+        if code == "OPERATION_EXECUTION_RATE_LIMITED":
+            # The provider's limit, not Lemma's: "ask an admin to raise it" is
+            # not something a user can do at the provider.
+            return f"The connector provider is rate limiting this. {_retry_wait(exc)}."
+
     status = getattr(exc, "status_code", None)
     if status == 429:
         # 429 carries its own wait, when the server advised one. Kept out of the
         # table because the message depends on the exception, not just the code.
-        retry_after = getattr(exc, "retry_after", None)
-        wait = (
-            f"Wait {retry_after:g}s and try again"
-            if isinstance(retry_after, (int, float))
-            else "Wait and try again"
-        )
-        return f"Rate limited. {wait}, or ask an admin to raise the limit."
+        return f"Rate limited. {_retry_wait(exc)}, or ask an admin to raise the limit."
     return _NEXT_STEP.get(status) if isinstance(status, int) else None
 
 
