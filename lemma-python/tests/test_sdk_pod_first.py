@@ -329,6 +329,32 @@ def test_pod_connectors_execute_asks_to_be_the_app_when_told_to():
     }
 
 
+def test_pod_connectors_facade_forwards_the_app_identity_choice():
+    """The facade forwards `act_as`; a dropped forward would ship silently."""
+    transport = StubTransport()
+    pod = Pod(
+        "22222222-2222-4222-8222-222222222222",
+        org_id="11111111-1111-4111-8111-111111111111",
+        token="token",
+        base_url="https://api.example.test",
+    )
+    pod._transport = transport
+    pod.connectors._transport = transport
+    pod.connectors.operations._parent._transport = transport
+
+    pod.connectors.execute(
+        "github",
+        "pulls_create_review",
+        {"body": "looks good"},
+        act_as="app",
+    )
+
+    assert transport.calls[0]["body"] == {
+        "payload": {"body": "looks good"},
+        "act_as": "app",
+    }
+
+
 def test_connectors_triggers_list_uses_org_and_auth_config_path_args():
     transport = StubTransport()
     lemma = Lemma(

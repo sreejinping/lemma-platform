@@ -17,6 +17,9 @@ from pydantic import ValidationError
 from app.modules.connectors.api.schemas.connector_operation_schemas import (
     OperationExecutionRequest,
 )
+from app.modules.connectors.application.connector_operation_use_cases import (
+    ConnectorOperationUseCases,
+)
 from app.modules.connectors.domain.execution_plan import ResolvedConnectorExecution
 from app.modules.connectors.domain.kinds import ExecutionRequest
 from app.modules.connectors.services.connector_operation_service import (
@@ -40,6 +43,10 @@ def test_every_layer_defaults_to_the_person():
     for name in ("resolve_execution", "resolve_execution_for_auth_config"):
         signature = inspect.signature(getattr(ConnectorOperationService, name))
         assert signature.parameters["act_as"].default == "user", name
+    use_case = inspect.signature(
+        ConnectorOperationUseCases.execute_operation_for_auth_config
+    )
+    assert use_case.parameters["act_as"].default == "user"
 
 
 def test_the_execute_request_defaults_to_the_person_and_admits_only_the_two():

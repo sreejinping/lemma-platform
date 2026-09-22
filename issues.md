@@ -37,6 +37,16 @@ the thing that is wrong — resolve it with a product decision before writing co
 
 ## Open
 
+### DEV-CONN-001 — A caller may choose the connector's bot identity, whatever its own permissions
+**Violates:** PS-CONN-031
+**Severity:** question
+**Where:** `lemma-backend/app/modules/connectors/api/schemas/connector_operation_schemas.py:118` (the request's `act_as`), threaded through `connector_operation_controller.py:160` and `application/connector_operation_use_cases.py:76` to `services/execution/github_presenter.py:49`.
+**Required:** PS-CONN-031 says an operation's identity does not vary by caller, by request, or by anything a workload can influence, and that where an application identity is used it is used "for every caller alike".
+**Actual:** The execute request takes an optional `act_as` (`"user"` by default), so a caller may ask to run an operation as the connector's own application identity. It is still bounded by the operation's route -- `github_token_kind == "user_only"` keeps the person's token, and an install with no installation id falls back to it -- and by the installation the resolved account is bound to. What is not bounded is the width: a GitHub installation token carries the App's granted permissions, which can exceed the caller's own within the installation, so a member with read-only access to a repository can act there with the App's write permission.
+**Why it matters:** Within one installation, a caller can exercise reach it does not have itself. The pod/agent connector path already presented the App identity (`agent/tools/connectors/pydantic_adapter.py:248` hardcodes `act_as="app"`); this change makes the same choice available to the REST endpoint and the Python SDK, and defaults to the person.
+**Fix:** A product decision, not a code fix: either update PS-CONN-031 to state the per-call choice and bound the App identity to the caller's own permissions, or drop the request-level choice and leave identity fixed by the connector as the promise says. The decision on this branch was to expose the choice so a pod function can post as the connector's bot; the promise is left standing and marked `gap` until it is reconciled.
+**How it was found:** implementing the per-call choice requested on thread `LEM-4`, and the spec-integrity review of that change.
+
 ### DEV-SURF-001 — A disabled surface drops every message to it, in silence
 **Violates:** nothing — and that is the finding. No statement defines what a
 *disabled* surface does with an inbound message.
