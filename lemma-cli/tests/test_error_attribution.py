@@ -264,9 +264,7 @@ def test_a_provider_404_does_not_point_at_lemmas_server_config():
     wrong pod or server."""
     from lemma_sdk.errors import api_error
 
-    out = _both_paths(
-        api_error(404, "not found", code="OPERATION_EXECUTION_NOT_FOUND")
-    )
+    out = _both_paths(api_error(404, "not found", code="OPERATION_EXECUTION_NOT_FOUND"))
 
     assert "provider" in out
     assert "lemma config show" not in out
