@@ -298,7 +298,33 @@ def test_pod_connectors_execute_uses_bound_org_id():
         "GMAIL_SEND_EMAIL",
     )
     assert transport.calls[0]["body"] == {
-        "payload": {"to": "a@example.com", "subject": "Hi"}
+        "payload": {"to": "a@example.com", "subject": "Hi"},
+        "act_as": "user",
+    }
+
+
+def test_pod_connectors_execute_asks_to_be_the_app_when_told_to():
+    transport = StubTransport()
+    pod = Pod(
+        "22222222-2222-4222-8222-222222222222",
+        org_id="11111111-1111-4111-8111-111111111111",
+        token="token",
+        base_url="https://api.example.test",
+    )
+    pod._transport = transport
+    pod.connectors._transport = transport
+    pod.connectors.operations._parent._transport = transport
+
+    pod.connectors.operations.execute(
+        "github",
+        "pulls_create_review",
+        {"body": "looks good"},
+        act_as="app",
+    )
+
+    assert transport.calls[0]["body"] == {
+        "payload": {"body": "looks good"},
+        "act_as": "app",
     }
 
 

@@ -330,6 +330,7 @@ _NAME_TO_MODULE = {
     'OperationDiscoverySchema': 'operation_discovery_schema',
     'OperationDiscoveryStatus': 'operation_discovery_status',
     'OperationExecutionRequest': 'operation_execution_request',
+    'OperationExecutionRequestActAs': 'operation_execution_request_act_as',
     'OperationExecutionRequestPayload': 'operation_execution_request_payload',
     'OperationExecutionResponse': 'operation_execution_response',
     'OperationSummary': 'operation_summary',
@@ -885,6 +886,7 @@ if TYPE_CHECKING:
     from .operation_discovery_schema import OperationDiscoverySchema
     from .operation_discovery_status import OperationDiscoveryStatus
     from .operation_execution_request import OperationExecutionRequest
+    from .operation_execution_request_act_as import OperationExecutionRequestActAs
     from .operation_execution_request_payload import OperationExecutionRequestPayload
     from .operation_execution_response import OperationExecutionResponse
     from .operation_summary import OperationSummary
@@ -1453,6 +1455,7 @@ __all__ = [
     'OperationDiscoverySchema',
     'OperationDiscoveryStatus',
     'OperationExecutionRequest',
+    'OperationExecutionRequestActAs',
     'OperationExecutionRequestPayload',
     'OperationExecutionResponse',
     'OperationSummary',

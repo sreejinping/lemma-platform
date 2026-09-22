@@ -4,5 +4,12 @@
 /* eslint-disable */
 export type OperationExecutionRequest = {
     account_id?: (string | null);
+    act_as?: OperationExecutionRequest.act_as;
     payload: Record<string, any>;
 };
+export namespace OperationExecutionRequest {
+    export enum act_as {
+        USER = 'user',
+        APP = 'app',
+    }
+}

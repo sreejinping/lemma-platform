@@ -12,7 +12,11 @@ import inspect
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
+from app.modules.connectors.api.schemas.connector_operation_schemas import (
+    OperationExecutionRequest,
+)
 from app.modules.connectors.domain.execution_plan import ResolvedConnectorExecution
 from app.modules.connectors.domain.kinds import ExecutionRequest
 from app.modules.connectors.services.connector_operation_service import (
@@ -36,6 +40,19 @@ def test_every_layer_defaults_to_the_person():
     for name in ("resolve_execution", "resolve_execution_for_auth_config"):
         signature = inspect.signature(getattr(ConnectorOperationService, name))
         assert signature.parameters["act_as"].default == "user", name
+
+
+def test_the_execute_request_defaults_to_the_person_and_admits_only_the_two():
+    """The wire shape is where the choice enters the system.
+
+    Omission has to mean "the person" here first, or the default at every hop
+    below it is answering a question the caller never asked. Anything other than
+    the two identities is refused rather than passed down to be interpreted.
+    """
+    assert OperationExecutionRequest(payload={}).act_as == "user"
+    assert OperationExecutionRequest(payload={}, act_as="app").act_as == "app"
+    with pytest.raises(ValidationError):
+        OperationExecutionRequest(payload={}, act_as="bot")
 
 
 def _callers_asking_to_be_the_app() -> set[str]:

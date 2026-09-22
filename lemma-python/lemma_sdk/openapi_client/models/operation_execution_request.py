@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Any, TypeVar, cast
 from attrs import define as _attrs_define
 from attrs import field as _attrs_field
 
+from ..models.operation_execution_request_act_as import OperationExecutionRequestActAs
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
@@ -23,10 +24,12 @@ class OperationExecutionRequest:
     Attributes:
         payload (OperationExecutionRequestPayload):
         account_id (None | str | Unset):
+        act_as (OperationExecutionRequestActAs | Unset):  Default: OperationExecutionRequestActAs.USER.
     """
 
     payload: OperationExecutionRequestPayload
     account_id: None | str | Unset = UNSET
+    act_as: OperationExecutionRequestActAs | Unset = OperationExecutionRequestActAs.USER
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -38,6 +41,10 @@ class OperationExecutionRequest:
         else:
             account_id = self.account_id
 
+        act_as: str | Unset = UNSET
+        if not isinstance(self.act_as, Unset):
+            act_as = self.act_as.value
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -47,6 +54,8 @@ class OperationExecutionRequest:
         )
         if account_id is not UNSET:
             field_dict["account_id"] = account_id
+        if act_as is not UNSET:
+            field_dict["act_as"] = act_as
 
         return field_dict
 
@@ -68,9 +77,17 @@ class OperationExecutionRequest:
 
         account_id = _parse_account_id(d.pop("account_id", UNSET))
 
+        _act_as = d.pop("act_as", UNSET)
+        act_as: OperationExecutionRequestActAs | Unset
+        if isinstance(_act_as, Unset):
+            act_as = UNSET
+        else:
+            act_as = OperationExecutionRequestActAs(_act_as)
+
         operation_execution_request = cls(
             payload=payload,
             account_id=account_id,
+            act_as=act_as,
         )
 
         operation_execution_request.additional_properties = d

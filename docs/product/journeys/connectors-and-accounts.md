@@ -15,12 +15,13 @@ behalf.
 
 Some providers offer a second identity that is not a person's at all — a GitHub
 App installed on an organization acts as itself, against the repositories that
-organization granted it. Where a connector has one, the pod may act as *it*
-instead of as a person, which is how work survives the person who set it up. It
-does not weaken the promise above: the App is not somebody's credential, its
-reach is whatever the organization granted the installation and no more, and
-which of the two identities a given operation uses is fixed by the connector
-rather than chosen per call. PS-CONN-031 says which is which.
+organization granted it. Where a connector has one, a caller may ask to act as
+*it* instead of as a person, which is how work survives the person who set it
+up. It does not weaken the promise above: the App is not somebody's credential,
+its reach is whatever the organization granted the installation and no more,
+the person's account is what a caller gets unless it asks otherwise, and an
+operation the App cannot reach stays the person's however it is asked for.
+PS-CONN-031 says which is which.
 
 ---
 
@@ -179,7 +180,7 @@ rather than chosen per call. PS-CONN-031 says which is which.
 
 **Contracts:** `connector.operation.search`, `connector.operation.discover`, `connector.operation.detail`, `connector.operation.details.batch`, `connector.auth_config.refresh_operations`
 
-### PS-CONN-031 — An operation runs as the identity its connector is bound to
+### PS-CONN-031 — An operation runs as the identity the caller asks for
 **Status:** covered
 
 - When a person runs an operation, the system shall run it using their own
@@ -189,13 +190,14 @@ rather than chosen per call. PS-CONN-031 says which is which.
 - While an agent or function runs an operation on a person's behalf through a
   connector whose identity is a person's account, the system shall use that
   person's account and shall not fall back to anyone else's.
-- Where a connector's operations run under an application identity the
-  organization installed rather than under any person's account, the system
-  shall use that identity for every caller alike, and shall keep it inside what
-  the organization granted that installation. A person's own account shall not
-  be substituted for it, nor it for a person's account.
-- The system shall not let the choice between the two vary by caller, by
-  request, or by anything a workload can influence.
+- Where a connector offers an application identity the organization
+  installed, a caller may ask for it rather than for a person's account. The
+  system shall use the application identity only for the installation the
+  account the call resolved to is bound to, and shall keep it inside what the
+  organization granted that installation.
+- A caller that asks for nothing shall act as the person, and an operation the
+  application identity cannot reach shall act as the person even when that
+  identity is asked for.
 - If a person runs an operation for a connector they have not connected, then
   the system shall refuse and shall tell them to connect first.
 

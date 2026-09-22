@@ -246,6 +246,12 @@ _HTTP_EXECUTOR_SEAM = (
     "app.modules.connectors.infrastructure.adapters.openapi_http_executor."
     "OpenApiHttpExecutor.execute"
 )
+# Minting a GitHub installation token is a call to GitHub, so it is stood in
+# rather than made. Named as a string seam like the executor above: the
+# presenter is the collaborator under test, not the unit.
+_INSTALLATION_TOKEN_SEAM = (
+    "app.modules.connectors.services.execution.github_presenter.installation_token"
+)
 
 
 @pytest.mark.asyncio
@@ -364,6 +370,124 @@ async def test_connector_operations_use_connected_user_account(
 
         # The connected account's credentials reached the upstream call.
         assert seen["credentials"] == {"api_key": "secret"}
+
+
+@pytest.mark.asyncio
+async def test_execute_act_as_reaches_the_presenter(
+    authenticated_client: AsyncClient,
+    fixed_test_user,
+    fixed_test_org,
+    db_session,
+):
+    """The REST body's `act_as` has to survive every hop to the presenter.
+
+    The presenter unit tests prove the decision; this proves the endpoint can
+    even ask for it. Nothing said `act_as` before, so every REST call was the
+    person's -- including a pod function's, which is the caller that wanted the
+    bot identity and had no way to ask.
+    """
+    app_id = "github"
+    app = await db_session.get(Connector, app_id)
+    if not app:
+        app = _connector(
+            app_id=app_id,
+            title="GitHub",
+            description="GitHub",
+            kind=ConnectorKind.HTTP.value,
+            auth_method=AuthMethod.OAUTH2.value,
+        )
+        db_session.add(app)
+        await db_session.flush()
+    auth_config = await _seed_auth_config(
+        db_session,
+        app_id=app_id,
+        organization_id=fixed_test_org["id"],
+        kind=ConnectorKind.HTTP.value,
+    )
+    operations_url = (
+        f"/organizations/{fixed_test_org['id']}/connectors/"
+        f"{auth_config.name}/operations"
+    )
+
+    suffix = uuid4().hex[:8]
+    installation_route = f"pulls_create_review_{suffix}"
+    user_only_route = f"users_get_authenticated_{suffix}"
+    account_id = uuid4()
+    db_session.add(
+        Account(
+            id=account_id,
+            connector_id=app_id,
+            user_id=fixed_test_user["id"],
+            organization_id=fixed_test_org["id"],
+            auth_config_id=auth_config.id,
+            # The installation the account is bound to; the presenter mints
+            # against this, not against anything the request supplies.
+            external_ref="158040062",
+            credentials={"access_token": "gho_the_person", "token_type": "Bearer"},
+            is_default=True,
+        )
+    )
+    for name, token_kind in (
+        (installation_route, "installation_ok"),
+        (user_only_route, "user_only"),
+    ):
+        db_session.add(
+            ConnectorOperation(
+                id=f"{app_id}:{name}",
+                connector_id=app_id,
+                kind=ConnectorKind.HTTP.value,
+                name=name,
+                provider_operation_name=name,
+                display_name=name,
+                description="A test operation",
+                input_schema={"type": "object", "properties": {}},
+                execution={"github_token_kind": token_kind},
+            )
+        )
+    await db_session.commit()
+
+    async def _installation_token(installation_id, **_kwargs):
+        return "ghs_the_app"
+
+    seen: list[dict] = []
+
+    async def mock_execute(_self, *, payload, third_party_credentials, **_kwargs):
+        seen.append(third_party_credentials)
+        return {"ok": True}
+
+    with (
+        patch(_INSTALLATION_TOKEN_SEAM, new=_installation_token),
+        patch(_HTTP_EXECUTOR_SEAM, new=mock_execute),
+    ):
+
+        async def _run(operation: str, body: dict) -> object:
+            return await authenticated_client.post(
+                f"{operations_url}/{operation}/execute",
+                json={"payload": {}, "account_id": str(account_id), **body},
+            )
+
+        asked_for_app = await _run(installation_route, {"act_as": "app"})
+        assert asked_for_app.status_code == 200, asked_for_app.text
+        assert seen[-1]["access_token"] == "ghs_the_app"
+        assert seen[-1]["token_type"] == "Bearer"
+
+        said_nothing = await _run(installation_route, {})
+        assert said_nothing.status_code == 200, said_nothing.text
+        assert seen[-1]["access_token"] == "gho_the_person"
+
+        said_user = await _run(installation_route, {"act_as": "user"})
+        assert said_user.status_code == 200, said_user.text
+        assert seen[-1]["access_token"] == "gho_the_person"
+
+        # A route an installation token cannot reach keeps the person even when
+        # the app identity is asked for.
+        user_only = await _run(user_only_route, {"act_as": "app"})
+        assert user_only.status_code == 200, user_only.text
+        assert seen[-1]["access_token"] == "gho_the_person"
+
+        # Anything that is not one of the two is refused rather than guessed.
+        rejected = await _run(installation_route, {"act_as": "bot"})
+        assert rejected.status_code == 422, rejected.text
 
 
 @pytest.mark.asyncio

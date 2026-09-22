@@ -73,6 +73,7 @@ class ConnectorOperationUseCases:
         user_id: UUID,
         request: Request,
         account_id: UUID | None = None,
+        act_as: str = "user",
     ) -> OperationExecutionResponse:
         # Phase 1 (short scope): build + bind the request Context (org/delegation
         # aware), resolve all DB state + authorize + resolve credentials. The
@@ -89,6 +90,7 @@ class ConnectorOperationUseCases:
                 payload=payload,
                 actor=scope.ctx,
                 account_id=account_id,
+                act_as=act_as,
             )
 
         # Phase 2: the external operation call, with NO pooled connection held.

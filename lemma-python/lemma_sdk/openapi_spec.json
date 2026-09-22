@@ -10447,6 +10447,15 @@
             ],
             "title": "Account Id"
           },
+          "act_as": {
+            "default": "user",
+            "enum": [
+              "user",
+              "app"
+            ],
+            "title": "Act As",
+            "type": "string"
+          },
           "payload": {
             "additionalProperties": true,
             "title": "Payload",

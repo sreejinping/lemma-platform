@@ -245,7 +245,7 @@ export type { OperationDetailsBatchResponse } from './models/OperationDetailsBat
 export type { OperationDiscoverResponse } from './models/OperationDiscoverResponse.js';
 export type { OperationDiscoverySchema } from './models/OperationDiscoverySchema.js';
 export { OperationDiscoveryStatus } from './models/OperationDiscoveryStatus.js';
-export type { OperationExecutionRequest } from './models/OperationExecutionRequest.js';
+export { OperationExecutionRequest } from './models/OperationExecutionRequest.js';
 export type { OperationExecutionResponse } from './models/OperationExecutionResponse.js';
 export type { OperationSummary } from './models/OperationSummary.js';
 export type { OrganizationCreateRequest } from './models/OrganizationCreateRequest.js';
