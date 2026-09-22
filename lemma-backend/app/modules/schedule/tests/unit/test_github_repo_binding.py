@@ -39,6 +39,23 @@ class TestWhatTheDeliverySays:
             "repo": {"owner": "octo", "repo": "api", "ref": "feature/commas"}
         }
 
+    def test_a_review_binds_to_the_branch_under_review(self):
+        """A review and an inline comment carry the pull request they are about.
+
+        Their findings were written against that pull request's head, so an
+        agent woken by one that lands on `main` has to go looking for the branch
+        before it can answer any of them.
+        """
+        for event in ("pull_request_review", "pull_request_review_comment"):
+            context = _repo_context(
+                {
+                    "repository": REPOSITORY,
+                    "pull_request": {"head": {"ref": "feature/commas"}},
+                },
+                event,
+            )
+            assert context["repo"]["ref"] == "feature/commas", event
+
     def test_a_push_binds_to_the_branch_it_pushed(self):
         context = _repo_context(
             {"repository": REPOSITORY, "ref": "refs/heads/topic"}, "push"
