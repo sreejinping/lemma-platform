@@ -2,6 +2,8 @@ from typing import Any, Dict, Optional
 
 from pydantic import BaseModel, Field
 
+from app.modules.connectors.domain.kinds import ActingIdentity
+
 
 class OperationSummary(BaseModel):
     """Compact operation metadata for discovery flows."""
@@ -108,6 +110,12 @@ class OperationDetailsBatchResponse(BaseModel):
 class OperationExecutionRequest(BaseModel):
     payload: Dict[str, Any]
     account_id: str | None = None
+    #: Which of an account's identities this call should present as. "app" asks
+    #: for the connector's own application identity where it has one and the
+    #: operation's route allows it; "user" -- the default -- keeps whichever
+    #: identity the connected account carries. A caller that says nothing keeps
+    #: the behaviour it had before the field existed.
+    act_as: ActingIdentity = "user"
 
 
 class OperationExecutionResponse(BaseModel):

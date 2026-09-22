@@ -180,7 +180,22 @@ rather than chosen per call. PS-CONN-031 says which is which.
 **Contracts:** `connector.operation.search`, `connector.operation.discover`, `connector.operation.detail`, `connector.operation.details.batch`, `connector.auth_config.refresh_operations`
 
 ### PS-CONN-031 — An operation runs as the identity its connector is bound to
-**Status:** covered
+**Status:** gap
+
+> **Gap:** the identity no longer varies only with the connector. The execute
+> request now takes an optional `act_as`, so a caller may ask to run an
+> operation as the App's installation token instead of the person's -- added by
+> product decision so a pod function can post as the connector's bot. The
+> choice is still bounded by the route (`github_token_kind` keeps the
+> user-only routes on the person's token) and by the installation the resolved
+> account is bound to, but the installation token carries the App's granted
+> permissions, which can exceed the caller's own within the installation. The
+> new request-level clauses are proved by the backend module suite
+> (`connectors/tests/unit/test_github_presenter.py`,
+> `connectors/tests/e2e/test_connector_operations.py`), not by a scenario: the
+> scenario suite stands in no real App installation. The divergence and the
+> accepted residual reach are recorded as `DEV-CONN-001` in
+> [issues.md](../../../issues.md).
 
 - When a person runs an operation, the system shall run it using their own
   connected account.

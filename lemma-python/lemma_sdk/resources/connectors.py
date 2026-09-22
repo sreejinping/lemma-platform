@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from typing import Literal
+
 from ..openapi_client.api.connectors import (
     connector_account_create,
     connector_account_update,
@@ -99,6 +101,9 @@ from ..openapi_client.models.operation_execution_response import (
 )
 from ..types import ConnectorPayload, JsonObject
 from .base import BoundResource, compact
+
+#: Who a connector call presents as. Mirrors the backend's `ActingIdentity`.
+ActingIdentity = Literal["user", "app"]
 
 
 class ConnectorApps:
@@ -307,13 +312,29 @@ class ConnectorOperations:
         payload: ConnectorPayload,
         *,
         account_id: str | None = None,
+        act_as: ActingIdentity = "user",
     ) -> OperationExecutionResponse:
+        """Run one operation.
+
+        `act_as="app"` asks to present as the connector's own application
+        identity rather than as the connected account's person -- a pod function
+        posting a review as the connector's bot instead of as whoever connected
+        GitHub. It is a request, not a guarantee: where the operation's route is
+        one an installation token cannot reach, or the account has no
+        application identity, the person's credentials are used and the call
+        still runs.
+        """
+        body = {"payload": payload, "account_id": account_id}
+        if act_as != "user":
+            # "user" is the request's own default, so a caller that did not ask
+            # for the app identity sends exactly the request it always sent.
+            body["act_as"] = act_as
         return self._parent._call(
             connector_operation_execute,
             self._parent._org_uuid(),
             auth_config,
             operation,
-            body=compact({"payload": payload, "account_id": account_id}),
+            body=compact(body),
             body_model=OperationExecutionRequest,
         )
 
@@ -364,12 +385,15 @@ class BoundConnectors(BoundResource):
         payload: ConnectorPayload,
         *,
         account_id: str | None = None,
+        act_as: ActingIdentity = "user",
     ) -> OperationExecutionResponse:
+        """Run one operation. See `ConnectorOperations.execute` for `act_as`."""
         return self.operations.execute(
             auth_config,
             operation,
             payload,
             account_id=account_id,
+            act_as=act_as,
         )
 
     def connect_request(
