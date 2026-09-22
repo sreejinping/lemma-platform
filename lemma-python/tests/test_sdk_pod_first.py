@@ -297,9 +297,10 @@ def test_pod_connectors_execute_uses_bound_org_id():
         "gmail",
         "GMAIL_SEND_EMAIL",
     )
+    # A caller that says nothing sends the request it always sent: "user" is
+    # the request's own default, so the field is absent rather than repeated.
     assert transport.calls[0]["body"] == {
-        "payload": {"to": "a@example.com", "subject": "Hi"},
-        "act_as": "user",
+        "payload": {"to": "a@example.com", "subject": "Hi"}
     }
 
 

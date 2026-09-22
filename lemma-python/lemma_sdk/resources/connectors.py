@@ -324,14 +324,17 @@ class ConnectorOperations:
         application identity, the person's credentials are used and the call
         still runs.
         """
+        body = {"payload": payload, "account_id": account_id}
+        if act_as != "user":
+            # "user" is the request's own default, so a caller that did not ask
+            # for the app identity sends exactly the request it always sent.
+            body["act_as"] = act_as
         return self._parent._call(
             connector_operation_execute,
             self._parent._org_uuid(),
             auth_config,
             operation,
-            body=compact(
-                {"payload": payload, "account_id": account_id, "act_as": act_as}
-            ),
+            body=compact(body),
             body_model=OperationExecutionRequest,
         )
 
