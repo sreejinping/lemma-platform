@@ -203,6 +203,94 @@ def test_a_rate_limit_message_does_not_claim_the_command_was_an_export():
     assert "30" in out
 
 
+# --- a provider's refusal is not Lemma's ----------------------------------
+
+
+def _both_paths(exc) -> str:
+    """What both error paths print for `exc`, joined; the hint is shared."""
+    import contextlib
+    import io
+
+    from lemma_cli.cli_core.errors import report_cli_error
+    from lemma_cli.cli_core.state import humanize_error
+
+    buffer = io.StringIO()
+    with contextlib.redirect_stderr(buffer):
+        assert report_cli_error(exc)
+    return buffer.getvalue() + "\n" + humanize_error(exc)
+
+
+def test_a_provider_403_does_not_blame_lemma_grants():
+    """GitHub's own 403 is translated to OPERATION_EXECUTION_ACCESS_DENIED, so
+    the error carried the provider's status and the status-only hint sent the
+    user to audit pod grants and org roles while the connected app was the one
+    missing a permission. The code says who refused."""
+    from lemma_sdk.errors import api_error
+
+    out = _both_paths(
+        api_error(403, "access denied", code="OPERATION_EXECUTION_ACCESS_DENIED")
+    )
+
+    assert "provider" in out
+    assert "pod grant" not in out
+    assert "org role" not in out
+
+
+def test_a_lemma_403_still_points_at_grants():
+    """No OPERATION_EXECUTION_* code means Lemma refused, and the grant hint is
+    the right one."""
+    from lemma_sdk.errors import api_error
+
+    out = _both_paths(api_error(403, "forbidden", code="CONNECTOR_ACCESS_DENIED"))
+
+    assert "pod grant" in out
+
+
+def test_a_provider_401_does_not_send_the_user_to_auth_login():
+    """A connector account the provider rejects is not an expired Lemma
+    session, so `lemma auth login` is the wrong next step."""
+    from lemma_sdk.errors import api_error
+
+    out = _both_paths(
+        api_error(401, "unauthorized", code="OPERATION_EXECUTION_UNAUTHORIZED")
+    )
+
+    assert "provider" in out
+    assert "lemma auth login" not in out
+
+
+def test_a_provider_404_does_not_point_at_lemmas_server_config():
+    """The provider not finding a resource is not the user being pointed at the
+    wrong pod or server."""
+    from lemma_sdk.errors import api_error
+
+    out = _both_paths(
+        api_error(404, "not found", code="OPERATION_EXECUTION_NOT_FOUND")
+    )
+
+    assert "provider" in out
+    assert "lemma config show" not in out
+
+
+def test_a_provider_429_does_not_advise_raising_lemmas_limit():
+    """The provider's rate limit is not Lemma's to raise, but the wait it
+    advised still belongs in the line."""
+    from lemma_sdk.errors import api_error
+
+    out = _both_paths(
+        api_error(
+            429,
+            "slow down",
+            code="OPERATION_EXECUTION_RATE_LIMITED",
+            retry_after=30,
+        )
+    )
+
+    assert "provider" in out
+    assert "30" in out
+    assert "raise the limit" not in out
+
+
 # --- name resolution past the first page ----------------------------------
 
 
