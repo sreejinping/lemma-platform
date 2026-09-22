@@ -181,10 +181,24 @@ class TestSourceEventId:
     run every matched schedule a second time.
     """
 
-    async def test_a_redelivery_collapses_onto_the_first_attempt(self):
+    @pytest.mark.parametrize(
+        ("event", "subject"),
+        [
+            ("pull_request", {}),
+            ("pull_request_review", {"review": {"id": 80}}),
+            ("pull_request_review_comment", {"comment": {"id": 81}}),
+        ],
+    )
+    async def test_a_redelivery_collapses_onto_the_first_attempt(self, event, subject):
+        """Every event's own key, delivered twice with a fresh delivery id.
+
+        A new event is a new key, and a key that took part of itself from the
+        delivery -- the id GitHub issues per *delivery* -- would run every
+        matched schedule a second time for something that happened once.
+        """
         source = GitHubWebhookSource()
-        payload = _pull_request()
-        first = _delivery(payload, event="pull_request")
+        payload = {**_pull_request(), **subject}
+        first = _delivery(payload, event=event)
         second = WebhookDelivery(
             source="github",
             raw_body=first.raw_body,
@@ -195,6 +209,33 @@ class TestSourceEventId:
             for d in (first, second)
         ]
         assert ids[0] == ids[1]
+
+    def test_a_later_review_is_a_new_event(self):
+        def review(review_id: int, action: str = "submitted") -> dict:
+            return {"action": action, "review": {"id": review_id}}
+
+        # A second review of the same pull request, and a later edit of the
+        # first: both are things a schedule may be told to fire on, and neither
+        # is a redelivery of the other.
+        assert source_event_id(
+            "pull_request_review", "1", 2, review(80)
+        ) != source_event_id("pull_request_review", "1", 2, review(81))
+        assert source_event_id(
+            "pull_request_review", "1", 2, review(80)
+        ) != source_event_id("pull_request_review", "1", 2, review(80, "edited"))
+
+    def test_a_later_review_comment_is_a_new_event(self):
+        def comment(comment_id: int, action: str = "created") -> dict:
+            return {"action": action, "comment": {"id": comment_id}}
+
+        assert source_event_id(
+            "pull_request_review_comment", "1", 2, comment(81)
+        ) != source_event_id("pull_request_review_comment", "1", 2, comment(82))
+        assert source_event_id(
+            "pull_request_review_comment", "1", 2, comment(81)
+        ) != source_event_id(
+            "pull_request_review_comment", "1", 2, comment(81, "deleted")
+        )
 
     def test_a_new_push_to_the_same_ref_is_a_new_event(self):
         base = {"after": "sha-one"}

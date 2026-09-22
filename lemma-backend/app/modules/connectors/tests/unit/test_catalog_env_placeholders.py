@@ -89,6 +89,20 @@ def test_no_placeholder_hides_in_a_field_that_is_never_filled():
             )
 
 
+def _github_triggers() -> dict[str, dict]:
+    github = next(a for a in _apps() if a["name"] == "github")
+    return {t["event_type"]: t for t in github["triggers"]}
+
+
+def _action_defaults() -> dict[str, list[str] | None]:
+    return {
+        event: (trigger["config_schema"]["properties"].get("actions") or {}).get(
+            "default"
+        )
+        for event, trigger in _github_triggers().items()
+    }
+
+
 def test_the_noisy_events_default_to_one_action():
     """Three GitHub events fire per release, and one per workflow-run state.
 
@@ -97,16 +111,36 @@ def test_the_noisy_events_default_to_one_action():
     thing a person did once. A busy repository does the same for `workflow_run`,
     once per run per state change.
     """
-    github = next(a for a in _apps() if a["name"] == "github")
-    defaults = {
-        t["event_type"]: (t["config_schema"]["properties"].get("actions") or {}).get(
-            "default"
-        )
-        for t in github["triggers"]
-    }
+    defaults = _action_defaults()
     assert defaults["release"] == ["published"]
     assert defaults["workflow_run"] == ["completed"]
     assert defaults["check_suite"] == ["completed"]
     # The rest are single user actions, where every one is worth firing on.
     for event in ("push", "pull_request", "issues", "issue_comment"):
         assert defaults[event] is None, event
+
+
+def test_a_review_defaults_to_the_delivery_that_says_something_new():
+    """A review is filtered the same way a release is, and for the same reason.
+
+    `submitted` is a reviewer's findings -- a person's or a bot's -- landing on
+    the pull request. `edited` is a correction to a review the agent may already
+    have read, and `dismissed` is a maintainer withdrawing one; firing on either
+    wakes an agent for something it has already acted on. An inline review
+    comment is the same shape one level down, where `created` is the new finding
+    and a delete withdraws it.
+    """
+    defaults = _action_defaults()
+    assert defaults["pull_request_review"] == ["submitted"]
+    assert defaults["pull_request_review_comment"] == ["created"]
+
+
+def test_the_review_triggers_offer_the_actions_github_sends():
+    """The enum is what the connect form and the API accept. An action GitHub
+    never sends is a checkbox that silently does nothing."""
+    for event, expected in (
+        ("pull_request_review", ["submitted", "edited", "dismissed"]),
+        ("pull_request_review_comment", ["created", "edited", "deleted"]),
+    ):
+        actions = _github_triggers()[event]["config_schema"]["properties"]["actions"]
+        assert actions["items"]["enum"] == expected, event

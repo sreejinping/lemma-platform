@@ -13,6 +13,10 @@ from pathlib import Path
 
 import pytest
 
+from app.modules.connectors.infrastructure.webhook_sources.github import (
+    SUPPORTED_EVENTS,
+)
+
 pytestmark = pytest.mark.unit
 
 _CONFIG = Path(__file__).resolve().parents[5] / "scripts" / "lemma_apps_config.json"
@@ -23,6 +27,21 @@ def github_operations() -> list[dict]:
     apps = json.loads(_CONFIG.read_text(encoding="utf-8"))
     entry = next(app for app in apps if app["name"] == "github")
     return entry["static_operations"]
+
+
+def test_the_catalog_offers_exactly_the_events_the_source_routes():
+    """Both directions, and each fails quietly on its own.
+
+    A trigger whose event is outside `SUPPORTED_EVENTS` never fires: the
+    delivery is acknowledged and dropped before routing, so the schedule is
+    created, the form accepts it, and nothing ever arrives. An event inside the
+    set with no trigger is the other half -- routed to something nobody can
+    choose, which is why the set's own comment calls it the catalog's events.
+    """
+    apps = json.loads(_CONFIG.read_text(encoding="utf-8"))
+    github = next(app for app in apps if app["name"] == "github")
+    offered = {trigger["event_type"] for trigger in github["triggers"]}
+    assert offered == set(SUPPORTED_EVENTS), offered ^ set(SUPPORTED_EVENTS)
 
 
 def test_the_curated_set_covers_actions_end_to_end(github_operations):

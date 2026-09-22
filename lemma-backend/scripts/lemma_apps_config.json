@@ -10608,6 +10608,80 @@
         }
       },
       {
+        "name": "github_pull_request_review",
+        "event_type": "pull_request_review",
+        "description": "Triggered when a pull request review is submitted, edited or dismissed",
+        "config_schema": {
+          "type": "object",
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {
+            "repository_id": {
+              "type": "integer",
+              "title": "Repository",
+              "description": "Limit to one repository, by its numeric id. Left empty, the schedule fires for every repository the App is installed on. The id rather than the name because a repository can be renamed or transferred, and a schedule that stops firing when someone renames a repo is a bug nobody connects to the rename."
+            },
+            "actions": {
+              "type": "array",
+              "title": "Actions",
+              "description": "Which review actions to fire on. Defaults to submitted, which is the one carrying a review's findings -- an edit is a correction to a review already delivered, and a dismissal is a maintainer withdrawing one, so firing on either wakes an agent for a review it has already read.",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "submitted",
+                  "edited",
+                  "dismissed"
+                ]
+              },
+              "default": [
+                "submitted"
+              ]
+            }
+          }
+        },
+        "payload_schema": {
+          "type": "object",
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "description": "GitHub's own webhook payload for this event, delivered unchanged."
+        }
+      },
+      {
+        "name": "github_pull_request_review_comment",
+        "event_type": "pull_request_review_comment",
+        "description": "Triggered when someone leaves an inline review comment on a pull request's diff",
+        "config_schema": {
+          "type": "object",
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "properties": {
+            "repository_id": {
+              "type": "integer",
+              "title": "Repository",
+              "description": "Limit to one repository, by its numeric id. Left empty, the schedule fires for every repository the App is installed on. The id rather than the name because a repository can be renamed or transferred, and a schedule that stops firing when someone renames a repo is a bug nobody connects to the rename."
+            },
+            "actions": {
+              "type": "array",
+              "title": "Actions",
+              "description": "Which review comment actions to fire on. Defaults to created, which is when a new finding appears -- an edit corrects a comment already delivered, and a delete withdraws it, leaving nothing to act on.",
+              "items": {
+                "type": "string",
+                "enum": [
+                  "created",
+                  "edited",
+                  "deleted"
+                ]
+              },
+              "default": [
+                "created"
+              ]
+            }
+          }
+        },
+        "payload_schema": {
+          "type": "object",
+          "$schema": "http://json-schema.org/draft-07/schema#",
+          "description": "GitHub's own webhook payload for this event, delivered unchanged."
+        }
+      },
+      {
         "name": "github_issues",
         "event_type": "issues",
         "description": "Triggered when an issue is opened, closed, labelled or assigned",
