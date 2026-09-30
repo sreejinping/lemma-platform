@@ -143,17 +143,22 @@ def test_an_empty_body_does_not_carry_the_request_url_out_with_it():
     URL, which is ours rather than anything the provider said. With no body to
     read, there is nothing here that may leave: the status travels in
     `upstream_status` and the URL does not travel at all.
+
+    The value in the URL is a fixture rather than anything shaped like a
+    credential: what the assertion needs is a string that appears nowhere else,
+    and a realistic-looking one would be a finding for the secret scanner.
     """
     request = httpx.Request(
-        "POST", "https://provider.example/thing?api_key=sk-test-4f9a2b7c8d1e"
+        "POST", "https://provider.example/thing?api_key=not-a-real-credential"
     )
     response = httpx.Response(422, request=request, text="")
     with pytest.raises(OperationExecutionValidationError) as caught:
         with execution_failures_translated():
             raise httpx.HTTPStatusError("boom", request=request, response=response)
 
-    assert "sk-test-4f9a2b7c8d1e" not in caught.value.message
-    assert "sk-test-4f9a2b7c8d1e" not in str(caught.value.details)
+    assert "not-a-real-credential" not in caught.value.message
+    assert "not-a-real-credential" not in str(caught.value.details)
+    assert "provider.example" not in caught.value.message
     assert "upstream_message" not in caught.value.details
     assert caught.value.details["upstream_status"] == 422
     assert caught.value.message == "Connector rejected the operation request."
