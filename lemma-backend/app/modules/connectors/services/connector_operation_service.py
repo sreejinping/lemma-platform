@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import base64
 from typing import Any
 from uuid import UUID
 
@@ -44,6 +43,10 @@ from app.modules.connectors.services.account_resolution_service import (
 from app.modules.connectors.services.connector_service import ConnectorService
 from app.modules.connectors.domain.analytics import operation_execution_recorded
 from app.modules.connectors.domain.execution_plan import ResolvedConnectorExecution
+from app.modules.connectors.contracts.operation_payload_validation import (
+    reject_payload_mismatch,
+)
+from app.modules.connectors.services.operation_result import normalize_execution_result
 
 __all__ = ["ConnectorOperationService", "ResolvedConnectorExecution"]
 from app.modules.connectors.services.execution.plumbing import (
@@ -150,30 +153,6 @@ class ConnectorOperationService:
 
     def _is_oauth_account(self, account: Any) -> bool:
         return is_oauth_account(account)
-
-    def _normalize_execution_result(self, value: Any) -> Any:
-        model_dump = getattr(value, "model_dump", None)
-        if callable(model_dump):
-            return self._normalize_execution_result(
-                model_dump(by_alias=True, exclude_none=True, mode="json")
-            )
-        if isinstance(value, dict):
-            return {
-                key: self._normalize_execution_result(item)
-                for key, item in value.items()
-            }
-        if isinstance(value, list):
-            return [self._normalize_execution_result(item) for item in value]
-        if isinstance(value, tuple):
-            return [self._normalize_execution_result(item) for item in value]
-        if isinstance(value, (bytes, bytearray)):
-            return {
-                "type": "binary_content",
-                "content_base64": base64.b64encode(bytes(value)).decode("ascii"),
-                "media_type": "application/octet-stream",
-                "size_bytes": len(value),
-            }
-        return value
 
     async def _resolve_execution_credentials(
         self, account: Any, user_id: UUID
@@ -516,6 +495,7 @@ class ConnectorOperationService:
                 )
         if not operation:
             raise OperationNotFoundError(operation_name)
+        reject_payload_mismatch(operation.name, operation.input_schema, payload)
 
         credentials = await self._resolve_execution_credentials(account, user_id)
         return ResolvedConnectorExecution(
@@ -561,9 +541,7 @@ class ConnectorOperationService:
             result = await self._dispatcher().execute(
                 execution_request(self._dispatcher(), resolved)
             )
-        return OperationExecutionResponse(
-            result=self._normalize_execution_result(result)
-        )
+        return OperationExecutionResponse(result=normalize_execution_result(result))
 
     async def execute_operation_for_auth_config(
         self,

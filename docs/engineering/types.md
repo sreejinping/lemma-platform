@@ -255,6 +255,22 @@ point of use, through `reveal_secret` / `reveal_credentials` — never in a log,
 never in a serialised payload, never in an error detail. See
 [development.md](../../lemma-backend/docs/development.md#secrets).
 
+One exception, and it is the provider's words rather than ours. Text a provider
+wrote back about a request it refused reaches the caller as the provider wrote
+it: `connector.operation.execute` promises exactly that (PS-CONN-032, "report
+what the provider said rather than a generic failure"), and a paraphrased
+sentence is the difference between a caller that can correct its request and one
+that cannot. So a provider that echoes the token it rejected puts that token in
+the 422, in `details["upstream_message"]`, and in whatever copies them. Three
+things bound it: the text is capped at 2000 characters; it never came through a
+`reveal_*` helper, so it is not a secret this code revealed; and every word *we*
+write is still redacted before it leaves — `_safe_connector_details` lifts only
+`upstream_message` out of `redact_value`, and `httpx`'s own phrasing about a
+response, which carries the request URL that a query-parameter credential rides
+in, is not treated as the provider's words at all. If a provider turns out to
+need the old behaviour, the fix is a per-connector flag, not a second exception
+here.
+
 ## Related
 
 - [design.md](design.md) — where these signatures live and what a port may say

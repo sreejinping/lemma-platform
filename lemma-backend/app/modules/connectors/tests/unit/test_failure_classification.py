@@ -1,5 +1,12 @@
 """Which failures are the provider's fault, and which ones the breaker counts.
 
+And what a failure is allowed to say. A provider that refuses a request explains
+it in its own sentence -- "invalid_scope", "repository not found", a JSON body
+naming the field it disliked -- and a caller that reads a fixed "Connector
+rejected the operation request." instead has nothing to act on, which for a
+model means nothing to correct.
+
+
 Two mirror-image bugs. For http/sql the map stopped at 422, so every provider
 5xx fell through to the catch-all as our own 500 -- the breaker, whose whole
 purpose is "a provider that is down, where every caller waits the full
@@ -21,6 +28,9 @@ from app.modules.connectors.domain.errors import (
     OperationExecutionRateLimitedError,
     OperationExecutionTimeoutError,
     OperationExecutionValidationError,
+)
+from app.modules.connectors.domain.errors import (
+    OperationExecutionValidationError as _ValidationErrorForDetails,
 )
 from app.modules.connectors.infrastructure.adapters.mcp_executor import McpExecutor
 from app.modules.connectors.services.execution.plumbing import (
@@ -64,6 +74,94 @@ def test_a_status_the_provider_chose_is_still_an_answer():
     error = _translated(404)
     assert isinstance(error, OperationExecutionNotFoundError)
     assert not isinstance(error, BREAKER_COUNTS)
+
+
+def _refused(status: int, body: str) -> Exception:
+    request = httpx.Request("POST", "https://provider.example/thing")
+    response = httpx.Response(status, request=request, text=body)
+    with pytest.raises(Exception) as caught:
+        with execution_failures_translated():
+            raise httpx.HTTPStatusError("boom", request=request, response=response)
+    return caught.value
+
+
+def test_a_provider_refusal_reaches_the_caller_in_the_providers_own_words():
+    """The decision, made executable: the provider's error text travels exactly
+    as it came.
+
+    Rewriting it is how a caller ends up with a sentence it cannot act on. This
+    is the uncomfortable half of that -- the body here is shaped like one that
+    echoes a credential back, and it still arrives unaltered, because the only
+    thing that can tell a real token from a word that looks like one is the
+    provider, and it already decided.
+    """
+    body = '{"message":"Bad credentials: Authorization: Bearer abc123 and token=xyz"}'
+
+    error = _refused(422, body)
+
+    assert isinstance(error, OperationExecutionValidationError)
+    assert error.message == body
+    assert error.details["upstream_message"] == body
+    assert "[REDACTED]" not in error.message
+    assert "[REDACTED]" not in str(error.details)
+
+
+def test_the_providers_words_are_the_only_detail_that_escapes_redaction():
+    """Everything the connector module files alongside them is still scrubbed.
+    `upstream_message` is the one key that means "the provider said this"."""
+    error = _ValidationErrorForDetails(
+        "",
+        details={
+            "upstream_message": "Bearer abc123",
+            "error": "token=xyz",
+            "reason": "refused",
+        },
+    )
+
+    assert error.details["upstream_message"] == "Bearer abc123"
+    assert error.details["error"] == "token=[REDACTED]"
+    assert error.details["reason"] == "refused"
+
+
+def test_a_provider_refusal_without_a_sentence_keeps_the_fixed_message():
+    """The fallback stays for the paths that have nothing better to say."""
+    request = httpx.Request("GET", "https://provider.example/thing")
+    response = httpx.Response(422, request=request, text="   ")
+    with pytest.raises(OperationExecutionValidationError) as caught:
+        with execution_failures_translated():
+            raise httpx.HTTPStatusError("boom", request=request, response=response)
+
+    assert caught.value.message == "Connector rejected the operation request."
+
+
+def test_an_empty_body_does_not_carry_the_request_url_out_with_it():
+    """The one thing on this path that can leak a credential now that
+    `redact_text` is gone from it, and the reason it does not.
+
+    `httpx`'s own sentence about a response is a status and the *request URL* --
+    and a connector authenticated by query parameter has its credential in that
+    URL, which is ours rather than anything the provider said. With no body to
+    read, there is nothing here that may leave: the status travels in
+    `upstream_status` and the URL does not travel at all.
+
+    The value in the URL is a fixture rather than anything shaped like a
+    credential: what the assertion needs is a string that appears nowhere else,
+    and a realistic-looking one would be a finding for the secret scanner.
+    """
+    request = httpx.Request(
+        "POST", "https://provider.example/thing?api_key=not-a-real-credential"
+    )
+    response = httpx.Response(422, request=request, text="")
+    with pytest.raises(OperationExecutionValidationError) as caught:
+        with execution_failures_translated():
+            raise httpx.HTTPStatusError("boom", request=request, response=response)
+
+    assert "not-a-real-credential" not in caught.value.message
+    assert "not-a-real-credential" not in str(caught.value.details)
+    assert "provider.example" not in caught.value.message
+    assert "upstream_message" not in caught.value.details
+    assert caught.value.details["upstream_status"] == 422
+    assert caught.value.message == "Connector rejected the operation request."
 
 
 @pytest.fixture
@@ -117,6 +215,7 @@ async def test_an_mcp_tool_error_reaches_the_caller_with_what_the_tool_said(
     error = await _execute_create_issue(refusing_server)
 
     assert isinstance(error, OperationExecutionValidationError)
+    assert error.message == 'project key "FOO" does not exist'
     assert error.details["upstream_message"] == 'project key "FOO" does not exist'
     assert error.details["operation_name"] == "create_issue"
     assert error.details["reason"] == "tool_error"

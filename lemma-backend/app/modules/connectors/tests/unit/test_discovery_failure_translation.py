@@ -11,6 +11,10 @@ traceback in the response body. Two separate causes, both here:
   `HTTPError`, so it matched the transport branch before anything looked for a
   status -- and a 401 came back as "temporarily unavailable", inviting the retry
   that function's own docstring says not to invite.
+
+The provider's text now travels as the provider wrote it, including the two
+shapes that look like secrets. That is a decision, not an oversight: see the two
+tests at the end of this file.
 """
 
 from __future__ import annotations
@@ -86,21 +90,26 @@ def test_the_provider_gets_to_explain_itself():
     assert "insufficient_scope" in caught.value.details["upstream_message"]
 
 
-def test_a_credential_the_provider_echoed_back_is_scrubbed():
-    """The one place a secret can travel by accident: some providers quote the
-    token they rejected."""
+def test_a_credential_the_provider_echoed_back_travels_as_it_came():
+    """The uncomfortable half of a deliberate decision, asserted out loud.
+
+    Some providers quote the token they rejected. That text reaches the caller
+    now, unaltered, because the alternative was a caller -- usually a model --
+    holding a sentence with a word missing from it and no way to know which.
+    These two tests used to assert the opposite. The bound is all that is left,
+    and the answer if a provider ever turns out to need the old behaviour is a
+    per-connector flag, added then.
+    """
     secret = "sk-proj-" + "a1b2c3d4e5" * 4
     request = httpx.Request("POST", "https://tenant.example/mcp")
     response = httpx.Response(401, request=request, text=f"token {secret} rejected")
     with pytest.raises(OperationExecutionUnauthorizedError) as caught:
         with execution_failures_translated():
             raise httpx.HTTPStatusError("boom", request=request, response=response)
-    rendered = str(caught.value.details)
-    assert secret not in rendered
-    assert "rejected" in rendered
+    assert caught.value.details["upstream_message"] == f"token {secret} rejected"
 
 
-def test_an_authorization_header_quoted_back_is_scrubbed():
+def test_an_authorization_header_quoted_back_travels_as_it_came():
     request = httpx.Request("POST", "https://tenant.example/mcp")
     response = httpx.Response(
         401, request=request, text="Authorization: Bearer ghp_" + "x" * 36
@@ -108,7 +117,9 @@ def test_an_authorization_header_quoted_back_is_scrubbed():
     with pytest.raises(OperationExecutionUnauthorizedError) as caught:
         with execution_failures_translated():
             raise httpx.HTTPStatusError("boom", request=request, response=response)
-    assert "ghp_" not in str(caught.value.details)
+    assert caught.value.details["upstream_message"] == (
+        "Authorization: Bearer ghp_" + "x" * 36
+    )
 
 
 def test_an_enormous_error_page_is_bounded():

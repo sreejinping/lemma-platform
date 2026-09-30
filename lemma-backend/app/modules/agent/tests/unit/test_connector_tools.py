@@ -23,6 +23,7 @@ from app.modules.agent.tools.connectors.models import (
     SearchConnectorOperationsRequest,
 )
 from app.modules.agent.tools.context import BaseAgentContext
+from app.modules.connectors.domain.errors import OperationExecutionValidationError
 
 
 _DEFAULT = object()
@@ -345,3 +346,145 @@ async def test_an_attachment_is_read_as_the_agent_and_output_path_stays_lemmas(
     ]
     # Read in the agent's own pod, under the agent's delegated context.
     assert reads == [(run_ctx.deps.pod_id, "/me/q3.pdf", agent_ctx)]
+
+
+async def test_bad_arguments_name_the_field_that_belongs_under_body(monkeypatch):
+    """The tool and every other caller now share one diagnosis.
+
+    This tool had its own jsonschema pass and named the fields, while a REST
+    caller and a pod function got "Connector rejected the operation request."
+    with no field named -- the same payload, two different answers, decided by
+    which door it came through. The tool reads the connector module's diagnosis
+    now, so the two cannot drift apart again.
+    """
+    schema = {
+        "type": "object",
+        "properties": {
+            "owner": {"type": "string"},
+            "repo": {"type": "string"},
+            "body": {
+                "type": "object",
+                "properties": {"title": {}, "head": {}, "base": {}},
+            },
+        },
+        "required": ["owner", "repo", "body"],
+        "additionalProperties": False,
+    }
+    execute = AsyncMock()
+    _patch_services(
+        monkeypatch,
+        SimpleNamespace(
+            ctx=object(),
+            operations=SimpleNamespace(
+                get_operation_details_for_auth_config=AsyncMock(
+                    return_value=SimpleNamespace(input_schema=schema)
+                ),
+                resolve_execution_for_auth_config=AsyncMock(),
+                execute_resolved=execute,
+            ),
+        ),
+    )
+
+    result = await adapter.run_connector_operation(
+        _run_ctx(),
+        RunConnectorOperationRequest(
+            auth_config="github-app",
+            operation="pulls_create",
+            arguments={
+                "owner": "octocat-owner",
+                "repo": "hello-world-repo",
+                "title": "Add a pull request title",
+                "head": "feature-branch-name",
+                "base": "main-branch-name",
+            },
+        ),
+    )
+
+    assert result["error"] == "invalid_arguments"
+    assert "'body'" in result["message"]
+    assert {violation["kind"] for violation in result["violations"]} == {
+        "missing",
+        "misplaced",
+    }
+    assert any("'title'" in violation["message"] for violation in result["violations"])
+    assert "feature-branch-name" not in result["message"]
+    execute.assert_not_awaited()
+
+
+def _services_refusing(error: Exception):
+    """The resolve phase raising, which is where a refusal is born.
+
+    The payload gate and the provider's own refusal both arrive from here, so
+    this is the seam a caller meets them at -- and it is a collaborator the tool
+    is given, not a part of it that gets patched.
+    """
+    return SimpleNamespace(
+        ctx=None,
+        operations=SimpleNamespace(
+            get_operation_details_for_auth_config=AsyncMock(
+                return_value=SimpleNamespace(input_schema=None)
+            ),
+            resolve_execution_for_auth_config=AsyncMock(side_effect=error),
+        ),
+        files=SimpleNamespace(prepare=AsyncMock()),
+    )
+
+
+async def test_a_providers_own_sentence_reaches_the_model_as_it_came(monkeypatch):
+    """The provider's words, not a paraphrase of them.
+
+    `safe_error_text` redacts what an error says, and it is right to: `httpx`
+    stringifies with the whole URL, and a signed link in one would land in the
+    model's context and in the transcript a person reads back. A connector
+    error's message is a different thing -- the provider's own sentence about
+    the request -- and the connector module is where the decision about what it
+    may say is made. Re-scrubbing it here would quietly undo that decision for
+    the caller that matters most.
+    """
+    sentence = "Bad credentials: Authorization: Bearer abc123 and token=xyz"
+    _patch_services(
+        monkeypatch,
+        _services_refusing(
+            OperationExecutionValidationError(
+                sentence,
+                details={
+                    "reason": "tool_error",
+                    "upstream_message": sentence,
+                    "operation_name": "pulls_create",
+                },
+            )
+        ),
+    )
+
+    result = await adapter.run_connector_operation(
+        _run_ctx(),
+        RunConnectorOperationRequest(
+            auth_config="github-app", operation="pulls_create", arguments={}
+        ),
+    )
+
+    assert result["message"] == sentence
+    assert "[REDACTED]" not in result["message"]
+
+
+async def test_an_error_with_no_provider_text_keeps_its_redaction(monkeypatch):
+    """The other side of the rule. Only `upstream_message` means "the provider
+    said this"; anything we wrote ourselves is still scrubbed on the way out."""
+    _patch_services(
+        monkeypatch,
+        _services_refusing(
+            OperationExecutionValidationError(
+                "token=xyz is not a valid argument",
+                details={"reason": "bad_argument"},
+            )
+        ),
+    )
+
+    result = await adapter.run_connector_operation(
+        _run_ctx(),
+        RunConnectorOperationRequest(
+            auth_config="github-app", operation="pulls_create", arguments={}
+        ),
+    )
+
+    assert result["message"] == "token=[REDACTED] is not a valid argument"

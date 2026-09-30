@@ -583,8 +583,8 @@ async def test_connector_operation_returns_upstream_execution_error_details(
 
     Two things have to hold together. The status has to be classified -- a
     revoked token is a 401, not "our fault, 500" -- and the provider's own words
-    have to survive, redacted, because "not_authed" and "channel not found" are
-    the difference between an agent that can correct itself and one that cannot.
+    have to survive, because "not_authed" and "channel not found" are the
+    difference between an agent that can correct itself and one that cannot.
 
     The connectors this exercises used to be served by a vendored client whose
     gateway deliberately dropped the second half, so their failures were the
@@ -808,3 +808,187 @@ async def test_google_calendar_operation_executes_against_real_composio_account(
     assert isinstance(result, dict)
     assert isinstance(result.get("events"), list)
     assert isinstance(result.get("total_events"), int)
+
+
+#: GitHub's `pulls_create` shape, abbreviated: the path parameters at the top
+#: level, the request JSON under `body`, and nothing else allowed.
+PULLS_CREATE_SCHEMA = {
+    "type": "object",
+    "title": "pulls_create",
+    "properties": {
+        "owner": {"type": "string"},
+        "repo": {"type": "string"},
+        "body": {
+            "type": "object",
+            "properties": {"title": {}, "head": {}, "base": {}},
+        },
+    },
+    "required": ["owner", "repo", "body"],
+    "additionalProperties": False,
+}
+
+
+async def _seed_payload_shape_operation(
+    db_session, fixed_test_org, fixed_test_user
+) -> tuple[str, str]:
+    """A connector, install, account and one GitHub-shaped operation.
+
+    Returns the operations URL and the account id, so the two tests below differ
+    only in what the provider does.
+    """
+    app_id = "test-operation-app-payload-shape"
+    app = await db_session.get(Connector, app_id)
+    if not app:
+        app = _connector(
+            app_id=app_id,
+            title="Payload Shape App",
+            description="Test App for the payload the caller sent",
+            kind="http",
+            auth_method=AuthMethod.API_KEY.value,
+        )
+        db_session.add(app)
+        await db_session.flush()
+    auth_config = await _seed_auth_config(
+        db_session,
+        app_id=app_id,
+        organization_id=fixed_test_org["id"],
+        kind="http",
+    )
+    account_id = uuid4()
+    db_session.add(
+        Account(
+            id=account_id,
+            connector_id=app_id,
+            user_id=fixed_test_user["id"],
+            organization_id=fixed_test_org["id"],
+            auth_config_id=auth_config.id,
+            credentials={"api_key": "secret"},
+        )
+    )
+    await db_session.execute(
+        delete(ConnectorOperation).where(ConnectorOperation.connector_id == app_id)
+    )
+    db_session.add(
+        ConnectorOperation(
+            id=f"{app_id}:pulls_create",
+            connector_id=app_id,
+            name="pulls_create",
+            provider_operation_name="pulls_create",
+            display_name="Create a pull request",
+            description="Create a pull request",
+            input_schema=PULLS_CREATE_SCHEMA,
+            output_schema={"type": "object"},
+        )
+    )
+    await db_session.commit()
+    operations_url = (
+        f"/organizations/{fixed_test_org['id']}/connectors/"
+        f"{auth_config.name}/operations"
+    )
+    return operations_url, str(account_id)
+
+
+@pytest.mark.asyncio
+async def test_a_body_sent_at_the_top_level_is_refused_before_the_provider(
+    authenticated_client: AsyncClient,
+    fixed_test_user,
+    fixed_test_org,
+    db_session,
+):
+    """The write that produced the report, over the API.
+
+    A GitHub write called with the request JSON at the top level instead of
+    under `body` used to reach GitHub, which answered 422 about its own request
+    model: no field named, no hint that the JSON belonged under `body`. The
+    payload is checked against the schema the connector published now, so the
+    refusal names the field that is missing, the fields that are one level too
+    high, and where they belong -- and the provider is never called.
+    """
+    operations_url, account_id = await _seed_payload_shape_operation(
+        db_session, fixed_test_org, fixed_test_user
+    )
+    calls: list[dict] = []
+
+    async def mock_execute(_self, **kwargs):
+        calls.append(kwargs)
+        return {"number": 1}
+
+    with patch(_HTTP_EXECUTOR_SEAM, new=mock_execute):
+        response = await authenticated_client.post(
+            f"{operations_url}/pulls_create/execute",
+            json={
+                "payload": {
+                    "owner": "octocat-owner",
+                    "repo": "hello-world-repo",
+                    "title": "Add a pull request title",
+                    "head": "feature-branch-name",
+                    "base": "main-branch-name",
+                },
+                "account_id": account_id,
+            },
+        )
+
+    assert response.status_code == 422, response.text
+    payload = response.json()
+    assert payload["code"] == "OPERATION_EXECUTION_VALIDATION_ERROR"
+    assert payload["request_id"]
+    assert "'body'" in payload["message"]
+    for field in ("title", "head", "base"):
+        assert f"'{field}'" in payload["message"]
+    for value in ("octocat-owner", "feature-branch-name", "main-branch-name"):
+        assert value not in payload["message"]
+    assert payload["details"]["reason"] == "payload_schema_mismatch"
+    assert calls == [], "the payload was refused, so the provider was never called"
+
+
+@pytest.mark.asyncio
+async def test_a_provider_refusal_reaches_the_caller_in_the_providers_own_words(
+    authenticated_client: AsyncClient,
+    fixed_test_user,
+    fixed_test_org,
+    db_session,
+):
+    """A refusal the schema could not have caught still explains itself.
+
+    GitHub can reject a well-shaped request -- a head branch that does not
+    exist, a repository in a state it will not allow -- and its own sentence
+    about that is the whole diagnosis. It reaches the caller as the provider
+    wrote it, with its status, rather than as "Connector rejected the operation
+    request."
+    """
+    operations_url, account_id = await _seed_payload_shape_operation(
+        db_session, fixed_test_org, fixed_test_user
+    )
+    provider_body = (
+        '{"message":"Validation Failed","errors":[{"resource":"PullRequest",'
+        '"field":"head","code":"invalid"}]}'
+    )
+
+    async def mock_execute(_self, **_kwargs):
+        raise OpenApiHttpExecutionError(
+            f"pulls_create failed: HTTP 422. {provider_body}",
+            status_code=422,
+            details={"error": provider_body, "status_code": 422},
+        )
+
+    with patch(_HTTP_EXECUTOR_SEAM, new=mock_execute):
+        response = await authenticated_client.post(
+            f"{operations_url}/pulls_create/execute",
+            json={
+                "payload": {
+                    "owner": "octocat-owner",
+                    "repo": "hello-world-repo",
+                    "body": {"title": "Add a pull request title"},
+                },
+                "account_id": account_id,
+            },
+        )
+
+    assert response.status_code == 422, response.text
+    payload = response.json()
+    assert payload["code"] == "OPERATION_EXECUTION_VALIDATION_ERROR"
+    assert provider_body in payload["message"]
+    assert "422" in payload["message"]
+    assert payload["details"]["upstream_status"] == 422
+    assert payload["details"]["upstream_message"] == payload["message"]
+    assert "[REDACTED]" not in json.dumps(payload)

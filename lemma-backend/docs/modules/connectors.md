@@ -68,6 +68,17 @@ decrypted credential values into a session-free DTO. The provider call happens
 outside a UoW; a final short UoW marks accounts for reauthentication when an
 unauthorized response is classified.
 
+The resolve phase also checks the payload against the operation's own stored
+input schema, before any credential is resolved and before anything is sent. An
+operation's schema carries its path, query and header parameters at the top
+level and its request JSON under `body`, so a caller that puts the body's fields
+at the top level is told which field is missing and where the others belong,
+rather than reaching the provider with an empty body and being told only that
+the request was rejected. The check is top level only -- a misspelled property
+inside `body` is the provider's to judge -- and it is skipped for an operation
+whose schema says nothing about which keys it takes. A refusal the schema could
+not have caught carries the provider's own words, as the provider wrote them.
+
 A credential refresh fails one of two ways, and they answer differently. When
 the provider says the grant itself is gone (`invalid_grant`, `invalid_client`,
 `unauthorized_client`, a Composio connection in a terminal state), or an expired

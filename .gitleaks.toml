@@ -181,3 +181,23 @@ is a keyword argument with an integer on the right.
 regexes = [
   '''ttl_seconds=3600''',
 ]
+
+[[allowlists]]
+description = '''
+A fabricated credential in a connector test: the request URL built by
+`test_an_empty_body_does_not_carry_the_request_url_out_with_it` carried
+`api_key=sk-test-4f9a2b7c8d1e`. It was invented for that fixture -- no Stripe
+account has ever held it, and the test asserts on a string, not on a working
+credential -- but `sk-` followed by hex is exactly what `generic-api-key` is
+built to notice, and it was committed before the scanner was run.
+
+The literal is gone: the URL now reads `api_key=not-a-real-credential`, which no
+scanner or person will mistake for a credential. Allowlisted because the commit
+that introduced it is still in this branch's history and gitleaks scans commits,
+not the working tree. By exact value, in the style of the entries above, so any
+other high-entropy string in that file is still a finding. `main` is
+squash-merged, so the value never reaches its history at all.
+'''
+regexes = [
+  '''sk-test-4f9a2b7c8d1e''',
+]
