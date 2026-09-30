@@ -66,18 +66,32 @@ async def test_a_waiting_agent_ends_its_turn_and_returns(world):
         state = await alice.opens_conversation(conversation, in_pod=pod)
         return str(state.get("status") or "").upper() == "WAITING"
 
-    await eventually(has_stopped_running, timeout=UNTIL_A_MODEL_ACTS)
+    await eventually(
+        has_stopped_running,
+        bool,
+        describe="the agent to end its turn and wait",
+        timeout=UNTIL_A_MODEL_ACTS,
+    )
+    # What was said before the wait, so an answer given then cannot count as
+    # the agent coming back.
+    before = {str(m.get("id")) for m in await alice.messages_in(conversation, in_pod=pod)}
 
     # Then: nobody does anything, and it comes back anyway.
     async def has_answered() -> bool:
         messages = await alice.messages_in(conversation, in_pod=pod)
+        # `text`: a message's words are there. This read `content`, which the
+        # API never sends, so the scenario could not pass whatever the agent did.
         return any(
-            "checked again" in str(message.get("content") or "").lower()
+            str(message.get("id")) not in before
+            and message.get("role") == "assistant"
+            and "checked again" in str(message.get("text") or "").lower()
             for message in messages
         )
 
     await eventually(
         has_answered,
+        bool,
+        describe="the agent to come back by itself and say 'checked again'",
         timeout=UNTIL_A_MODEL_ACTS + _A_SHORT_WAIT_SECONDS,
     )
 
@@ -99,7 +113,12 @@ async def test_stopping_a_waiting_conversation_ends_the_wait(world):
         state = await alice.opens_conversation(conversation, in_pod=pod)
         return str(state.get("status") or "").upper() == "WAITING"
 
-    await eventually(is_waiting, timeout=UNTIL_A_MODEL_ACTS)
+    await eventually(
+        is_waiting,
+        bool,
+        describe="the conversation to be WAITING",
+        timeout=UNTIL_A_MODEL_ACTS,
+    )
 
     await alice.api.expect(
         "POST",

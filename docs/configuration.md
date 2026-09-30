@@ -282,9 +282,22 @@ E2B_DOMAIN=
 # production; override it for anything sharing an E2B account with real
 # workspaces.
 E2B_METADATA_NAMESPACE=
+# Only for a deployment whose plans sell workspace sizes. JSON, keyed
+# `{cpu}x{memory_mb}`, one template per size.
+E2B_WORKSPACE_SIZE_TEMPLATES=
 ```
 
-These five are the whole backend-side E2B surface. In particular:
+These six are the whole backend-side E2B surface. In particular:
+
+- **A workspace size is a template.** E2B fixes CPU and memory when a template
+  is built, so a deployment whose plans size workspaces builds one workspace
+  template per size — `build_templates.py --name-suffix -4x8192` with
+  `E2B_WORKSPACE_CPU_COUNT=4` and `E2B_WORKSPACE_MEMORY_MB=8192` — and maps
+  the sizes here, e.g. `{"4x8192": "lemma-workspace-4x8192"}`. A size with no
+  entry is served from `E2B_WORKSPACE_TEMPLATE`, and logged. Without a plan
+  provider nothing asks for a size and this is never read. A workspace that
+  already exists keeps the template it was created on: here the sandbox is its
+  disk, so it cannot be rebuilt at a new size without carrying its files across.
 
 - **Whether a sandbox is on the internet is not one of them.** E2B gives every
   port a sandbox listens on a public name, so sandboxes are created closed:
@@ -473,7 +486,34 @@ EMAIL_TRANSPORT=smtp          # smtp | filesystem
 EMAIL_OUTPUT_DIR=/tmp/lemma-emails   # filesystem transport only
 AUTH_EMAIL_VERIFICATION_REQUIRED=true
 AUTH_ABUSE_PROTECTION_ENABLED=true
+# open | invite_only | closed. Unset means open.
+SIGNUP_MODE=
 ```
+
+### Who may sign up
+
+`SIGNUP_MODE` decides who can create an account, on every path that creates
+one — email and password, an OAuth provider, and email-code sign-in:
+
+- `open` — anyone who reaches the sign-up page. The default for hosted and
+  self-hosted deployments, and what they did before the setting existed.
+- `invite_only` — only an address holding a pending, unexpired organization
+  invitation. Anyone else is told "This Lemma is invite-only. Ask someone
+  already on it for an invitation."
+- `closed` — nobody.
+
+People who already have an account sign in whatever the mode is — a sign-up
+for an address that already has a password is answered "you already have an
+account", with a way to sign in, never with the mode's refusal — and the first
+account on a deployment with no accounts at all is admitted whatever the mode —
+there is nobody yet who could have invited it. That check is a read, not a
+reservation: two signups racing on an empty database could both get in, so a
+server that wants a closed door from the first request should create its first
+account before exposing the sign-up page.
+
+Unset means `open` on Lemma Desktop too. Desktop sets `SIGNUP_MODE` only while
+the installation is shared, from its *Who can join* choice; see
+[Desktop security](architecture/desktop-security.md).
 
 **Resend is not a transport.** To send through Resend, leave
 `EMAIL_TRANSPORT=smtp`, set `RESEND_API_KEY` and `RESEND_FROM_EMAIL`, and leave
@@ -490,6 +530,25 @@ operator gets a bare pydantic traceback rather than a message.
 domain, which meant an unconfigured deployment sent password resets from a
 domain it did not own — those fail DMARC silently and lock people out with
 nothing in the logs to explain it. Set it, or leave Resend unconfigured.
+
+**When no mail can be sent.** With `EMAIL_TRANSPORT=smtp` and neither Resend
+nor all four SMTP values set, nothing is sent and each attempt logs
+`identity.email.not_sent` at warning level with the reason. The product says so
+where it would otherwise promise mail: a new invitation comes back with
+`emailed: false` and its `accept_url`, which the People page offers to copy; a
+password reset answers that email isn't set up; and email-code sign-in refuses
+before minting a code (`EMAIL_NOT_CONFIGURED`) and points at a password instead.
+The filesystem transport is not "no mail" in this sense — it writes a spool for
+tests and the dev stack to read, and every send succeeds. Chat signup is the
+exception that treats the spool as no mail, because nobody in a chat can read
+it: on either, a sender a shared bot does not recognise is told how to be
+recognised instead of being asked for an address (see
+[chat onboarding](operators/chat-onboarding.md)).
+
+On a local installation (`ENVIRONMENT=local`), a signed-in user can ask whether
+mail can be sent (`GET /users/me/email-delivery`) and send a test email to their
+own address (`POST /users/me/email-delivery/test`, rate limited per account
+while the auth abuse controls are on). Both answer 404 on any other deployment.
 
 ### Agent email surfaces
 
@@ -813,10 +872,19 @@ Each surface needs its own credentials, and none is required — a surface with 
 token is simply inactive. Local installs have no public URL, so they receive
 events by polling or socket instead of webhooks.
 
+Slack has no bot token setting. A Slack surface uses the bot token stored on
+the Slack connector account it is attached to, which somebody connects through
+OAuth. The environment names the Slack app that OAuth runs against; an
+organization can register its own app on the Slack connector's auth config
+instead, and that app's signing secret is stored there too.
+
 ```dotenv
-SLACK_BOT_TOKEN=
-SLACK_SIGNING_SECRET=
+SLACK_CLIENT_ID=              # this deployment's Slack app
+SLACK_CLIENT_SECRET=
+SLACK_SIGNING_SECRET=         # verifies webhook events from that app
+SLACK_APP_ID=                 # matches an event to that app
 ENABLE_SLACK_SOCKET_MODE=false
+SLACK_APP_TOKEN=              # app-level token, Socket Mode only
 
 TELEGRAM_BOT_TOKEN=
 TELEGRAM_WEBHOOK_SECRET=
@@ -829,7 +897,7 @@ MICROSOFT_BOT_APP_ID=
 ## Frontend
 
 The frontend reads `NEXT_PUBLIC_*` variables, which are applied at runtime.
-`lemma-frontend/.env.example` is the working list.
+`lemma-harness/.env.example` is the working list.
 
 ```dotenv
 NEXT_PUBLIC_API_URL=https://api.example.com

@@ -26,7 +26,30 @@ pub(crate) fn lemma_update_metadata_for(raw: &Value, target: &str) -> LemmaUpdat
     LemmaUpdateMetadata {
         postgres_major: block.get("postgres_major").and_then(Value::as_u64),
         runtime_download_bytes: block.get("runtime_download_bytes").and_then(Value::as_u64),
+        runtime_artifacts: runtime_artifacts(block).unwrap_or_default(),
     }
+}
+
+/// The feed's `runtime_artifacts`: `{"host": {"sha256", "size"}, "guest": …}`.
+///
+/// All or nothing. One malformed or missing entry would make a partial sum
+/// look like the whole download, so anything short of both valid entries is
+/// read as absent and the whole-release figure stands.
+fn runtime_artifacts(block: &Value) -> Option<Vec<(artifact_install::Component, String, u64)>> {
+    let artifacts = block.get("runtime_artifacts")?;
+    [
+        artifact_install::Component::Host,
+        artifact_install::Component::Guest,
+    ]
+    .into_iter()
+    .map(|component| {
+        let entry = artifacts.get(component.name())?;
+        let sha256 = entry.get("sha256")?.as_str()?;
+        let size = entry.get("size")?.as_u64()?;
+        artifact_install::valid_recorded_digest(sha256)
+            .then(|| (component, sha256.to_owned(), size))
+    })
+    .collect()
 }
 
 /// Where an in-flight update records what it was aiming at.
@@ -139,12 +162,111 @@ pub(crate) fn announce_incomplete_update(app: &AppHandle, message: String) {
 /// would need `github.com` and `objects.githubusercontent.com` in
 /// `connect-src`, widening the network policy of the same webview that hosts
 /// the remote workspace origin.
+/// How long a check may take before Settings says it could not check.
+///
+/// The updater has no timeout of its own, so a stalled connection to the feed
+/// left the page on "Checking for updates..." with no error and no way on. The
+/// feed is one small JSON document behind a redirect; this is generous for it.
+/// The install path has none: it downloads the app bundle, which a slow link
+/// may legitimately take longer over.
+pub(crate) const UPDATE_CHECK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Ask this build's feed what it offers, bounded by `UPDATE_CHECK_TIMEOUT`.
+///
+/// Shared by the Settings check and the launch-time one, so both ask the same
+/// feed with the same channel policy (`update_policy::candidate_allowed`, the
+/// plugin's version comparator).
+pub(crate) async fn fetch_offered_update(
+    app: &AppHandle,
+) -> Result<Option<tauri_plugin_updater::Update>, String> {
+    app.updater_builder()
+        .endpoints(parsed_updater_endpoints())
+        .map_err(|error| format!("could not check for updates: {error}"))?
+        .timeout(UPDATE_CHECK_TIMEOUT)
+        .build()
+        .map_err(|error| format!("could not check for updates: {error}"))?
+        .check()
+        .await
+        .map_err(|error| format!("could not check for updates: {error}"))
+}
+
+/// How long after launch the background check waits.
+///
+/// Long enough that it never competes with the launch it follows -- a cold
+/// local start is downloading and booting in these seconds -- and short
+/// enough that someone who opens Lemma to do one thing still sees it.
+pub(crate) const LAUNCH_UPDATE_CHECK_DELAY: std::time::Duration =
+    std::time::Duration::from_secs(20);
+
+/// Whether this launch should ask the feed on its own.
+///
+/// Not from Recovery, which exists to start nothing, and not from a build that
+/// cannot update itself -- it would find a version and then refuse to
+/// install it.
+pub(crate) fn launch_update_check_wanted(updates_enabled: bool, recovery_launch: bool) -> bool {
+    updates_enabled && !recovery_launch
+}
+
+/// Look for a newer Lemma once, in the background, after launch.
+///
+/// Until now nothing checked unless someone opened the update panel, and a
+/// cloud user had no update panel they could reach. A hit adds one menu row
+/// (`update_available_label`) in the tray and the Lemma menu that opens the
+/// panel; nothing is downloaded or installed from here. A failure costs a
+/// launch-log line: an offline launch is not an error worth a dialog.
+pub(crate) fn schedule_launch_update_check(app: &AppHandle, recovery_launch: bool) {
+    if !launch_update_check_wanted(updates_enabled(), recovery_launch) {
+        return;
+    }
+    let handle = app.clone();
+    // A plain thread for the wait, so no async worker is parked for it.
+    std::thread::spawn(move || {
+        std::thread::sleep(LAUNCH_UPDATE_CHECK_DELAY);
+        match tauri::async_runtime::block_on(fetch_offered_update(&handle)) {
+            Ok(Some(update)) => announce_available_update(&handle, update.version.clone()),
+            Ok(None) => {}
+            Err(error) => {
+                append_bounded_log(&launch_log_path(), &format!("launch update check: {error}"))
+            }
+        }
+    });
+}
+
+/// Put "Lemma X is available" in the menus.
+///
+/// Rebuilt rather than inserted into, so the one place that builds each menu
+/// stays the one place that decides what is in it; the tray's two live lines
+/// are then rewritten from the state the shell already holds.
+pub(crate) fn announce_available_update(app: &AppHandle, version: String) {
+    append_bounded_log(
+        &launch_log_path(),
+        &format!("launch update check: Lemma {version} is available"),
+    );
+    {
+        let shell: State<Shell> = app.state();
+        *shell.available_update.lock_or_recover() = Some(version);
+    }
+    let handle = app.clone();
+    let _ = app.run_on_main_thread(move || {
+        refresh_menus_for_connection_mode(&handle);
+        refresh_tray_status(&handle);
+        let status = {
+            let shell: State<Shell> = handle.state();
+            let status = shell.agent_host_status.lock_or_recover().clone();
+            status
+        };
+        if let Some(status) = status {
+            refresh_agent_host_tray(&handle, &status);
+        }
+    });
+}
+
 #[tauri::command]
 pub(crate) async fn check_for_app_update(
     window: Webview,
     app: AppHandle,
 ) -> Result<AppUpdateStatus, String> {
-    require_control_window(&window)?;
+    require_settings_caller(&window, &app)?;
     let mut status = AppUpdateStatus {
         channel: release_channel(),
         current_version: env!("CARGO_PKG_VERSION"),
@@ -152,36 +274,36 @@ pub(crate) async fn check_for_app_update(
         updates_supported: updates_enabled(),
         available_version: None,
         runtime_download_bytes: None,
-        data_compatibility: "unknown",
+        data_compatibility: "compatible",
+        installed_postgres_major: None,
+        candidate_postgres_major: None,
     };
     if !updates_enabled() {
         return Ok(status);
     }
-    let update = app
-        .updater_builder()
-        .endpoints(parsed_updater_endpoints())
-        .map_err(|error| format!("could not check for updates: {error}"))?
-        .build()
-        .map_err(|error| format!("could not check for updates: {error}"))?
-        .check()
-        .await
-        .map_err(|error| format!("could not check for updates: {error}"))?;
-    let Some(update) = update else {
-        status.data_compatibility = "compatible";
+    let Some(update) = fetch_offered_update(&app).await? else {
         return Ok(status);
     };
     status.available_version = Some(update.version.clone());
     // The feed's own `lemma` block. The updater ignores unknown top-level keys
     // and hands back the parsed document, so this costs no extra request.
     let metadata = lemma_update_metadata(&update.raw_json);
-    status.runtime_download_bytes = metadata.runtime_download_bytes;
-    status.data_compatibility = if !has_local_runtime_data() {
-        "compatible"
-    } else if cfg!(windows) {
-        "migration-unavailable"
-    } else {
-        metadata.compatibility_with(installed_postgres_major())
-    };
+    // Nothing to download reads as not knowing rather than as "about 0 B":
+    // both pages word an unknown size generically, and a zero only happens
+    // when the host pack is unchanged too, which a release almost never is.
+    status.runtime_download_bytes = metadata
+        .runtime_bytes_to_download(&runtime_install_root())
+        .filter(|bytes| *bytes > 0);
+    // No Windows exception: its data lives in a separate holder distribution,
+    // and replacing the runtime already refuses to run until that holder says
+    // it has the data (`refuse_replacement_without_holder`) -- a check at the
+    // point of risk, where a blanket refusal here only hid every update.
+    if has_local_runtime_data() {
+        let installed = installed_postgres_major();
+        status.data_compatibility = metadata.compatibility_with(installed);
+        status.installed_postgres_major = installed;
+        status.candidate_postgres_major = metadata.postgres_major;
+    }
     Ok(status)
 }
 
@@ -235,6 +357,38 @@ impl Drop for InstallInFlight {
     }
 }
 
+/// How many agent runs the Agent Host says are in flight, across every
+/// workspace it is paired with. Zero when it is not running or has not said.
+pub(crate) fn active_agent_runs(status: Option<&Value>) -> u64 {
+    let Some(status) = status else { return 0 };
+    if status["running"].as_bool() != Some(true) {
+        return 0;
+    }
+    status["targets"]
+        .as_array()
+        .map(|targets| {
+            targets
+                .iter()
+                .filter_map(|target| target["active_runs"].as_u64())
+                .sum()
+        })
+        .unwrap_or(0)
+}
+
+/// The consent's account of the runs an install interrupts, or nothing.
+///
+/// Said only when there is something to lose: a line about zero runs is one
+/// more thing to read past on every update.
+pub(crate) fn interrupted_runs_sentence(active_runs: u64) -> String {
+    match active_runs {
+        0 => String::new(),
+        1 => " 1 agent run on this computer is in progress and will be interrupted.".into(),
+        many => {
+            format!(" {many} agent runs on this computer are in progress and will be interrupted.")
+        }
+    }
+}
+
 /// Download and install a newer Lemma, then offer to restart.
 ///
 /// `expected_version` is the version the user was actually shown and agreed
@@ -252,7 +406,7 @@ pub(crate) async fn install_app_update(
     reset_data: bool,
     expected_version: String,
 ) -> Result<(), String> {
-    require_control_window(&window)?;
+    require_settings_caller(&window, &app)?;
     if !updates_enabled() {
         return Err(
             "this build does not update itself; download the current release instead".into(),
@@ -274,9 +428,58 @@ pub(crate) async fn install_app_update(
     ensure_update_preserves_data(
         reset_data,
         has_local_runtime_data(),
-        lemma_update_metadata(&update.raw_json).compatibility_with(installed_postgres_major()),
-        cfg!(windows),
+        installed_postgres_major(),
+        lemma_update_metadata(&update.raw_json).postgres_major,
     )?;
+
+    // The person agrees here, natively, before anything is downloaded or
+    // stopped. The command is reachable from the workspace page, and a page
+    // asking is not the person agreeing: without this, a page that passed the
+    // caller check could replace the application and restart the stack with
+    // nobody at the keyboard having said yes. Asked after the checks above,
+    // so a refusal they would make anyway is not preceded by a question, and
+    // before the download, so saying no costs nothing. Off the async runtime,
+    // for the reason given at the restart question below.
+    // Said before, not after: the workspace is unusable from the moment the
+    // stack stops until the new runtime has downloaded on the next launch,
+    // and that is a cost somebody deciding *when* to update needs to know.
+    let runtime_download = match lemma_update_metadata(&update.raw_json)
+        .runtime_bytes_to_download(&runtime_install_root())
+    {
+        Some(bytes) if bytes > 0 => format!(" (about {} MB)", bytes.div_ceil(1024 * 1024)),
+        _ => String::new(),
+    };
+    // Stopping locald stops the Agent Host with it, so a coding agent mid-run
+    // is cut off. Read from the status the shell already holds rather than
+    // asked for: this is a sentence in a question, and a stack too sick to
+    // answer is not a reason to withhold the update.
+    let active_runs = {
+        let shell: State<Shell> = app.state();
+        let status = shell.agent_host_status.lock_or_recover().clone();
+        active_agent_runs(status.as_ref())
+    };
+    let consent = format!(
+        "Lemma {} will be downloaded and installed. Lemma's local runtime stops \
+         while it installs, and Lemma restarts as soon as it is installed.{} Your \
+         local workspace opens again once the updated runtime{runtime_download} \
+         has downloaded.",
+        update.version,
+        interrupted_runs_sentence(active_runs),
+    );
+    let handle = app.clone();
+    let agreed = tauri::async_runtime::spawn_blocking(move || {
+        confirm_destructive_action_impl(
+            handle,
+            "Install the update?".into(),
+            consent,
+            "Install".into(),
+        )
+    })
+    .await
+    .map_err(|join| join.to_string())??;
+    if !agreed {
+        return Err("The update was not installed.".into());
+    }
 
     // Downloaded first, and deliberately not with `download_and_install`.
     //
@@ -334,28 +537,14 @@ pub(crate) async fn install_app_update(
         return Ok(());
     }
 
-    // Off the async runtime. `confirm_destructive_action_impl` waits on a
-    // channel until the user answers, and the user may never answer -- so
-    // calling it from this async command parked a tokio worker on a dialog for
-    // as long as the window was left open.
-    let message = format!(
-        "Lemma {} is installed. Restarting now finishes the update; it downloads \
-         its runtime once afterwards.",
+    // Not a question any more. The stack was stopped above and the bundle on
+    // disk is now the new version: "Later" left the old shell running over a
+    // stopped stack it could only restart from the *new* locald binary, which
+    // then met the old guest -- a mixed-version runtime nobody tested. The
+    // consent above says the restart is part of installing.
+    append_install_log(&format!(
+        "update: Lemma {} installed; restarting to finish",
         update.version
-    );
-    let handle = app.clone();
-    let restart = tauri::async_runtime::spawn_blocking(move || {
-        confirm_destructive_action_impl(
-            handle,
-            "Restart to finish updating?".into(),
-            message,
-            "Restart Now".into(),
-        )
-    })
-    .await
-    .map_err(|join| join.to_string())??;
-    if restart {
-        app.restart();
-    }
-    Ok(())
+    ));
+    app.restart();
 }

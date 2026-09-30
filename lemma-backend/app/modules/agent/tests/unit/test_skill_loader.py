@@ -276,6 +276,46 @@ async def test_load_skill_appends_local_workspace_override(
     assert "run CLI examples through `lemma_exec_command`" in result.content
 
 
+@pytest.mark.parametrize(
+    ("in_process", "native", "on_host", "names", "never"),
+    [
+        # A coding agent over MCP whose commands run in the sandbox.
+        (False, False, False, "`lemma_exec_command`", "`exec_command`, which"),
+        # A coding agent on the Mac with host execution on: Lemma withheld its
+        # command tools, so the skill must not send it to them.
+        (False, True, False, "`lemma_browser`", "through `lemma_exec_command`"),
+        # The in-process harness, whose tool is `exec_command`.
+        (True, False, False, "through `exec_command`", "lemma_exec_command"),
+        # The in-process harness whose commands run on the Mac.
+        (True, False, True, "the `browser` tool", "lemma_exec_command"),
+    ],
+)
+def test_the_skill_override_names_the_tools_this_run_has(
+    in_process: bool, native: bool, on_host: bool, names: str, never: str
+) -> None:
+    from app.modules.workspace.contracts.host_execution import HostWorkspace
+
+    deps = BaseAgentContext(
+        user_id=uuid4(),
+        pod_id=uuid4(),
+        conversation_id=uuid4(),
+        supports_pause_signal=in_process,
+        host_runs_native_commands=native,
+        host_workspace=(
+            HostWorkspace(sandbox_id=uuid4(), root="/Users/me/lemma/c/x")
+            if on_host
+            else None
+        ),
+    )
+
+    override = skills_adapter.skill_runtime_override(deps)
+
+    assert override in skills_adapter.SKILL_RUNTIME_OVERRIDES
+    assert skills_adapter.LOCAL_WORKSPACE_SKILL_OVERRIDE_MARKER in override
+    assert names in override
+    assert never not in override
+
+
 @pytest.mark.asyncio
 async def test_skill_download_releases_uow_before_storage_read():
     order: list[str] = []
@@ -355,8 +395,8 @@ def test_skill_output_never_advertises_a_workspace_filesystem_path():
 def test_workspace_image_creates_no_skills_directory(source: Path):
     """The claim the field descriptions make, checked against the images.
 
-    Both workspace builds put the shipped skills under `/sdk/lemma-skills` and
-    inside the installed `lemma_cli` package; neither creates `/skills`. If one
+    Both workspace builds put the shipped skills inside the installed
+    `lemma_cli` package; neither creates `/skills`. If one
     ever mounts or symlinks it, this fails — and `pod_path` should go back to
     advertising a real container path.
     """
@@ -367,3 +407,39 @@ def test_workspace_image_creates_no_skills_directory(source: Path):
     ]
 
     assert offenders == []
+
+
+@pytest.mark.asyncio
+async def test_system_skills_follow_lemma_skills_root_without_a_pod(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    """A packaged install has no source checkout to walk up to.
+
+    Its skills sit wherever LEMMA_SKILLS_ROOT says, and the pod-less fallback
+    used to ignore that and raise instead of listing them.
+    """
+    skills_root = tmp_path / "packaged-skills"
+    (skills_root / "packaged-skill").mkdir(parents=True)
+    (skills_root / "packaged-skill" / "SKILL.md").write_text(
+        "---\nname: packaged-skill\ndescription: Shipped beside the binary.\n---\n\nBody.\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("LEMMA_SKILLS_ROOT", str(skills_root))
+    skill_loader._build_system_skill_catalog.cache_clear()
+    try:
+        skills = await list_workspace_skills()
+        content = await read_workspace_skill("packaged-skill")
+    finally:
+        skill_loader._build_system_skill_catalog.cache_clear()
+
+    assert [skill["name"] for skill in skills] == ["packaged-skill"]
+    assert "Body." in content
+
+
+def test_missing_lemma_skills_root_is_reported_not_guessed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    monkeypatch.setenv("LEMMA_SKILLS_ROOT", str(tmp_path / "absent"))
+
+    with pytest.raises(RuntimeError, match="Skills directory not found"):
+        skill_loader._skills_root()

@@ -66,8 +66,8 @@ fn detailed_status_reports_reachability_not_just_liveness() {
 #[test]
 fn plain_http_is_opted_into_only_on_loopback() {
     use crate::local_domain::LocalDomain;
-    let sslip = LocalDomain::parse(Some("sslip"));
-    let is_loopback_http = |url: &str| is_loopback_http_for(url, &sslip);
+    let domain = LocalDomain::current();
+    let is_loopback_http = |url: &str| is_loopback_http_for(url, &domain);
 
     assert!(is_loopback_http("http://localhost:8710"));
     assert!(is_loopback_http("http://127.0.0.1:8710/api"));
@@ -80,21 +80,8 @@ fn plain_http_is_opted_into_only_on_loopback() {
     assert!(is_loopback_http(
         "http://apps.lemma.localhost:52502/internal"
     ));
-    // And the hostname it serves itself on now. A shipped install resolves
-    // to the loopback wildcard, because a browser derives no registrable
-    // domain from `*.localhost` and a framed pod app needs one. This is the
-    // same failure as the line above, one domain later: pairing died
-    // silently and onboarding sat on "Connecting this computer" for ever.
-    assert!(is_loopback_http("http://app.127.0.0.1.sslip.io:61624"));
-    assert!(is_loopback_http(
-        "http://apps.127.0.0.1.sslip.io:61624/internal"
-    ));
     // A LAN or public address over plain HTTP stays refused.
-    // Somebody else's sslip host is somebody else's machine, not ours.
-    assert!(!is_loopback_http("http://app.10.0.0.7.sslip.io:61624"));
-    assert!(!is_loopback_http(
-        "http://app.127.0.0.1.sslip.io.evil:61624"
-    ));
+    assert!(!is_loopback_http("http://app.lemma.localhost.evil:61624"));
     assert!(!is_loopback_http("http://192.168.1.10:8710"));
     assert!(!is_loopback_http("http://localhost.evil.example:8710"));
     // ".localhost" must be the suffix, not a substring someone else owns.
@@ -189,4 +176,26 @@ fn status_answers_while_a_stubborn_sidecar_is_still_being_stopped() {
     );
     // Nothing is left behind.
     assert_eq!(unsafe { libc::kill(-i32::try_from(pid).unwrap(), 0) }, -1);
+}
+
+/// The loopback relay refuses the Agent Host's MCP relay ports, which it
+/// learns from the endpoint files each relay writes.
+#[test]
+fn mcp_relay_ports_are_read_from_the_endpoint_files() {
+    let root = tempdir().unwrap();
+    let directory = root.path().join("mcp-relay");
+    assert!(
+        crate::agent_host::status::mcp_relay_ports(&directory).is_empty(),
+        "no directory, no ports"
+    );
+    std::fs::create_dir_all(&directory).unwrap();
+    std::fs::write(directory.join("a.json"), r#"{"port":51001,"token":"x"}"#).unwrap();
+    std::fs::write(directory.join("b.json"), r#"{"port":51002,"token":"y"}"#).unwrap();
+    std::fs::write(directory.join("torn.json"), r#"{"port":"#).unwrap();
+    std::fs::write(directory.join("big.json"), r#"{"port":70000}"#).unwrap();
+    std::fs::write(directory.join("notes.txt"), r#"{"port":51003}"#).unwrap();
+
+    let mut ports = crate::agent_host::status::mcp_relay_ports(&directory);
+    ports.sort_unstable();
+    assert_eq!(ports, vec![51001, 51002]);
 }

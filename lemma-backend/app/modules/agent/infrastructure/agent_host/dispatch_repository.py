@@ -18,11 +18,16 @@ watermark comes from the stream's last entry.
 One consequence of at-least-once delivery shapes everything the host reports
 up: a control update the backend rejects is a control update the host resends
 forever, because it only clears its outbox once we accept it. Anything that
-travels on the poll — acknowledgements, checkpoints, rejections — must
-therefore be a no-op when it is stale rather than an error, and a single bad
-one must not fail the poll that carries the rest. A poll that 409s delivers no
-commands at all, so one un-appliable checkpoint would otherwise stop CANCEL_RUN
-and RESOLVE_PERMISSION reaching that host for every run it is executing.
+travels on the link's ``control`` frame — acknowledgements, checkpoints,
+rejections — must therefore be a no-op when it is stale rather than an error,
+and a single bad one must not fail the frame that carries the rest. A frame
+answered with an error delivers no commands at all, so one un-appliable
+checkpoint would otherwise stop CANCEL_RUN and RESOLVE_PERMISSION reaching that
+host for every run it is executing.
+
+"Poll" below means one read of the command queue: the link reads it whenever
+it applies a ``control`` frame, whenever the host's channel is poked, and every
+5 seconds as the floor under a lost poke (see ``agent_host_link_session``).
 """
 
 from __future__ import annotations
@@ -48,6 +53,7 @@ from app.modules.agent.domain.agent_host import (
     AgentHostRunSpec,
     AgentHostRunState,
 )
+from app.modules.agent.domain.value_objects import JsonObject
 from app.modules.agent.infrastructure.agent_host.event_stream import (
     AgentHostEventStream,
     agent_host_event_stream,
@@ -81,31 +87,6 @@ _CONTROL_COMMANDS_FIRST = case(
     (AgentHostCommandModel.kind == AgentHostCommandKind.START_RUN.value, 1),
     else_=0,
 )
-
-
-class PolledCommands(list[AgentHostCommand]):
-    """The commands one poll produced, plus whether anything actually changed.
-
-    ``progressed`` is false for a poll whose control updates were all no-ops.
-    That is the common case for a busy host: a non-terminal checkpoint *is* the
-    lease heartbeat, so the host resends it every poll, and re-applying an
-    unchanged state is not news anyone needs to come back promptly for. The
-    caller uses it to decide between a short backoff and an ordinary long poll.
-
-    A list subclass rather than a wrapper so callers keep iterating commands
-    directly, following ``StreamBatch`` in ``agent_host_event_stream``.
-    """
-
-    __slots__ = ("progressed",)
-
-    def __init__(
-        self,
-        commands: list[AgentHostCommand],
-        *,
-        progressed: bool,
-    ) -> None:
-        super().__init__(commands)
-        self.progressed = progressed
 
 
 def _log_unappliable_update(
@@ -172,7 +153,7 @@ class AgentHostDispatchRepository:
         available_run_slots: int,
         now: datetime | None = None,
         lease_seconds: int = DEFAULT_RUN_LEASE_SECONDS,
-    ) -> PolledCommands:
+    ) -> list[AgentHostCommand]:
         timestamp = now or utcnow()
         acknowledged = await control_updates.acknowledge_commands(
             self.session,
@@ -245,10 +226,14 @@ class AgentHostDispatchRepository:
                 remaining_run_slots -= 1
             wire_commands.append(await self._wire_command(command))
         await self.session.flush()
-        return PolledCommands(
-            wire_commands,
-            progressed=bool(acknowledged or applied),
-        )
+        if acknowledged or applied:
+            logger.debug(
+                "agent.infrastructure.agent_host_dispatch_repository.control_updates_applied",
+                host_id=str(host_id),
+                acknowledged=acknowledged,
+                applied=applied,
+            )
+        return wire_commands
 
     async def append_events(
         self,
@@ -428,6 +413,37 @@ class AgentHostDispatchRepository:
             payload={"encrypted_mcp": encrypted_mcp_payload},
             ttl_seconds=DEFAULT_COMMAND_TTL_SECONDS,
             now=now,
+        )
+
+    async def enqueue_steer(
+        self,
+        *,
+        run_id: UUID,
+        message_id: UUID,
+        prompt: list[JsonObject],
+        now: datetime | None = None,
+    ) -> AgentHostCommandModel | None:
+        """Hand a run still in flight a message the person sent since.
+
+        Returns None once the run is over: the message then waits for the
+        follow-up turn, which is what would have answered it anyway.
+
+        Also None until the host has accepted the run. Control commands are
+        handed out ahead of ``START_RUN`` (see ``_CONTROL_COMMANDS_FIRST``), so a
+        steer queued earlier would reach a host with no such run and be dropped
+        there; declining it here leaves the message for the next check instead.
+        """
+
+        async def _not_accepted_yet(lease: AgentHostRunLeaseModel) -> bool:
+            return lease.accepted_at is None
+
+        return await self._enqueue_for_live_run(
+            run_id=run_id,
+            kind=AgentHostCommandKind.STEER_RUN,
+            payload={"message_id": str(message_id), "prompt": prompt},
+            ttl_seconds=DEFAULT_COMMAND_TTL_SECONDS,
+            now=now,
+            skip_if=_not_accepted_yet,
         )
 
     async def expire_unaccepted_run(

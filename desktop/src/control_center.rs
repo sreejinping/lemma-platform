@@ -9,25 +9,26 @@ pub(crate) fn control_navigation_allowed(url: &tauri::Url) -> bool {
 }
 
 /// Normalise a Local settings page name, or say it is not one.
+///
+/// Local settings keeps what has to work when the workspace does not: health,
+/// this computer's Agent Host (the only settings a cloud user has here),
+/// recovery and diagnostics. The pages that moved to the workspace's This Mac
+/// settings -- the AI provider, sharing, integrations, channels, runtime and
+/// updates -- are still accepted as names, because an older frontend pack or
+/// harness can ask for them, and land on Overview rather than on an error.
+///
+/// `updates` is a destination of its own again: the update panel, wherever
+/// this mode shows it (Overview locally, This computer in cloud mode, which
+/// has no Overview). It is what Check for Updates… opens.
 pub(crate) fn control_center_page(page: Option<&str>) -> Result<String, String> {
     let page = match page.unwrap_or("overview") {
-        "connectors" => "integrations",
-        "services" => "runtime",
-        "surfaces" => "channels",
+        "ai" | "sharing" | "integrations" | "connectors" | "channels" | "surfaces" | "runtime"
+        | "services" => "overview",
         page => page,
     };
     if !matches!(
         page,
-        "overview"
-            | "computer"
-            | "ai"
-            | "sharing"
-            | "integrations"
-            | "channels"
-            | "runtime"
-            | "updates"
-            | "recovery"
-            | "diagnostics"
+        "overview" | "computer" | "recovery" | "diagnostics" | "updates"
     ) {
         return Err(format!("unknown Local settings page: {page}"));
     }

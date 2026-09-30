@@ -80,7 +80,7 @@ FUNCTION_BENCH_ENV = \
 	FUNCTION_BENCH_TERMINAL_TIMEOUT_SECONDS=$(FUNCTION_BENCH_TERMINAL_TIMEOUT_SECONDS)
 FUNCTION_BENCH_TEST = app/modules/function/tests/perf/test_function_execution_benchmark.py
 
-.PHONY: help test test-unit test-e2e test-e2e-real test-e2e-real-llm test-e2e-fast test-e2e-runtime test-module coverage coverage-unit coverage-e2e coverage-backend-unit coverage-backend-e2e-shard coverage-backend-report coverage-backend-gate coverage-baseline test-collect lint lint-async lint-session-scope lint-io-hygiene lint-unbounded lint-unbounded-reads lint-import-bound-defaults lint-controller-types lint-swallowed-errors lint-public-prose lint-test-doubles lint-migration-order lint-e2e-waits lint-import-budget test-e2e-shard-ci test-connection-scope typecheck-critical architecture migrate docker-build docker-build-cloud docker-build-arm64 docker-build-amd64 benchmark-functions-docker benchmark-functions-e2b teams-manifest-zip load-test-build load-test-up load-test-migrate load-test-setup load-test-run load-test-sse load-test-journey load-test-datastore-up load-test-datastore-setup load-test-datastore-files load-test-datastore-stats load-test-datastore-down load-test-monitor load-test-profile load-test-down load-test docker-reap
+.PHONY: help test test-unit test-e2e test-e2e-real test-e2e-real-llm test-e2e-fast test-e2e-runtime test-module coverage coverage-unit coverage-e2e coverage-backend-unit coverage-backend-e2e-shard coverage-backend-report coverage-backend-gate  test-collect lint lint-async lint-session-scope lint-io-hygiene lint-unbounded lint-unbounded-reads lint-import-bound-defaults lint-controller-types lint-swallowed-errors lint-memory-hazards lint-public-prose lint-test-doubles lint-migration-order lint-e2e-waits lint-import-budget test-e2e-shard-ci test-connection-scope typecheck-critical architecture migrate docker-build docker-build-cloud docker-build-arm64 docker-build-amd64 benchmark-functions-docker benchmark-functions-e2b teams-manifest-zip load-test-build load-test-up load-test-migrate load-test-setup load-test-run load-test-sse load-test-journey load-test-datastore-up load-test-datastore-setup load-test-datastore-files load-test-datastore-stats load-test-datastore-down load-test-monitor load-test-profile load-test-down load-test docker-reap
 
 help:
 	@echo "Lemma backend:"
@@ -105,6 +105,7 @@ help:
 	@echo "  make lint-controller-types  # new basedpyright errors in the typed surfaces"
 	@echo "  make test-e2e-shard-ci SHARD=sandbox   # one CI shard, exactly as CI runs it"
 	@echo "  make lint-swallowed-errors # broad excepts that leave no trace"
+	@echo "  make lint-memory-hazards   # process-lifetime memory retention shapes"
 	@echo "  make lint-public-prose   # internal hosts or dates in comments"
 	@echo "  make lint-test-doubles     # tests that patch inside their own subject"
 	@echo "  make lint-migration-order  # one alembic head, numbers matching apply order"
@@ -283,23 +284,12 @@ coverage-backend-report:
 		--markdown-out $(BACKEND_COVERAGE_DIR)/comment.md \
 		--summary-json-out $(BACKEND_COVERAGE_DIR)/summary.json
 
+# The CI floor: combined unit + e2e total against coverage-floor.txt. Run after
+# combining a unit run and e2e shards into $(BACKEND_COVERAGE_DIR)/coverage.json.
 coverage-backend-gate:
 	$(BACKEND_COVERAGE_DATA_ENV) uv run coverage combine
 	$(BACKEND_COVERAGE_DATA_ENV) uv run coverage json -o $(BACKEND_COVERAGE_DIR)/coverage.json
-	$(BACKEND_COVERAGE_DATA_ENV) uv run coverage xml -o $(BACKEND_COVERAGE_DIR)/coverage.xml
-	uv run python scripts/check_coverage_thresholds.py \
-		$(BACKEND_COVERAGE_DIR)/coverage.json \
-		--lane combined --min-total 70
-	uv run diff-cover $(BACKEND_COVERAGE_DIR)/coverage.xml \
-		--compare-branch origin/main --fail-under=85
-
-# Refresh the recorded floors from a run's reports. Only raises, so it locks in
-# a gain and cannot be used to clear a failure.
-coverage-baseline:
-	uv run python scripts/check_coverage_thresholds.py \
-		$(BACKEND_COVERAGE_DIR)/coverage.json --lane combined --write
-	uv run python scripts/check_coverage_thresholds.py \
-		$(BACKEND_COVERAGE_DIR)/e2e-union.json --lane e2e_union --write
+	$(BACKEND_COVERAGE_DATA_ENV) uv run coverage report --format=total --fail-under=$$(cat coverage-floor.txt)
 
 coverage-module:
 	@test -n "$(MODULE)" || (echo "MODULE is required, e.g. make coverage-module MODULE=agent" && exit 1)
@@ -311,8 +301,12 @@ coverage-module:
 test-collect:
 	uv run pytest --collect-only -q
 
+# Named rather than written inline because the root `make lint` reads both
+# lists, so its changed-files pass covers exactly what these targets do.
+LINT_PATHS = app migrations scripts
+
 lint:
-	uv run ruff check app migrations scripts
+	uv run ruff check $(LINT_PATHS)
 
 # Formatting, over first-party code only.
 FORMAT_PATHS = app migrations scripts sandbox_runtime load_tests standalone_app.py sitecustomize.py
@@ -514,6 +508,14 @@ lint-controller-types:
 # Ratcheted against swallowed-errors-baseline.json.
 lint-swallowed-errors:
 	uv run python scripts/check_swallowed_errors.py
+
+# Memory-hazard gate (enforced in CI). Unbounded caches, runtime-mutated
+# module-level containers, unclosed httpx clients, whole-body reads, tracing
+# without limits and fire-and-forget tasks each retain memory for the life of
+# the process. Ratcheted against memory-hazards-baseline.json; `--report` shows
+# the existing debt per rule and per file.
+lint-memory-hazards:
+	uv run python scripts/check_memory_hazards.py
 
 # Public-prose gate (enforced in CI). This repository is public, and
 # CONTRIBUTING's "Code and comments" already forbids internal hostnames,
@@ -779,8 +781,13 @@ SANDBOX_PLATFORMS ?= linux/amd64,linux/arm64
 # rather than following the host the way the workspace image now does.
 SANDBOX_FUNCTION_PLATFORM  ?= linux/amd64
 SANDBOX_FUNCTION_PLATFORMS ?= linux/amd64
-SANDBOX_PYTHON_IMAGE ?= python:3.14.6-slim
-SANDBOX_NODE_IMAGE   ?= node:24.18.0-slim
+# Empty by default, so the Dockerfiles' own digest-pinned bases are used. Set
+# either to build on a different base; the image is then not the one a release
+# publishes, and its digest will not match.
+SANDBOX_PYTHON_IMAGE ?=
+SANDBOX_NODE_IMAGE   ?=
+SANDBOX_BASE_ARGS := $(if $(SANDBOX_PYTHON_IMAGE),--build-arg PYTHON_IMAGE=$(SANDBOX_PYTHON_IMAGE)) \
+	$(if $(SANDBOX_NODE_IMAGE),--build-arg NODE_IMAGE=$(SANDBOX_NODE_IMAGE))
 
 WORKSPACE_IMAGE := $(SANDBOX_REGISTRY)/lemma-workspace
 FUNCTION_IMAGE  := $(SANDBOX_REGISTRY)/lemma-function
@@ -816,8 +823,7 @@ sandbox-image-workspace:
 	docker build \
 		--platform $(SANDBOX_PLATFORM) \
 		-f $(IMAGES_DIR)/Dockerfile.workspace \
-		--build-arg PYTHON_IMAGE=$(SANDBOX_PYTHON_IMAGE) \
-		--build-arg NODE_IMAGE=$(SANDBOX_NODE_IMAGE) \
+		$(SANDBOX_BASE_ARGS) \
 		-t $(WORKSPACE_IMAGE):$(SANDBOX_TAG) \
 		..
 
@@ -825,7 +831,7 @@ sandbox-image-function:
 	docker build \
 		--platform $(SANDBOX_FUNCTION_PLATFORM) \
 		-f $(IMAGES_DIR)/Dockerfile.function \
-		--build-arg PYTHON_IMAGE=$(SANDBOX_PYTHON_IMAGE) \
+		$(SANDBOX_BASE_ARGS) \
 		-t $(FUNCTION_IMAGE):$(SANDBOX_TAG) \
 		..
 
@@ -835,8 +841,7 @@ push-sandbox-workspace:
 	docker buildx build \
 		--platform $(SANDBOX_PLATFORMS) \
 		-f $(IMAGES_DIR)/Dockerfile.workspace \
-		--build-arg PYTHON_IMAGE=$(SANDBOX_PYTHON_IMAGE) \
-		--build-arg NODE_IMAGE=$(SANDBOX_NODE_IMAGE) \
+		$(SANDBOX_BASE_ARGS) \
 		-t $(WORKSPACE_IMAGE):$(SANDBOX_TAG) \
 		--push \
 		..
@@ -845,7 +850,7 @@ push-sandbox-function:
 	docker buildx build \
 		--platform $(SANDBOX_FUNCTION_PLATFORMS) \
 		-f $(IMAGES_DIR)/Dockerfile.function \
-		--build-arg PYTHON_IMAGE=$(SANDBOX_PYTHON_IMAGE) \
+		$(SANDBOX_BASE_ARGS) \
 		-t $(FUNCTION_IMAGE):$(SANDBOX_TAG) \
 		--push \
 		..

@@ -127,8 +127,8 @@ async def dispatch_agent_host_permission(
         await uow.commit()
     if command is None:
         return False
-    # The host is long-polling; without the poke the decision waits out the
-    # poll deadline while a user watches an idle agent.
+    # Without the poke the decision waits for the link's 5-second floor while
+    # a user watches an idle agent.
     await poke_host(command.host_id)
     return True
 
@@ -257,6 +257,7 @@ async def execute_approved_tool_as_user(
     deps: BaseAgentContext,
     tool_name: str,
     args: dict[str, object],
+    approval_id: str | None = None,
 ) -> dict[str, object]:
     """Run an approved tool outside the database transaction; never raise."""
     # Lazy to avoid importing the tool registry back through ConversationService.
@@ -274,6 +275,7 @@ async def execute_approved_tool_as_user(
             deps=deps,
             tool_name=tool_name,
             args=args,
+            approval_id=approval_id,
         )
         value = to_json_value(result)
         if isinstance(value, dict) and value.get("success") is False:

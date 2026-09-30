@@ -1,3 +1,4 @@
+# shellcheck shell=sh
 # Agent-facing login shells use the same Python 3.14 environment as native
 # execute_python contexts. User-installed packages live on workspace storage.
 export PIP_PREFIX=/home/user/.python
@@ -16,6 +17,14 @@ export UV_CACHE_DIR=/home/user/.uv-cache
 case ":${PATH}:" in
   *:/opt/lemma-python/bin:*) ;;
   *) export PATH="/opt/lemma-python/bin:${PATH}" ;;
+esac
+# The runtime overlay's commands, ahead of the image's own copies of the same
+# scripts in /usr/local/bin and of the interpreter's `lemma`. The backend
+# installs the overlay after the sandbox starts; until it has, this directory
+# does not exist and every lookup falls through to the image.
+case ":${PATH}:" in
+  *:/opt/lemma-runtime/current/bin:*) ;;
+  *) export PATH="/opt/lemma-runtime/current/bin:${PATH}" ;;
 esac
 case ":${PATH}:" in
   *:/home/user/.python/bin:*) ;;

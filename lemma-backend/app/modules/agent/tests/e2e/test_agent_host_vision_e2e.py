@@ -50,6 +50,7 @@ from app.modules.agent.services.workspace_location import (
     resolve_workspace_location,
 )
 from app.modules.agent.tests.e2e.agent_host_helpers import (
+    publish_harnesses,
     paired_machine,
     stale_after,
 )
@@ -87,8 +88,8 @@ async def _profile_for_a_host_that(db_session, scenario, *, reports_images: bool
         config_options=[_CLAUDE_CODE_MODEL_OPTION],
     )
     # A paired host is only "accepting new runs" while its heartbeat is fresh,
-    # and the heartbeat rides on the 25s long poll -- which a test cannot sit
-    # through. Stamping it is the same thing that poll does, without the wait.
+    # and the heartbeat is the link's `control` frame, sent every 20s by a host
+    # this test does not run. Stamping it is what that frame does.
     await db_session.execute(
         update(AgentHostModel)
         .where(AgentHostModel.id == machine["host_id"])
@@ -178,25 +179,23 @@ async def test_a_stale_catalog_does_not_outvote_a_host_that_learned_to_see(
     ), "fixture is wrong: the catalog should have been frozen without VISION"
 
     # Now the probe lands, exactly as the host reports it over ACP.
-    republished = await scenario.async_client.put(
-        "/agent-host/harnesses",
-        json={
-            "harnesses": [
-                {
-                    "harness_key": "claude-code",
-                    "display_name": "Claude Code",
-                    "adapter_version": "1.0.0",
-                    "health": "READY",
-                    "capabilities": {"load_session": True, "images": True},
-                    "config_revision": "rev-2",
-                    "config_options": [_CLAUDE_CODE_MODEL_OPTION],
-                    "stale_after": stale_after(),
-                }
-            ]
-        },
-        headers={"Authorization": f"Bearer {machine['host_secret']}"},
+    republished = await publish_harnesses(
+        scenario.async_client,
+        machine,
+        [
+            {
+                "harness_key": "claude-code",
+                "display_name": "Claude Code",
+                "adapter_version": "1.0.0",
+                "health": "READY",
+                "capabilities": {"load_session": True, "images": True},
+                "config_revision": "rev-2",
+                "config_options": [_CLAUDE_CODE_MODEL_OPTION],
+                "stale_after": stale_after(),
+            }
+        ],
     )
-    assert republished.status_code == 200, republished.text
+    assert republished["type"] == "harnesses_ok", republished
 
     mode, _run = await _vision_mode_for(db_session, scenario, profile)
 

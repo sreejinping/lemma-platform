@@ -16,7 +16,7 @@ use lemma_agent_host::service::ServiceManager;
 use serde_json::Value;
 use uuid::Uuid;
 
-use crate::cli::{Cli, Command};
+use crate::cli::{Cli, Command, HostExecutionAction, OwnSettingsAction};
 use crate::console::ConsoleCallbacks;
 use crate::output::{init_logging, print_value, select_one_target, show_logs, update_targets};
 
@@ -29,9 +29,9 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         .map_or_else(HostPaths::platform_default, Ok)?;
     match cli.command {
         Command::Serve => {
-            // Exactly one host per data directory. Two would poll the same
-            // pairing, split commands between them, and each mark the machine
-            // draining as it exits.
+            // Exactly one host per data directory. Two would connect with the
+            // same pairing, supersede each other's link, and each mark the
+            // machine draining as it exits.
             let _single = paths.lock_single_instance()?;
             let config = HostConfig::load_or_create(&paths)?;
             let runtime = HostRuntime::new(config, paths)?;
@@ -50,22 +50,33 @@ pub(crate) async fn run() -> anyhow::Result<()> {
         Command::Connect {
             url,
             pairing_code,
+            pairing_code_stdin,
             name,
             allow_insecure_http,
+            reenable,
         } => {
+            let pairing_code = if pairing_code_stdin {
+                let mut line = String::new();
+                std::io::stdin().read_line(&mut line)?;
+                line.trim().to_owned()
+            } else {
+                pairing_code.unwrap_or_default()
+            };
+            anyhow::ensure!(!pairing_code.is_empty(), "a pairing code is required");
             let config = HostConfig::load_or_create(&paths)?;
-            // Deliberately does not install adapters. Pairing is an HTTP call
-            // with a single-use code and needs none of them, but it used to wait
+            // Deliberately does not install adapters. Pairing is one exchange
+            // on the link with a single-use code and needs none of them, but it used to wait
             // for the whole cache to be built first -- which is why connecting
             // took minutes and why nothing appeared to be happening while it
             // did. `serve` warms the cache when the app opens instead, and a
             // harness that is not cached yet reports itself as installing.
-            let target = lemma_agent_host::api::TargetClient::pair(
+            let target = lemma_agent_host::link::pair_reenabling(
                 url,
                 &pairing_code,
                 &name,
                 &config.installation_id,
                 allow_insecure_http,
+                reenable,
             )
             .await?;
             // One target per Lemma server. Keying this on host_id alone was
@@ -104,6 +115,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         "url": target.base_url,
                         "enabled": target.enabled,
                         "host_id": target.host_id,
+                        "user_id": target.user_id,
+                        "local": target.is_local_install(),
+                        "host_execution": target.runs_host_commands(),
+                        "session_paused": target.session_paused,
                         "journal": status,
                     }))
                 })
@@ -119,19 +134,24 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             );
             Ok(())
         }
+        Command::Session { url, user } => {
+            let changed =
+                HostConfig::mutate(&paths, |config| Ok(config.apply_session(&url, user) > 0))?;
+            tracing::info!(signed_in = user.is_some(), %url, "the app's signed-in person changed");
+            drop(changed);
+            Ok(())
+        }
         Command::Disconnect {
             target,
             force_local,
         } => {
             let config = HostConfig::load_or_create(&paths)?;
             let selected = select_one_target(&config, target.as_deref())?.clone();
-            let client = lemma_agent_host::api::TargetClient::new(
-                selected.clone(),
-                config.installation_id.clone(),
-            )?;
-            if let Err(error) = client.revoke().await {
+            if let Err(error) =
+                lemma_agent_host::link::revoke(&selected, &config.installation_id).await
+            {
                 if !force_local {
-                    return Err(error.into());
+                    return Err(error);
                 }
                 eprintln!(
                     "Warning: remote revocation failed; removing local state because --force-local was supplied: {error}"
@@ -288,6 +308,10 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         adapter,
                         run_spec: spec,
                         scratch_directory: scratch,
+                        // A smoke run talks to no Lemma, so it is given no
+                        // credential.
+                        agent_environment: std::collections::BTreeMap::default(),
+                        own_settings: false,
                         mcp_server: None,
                         can_load_session: false,
                         published_config_options: Vec::new(),
@@ -300,6 +324,8 @@ pub(crate) async fn run() -> anyhow::Result<()> {
                         // control plane, and Ctrl-C takes the whole process.
                         cancel: lemma_agent_host::acp::never_cancelled(),
                         cancel_grace: Duration::ZERO,
+                        // Nor steer one: nothing sends on an empty inbox.
+                        steer: lemma_agent_host::acp::SteerInbox::default(),
                     },
                     Arc::new(ConsoleCallbacks { json }),
                 )
@@ -322,8 +348,124 @@ pub(crate) async fn run() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        Command::HostExecution { action } => host_execution(&paths, action).await,
+        Command::OwnSettings { action } => own_settings(&paths, action),
+        Command::ExecServer { root_base } => {
+            #[cfg(unix)]
+            {
+                lemma_agent_host::host_exec::server::run(root_base).await
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = root_base;
+                anyhow::bail!("host execution is not supported on this platform")
+            }
+        }
         Command::McpBridge { target_id, run_id } => {
             lemma_agent_host::mcp_bridge::run_bridge(&paths, target_id, run_id).await
         }
     }
+}
+
+/// `host-execution enable|disable|status|refresh-environment`.
+///
+/// The setting lives in `config.json`, which the running host re-reads every
+/// few seconds (`apply_local_controls`), so a change here reaches Lemma on the
+/// next `control` frame without a restart.
+async fn host_execution(paths: &HostPaths, action: HostExecutionAction) -> anyhow::Result<()> {
+    use lemma_agent_host::host_exec::env::EnvironmentSnapshot;
+    use lemma_agent_host::host_exec::wire::HostExecutionStatus;
+    // The switch belongs to the pairing with the Lemma installed on this
+    // computer; no other pairing may run commands here.
+    let set = |enabled: bool| {
+        HostConfig::mutate(paths, |config| {
+            let mut local = 0;
+            let mut changed = false;
+            for target in config.local_targets_mut() {
+                local += 1;
+                changed |= target.host_execution != enabled;
+                target.host_execution = enabled;
+            }
+            anyhow::ensure!(
+                local > 0 || !enabled,
+                "this computer is not paired with the Lemma installed on it; host execution is \
+                 only for that pairing"
+            );
+            Ok(changed)
+        })
+    };
+    match action {
+        HostExecutionAction::Enable => {
+            let status = HostExecutionStatus::current(true);
+            anyhow::ensure!(
+                status.available,
+                "this computer cannot confine commands (host execution needs macOS and /usr/bin/sandbox-exec)"
+            );
+            set(true)?;
+            // Taken now, where a slow shell profile costs the person who asked
+            // rather than the first command an agent runs.
+            EnvironmentSnapshot::load_or_take(&paths.root).await;
+            println!("Host execution is on.");
+        }
+        HostExecutionAction::Disable => {
+            set(false)?;
+            println!("Host execution is off.");
+        }
+        HostExecutionAction::Status { json } => {
+            let config = HostConfig::load_or_create(paths)?;
+            let status = HostExecutionStatus::current(config.host_execution());
+            let snapshot = EnvironmentSnapshot::cached(&paths.root);
+            print_value(
+                &serde_json::json!({
+                    "host_execution": status,
+                    "environment_taken_at": snapshot.as_ref().map(|snapshot| snapshot.taken_at),
+                    "environment_shell": snapshot.map(|snapshot| snapshot.shell),
+                }),
+                json,
+            );
+        }
+        HostExecutionAction::RefreshEnvironment => {
+            let snapshot = EnvironmentSnapshot::refresh(&paths.root).await;
+            println!(
+                "Took the environment of {} ({} variables). Workspaces opened from now on use it.",
+                snapshot.shell,
+                snapshot.variables.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// `own-settings enable|disable <harness>`.
+///
+/// Read by each run as it starts (`runtime::run`), so a change applies to the
+/// agent's next turn without a restart.
+fn own_settings(paths: &HostPaths, action: OwnSettingsAction) -> anyhow::Result<()> {
+    let (harness, enabled) = match action {
+        OwnSettingsAction::Enable { harness } => (harness, true),
+        OwnSettingsAction::Disable { harness } => (harness, false),
+    };
+    anyhow::ensure!(
+        !harness.is_empty()
+            && harness
+                .chars()
+                .all(|character| character.is_ascii_lowercase() || character == '-'),
+        "{harness:?} is not the name of a coding agent (claude-code, codex, opencode, cursor)"
+    );
+    HostConfig::mutate(paths, |config| {
+        Ok(if enabled {
+            config.own_settings.insert(harness.clone())
+        } else {
+            config.own_settings.remove(&harness)
+        })
+    })?;
+    println!(
+        "{harness} {} its own skills and settings.",
+        if enabled {
+            "now loads"
+        } else {
+            "no longer loads"
+        }
+    );
+    Ok(())
 }

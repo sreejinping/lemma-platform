@@ -74,8 +74,15 @@ fn run() -> io::Result<()> {
 /// the user was told only "lemma-locald exited during startup (exit status: 1)".
 fn serve() -> io::Result<()> {
     let paths = LocalPaths::discover()?;
+    // Before `Daemon::new`, which reclaims processes from the ledgers: a second
+    // daemon that did that first would stop the first daemon's services and
+    // only then discover, at bind, that it was the second.
+    let _instance = lemma_locald::instance_lock::claim(&paths.root)?;
     match Daemon::new(paths.clone()) {
-        Ok(daemon) => daemon.serve(),
+        Ok(daemon) => {
+            daemon.stop_on_termination_signals()?;
+            daemon.serve()
+        }
         Err(error) => {
             let _ = lemma_locald::protocol::append_bounded_daemon_log(
                 &paths.log,
@@ -138,10 +145,11 @@ fn client_event_finishes(command: &str, event: &str) -> bool {
         "control.snapshot" => event == "control.snapshot",
         "sharing.snapshot" => event == "sharing.snapshot",
         "sharing.preflight" => event == "sharing.preflight",
-        "sharing.enable" | "sharing.disable" => event == "sharing.changed",
+        "sharing.enable" | "sharing.disable" | "sharing.access" => event == "sharing.changed",
         "agent-host.status" => event == "agent-host.status",
         "config.apply" => event == "config.applied",
         "runtime.prepare" => event == "done",
+        "disk.cleanup" => event == "disk.cleanup",
         // The reset broadcasts `local.data-reset` on the way past; the run is
         // over when the stack has come back up, not when the wipe finished.
         "local.reset-data" => event == "done",
@@ -172,6 +180,7 @@ mod tests {
         ));
         assert!(client_event_finishes("sharing.enable", "sharing.changed"));
         assert!(client_event_finishes("sharing.disable", "sharing.changed"));
+        assert!(client_event_finishes("sharing.access", "sharing.changed"));
         assert!(client_event_finishes("runtime.prepare", "done"));
         assert!(!client_event_finishes(
             "runtime.prepare",

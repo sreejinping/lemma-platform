@@ -118,6 +118,8 @@ impl Daemon {
         );
         let daemon = Arc::clone(self);
         thread::spawn(move || {
+            // Released however this thread ends -- see `lifecycle::Finish`.
+            let _finish = daemon.agent_lifecycle.finish_on_drop();
             let text = |key: &str| {
                 request
                     .get(key)
@@ -129,10 +131,17 @@ impl Daemon {
                 "agent-host.start" => daemon.agent_host.start(),
                 "agent-host.stop" => daemon.agent_host.stop(),
                 "agent-host.restart" => daemon.agent_host.restart(),
-                "agent-host.pair" => {
+                "agent-host.pair" => daemon.agent_host.pair(
+                    &text("url"),
+                    &text("pairing_code"),
+                    &text("name"),
+                    request.get("reenable").and_then(Value::as_bool) == Some(true),
+                ),
+                "agent-host.session" => {
+                    let user = text("user_id");
                     daemon
                         .agent_host
-                        .pair(&text("url"), &text("pairing_code"), &text("name"))
+                        .session(&text("url"), (!user.is_empty()).then_some(user.as_str()))
                 }
                 "agent-host.unpair" => {
                     let target = text("target_id");
@@ -140,10 +149,19 @@ impl Daemon {
                         .agent_host
                         .unpair((!target.is_empty()).then_some(target.as_str()))
                 }
+                "agent-host.host-execution" => daemon.agent_host.set_host_execution(
+                    request
+                        .get("enabled")
+                        .and_then(Value::as_bool)
+                        .unwrap_or(false),
+                ),
+                "agent-host.own-settings" => daemon.agent_host.set_own_settings(
+                    &text("harness"),
+                    request.get("enabled").and_then(Value::as_bool) == Some(true),
+                ),
                 _ => daemon.agent_host.refresh(),
             };
             let outcome = result.map(|()| daemon.agent_host.detailed_status());
-            daemon.agent_lifecycle.finish();
             match outcome {
                 Ok(status) => {
                     daemon.send_direct(

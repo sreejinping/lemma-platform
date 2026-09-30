@@ -612,346 +612,6 @@
         "title": "AgentDetailResponse",
         "type": "object"
       },
-      "AgentHostCapacity": {
-        "properties": {
-          "active_runs": {
-            "default": 0,
-            "maximum": 128.0,
-            "minimum": 0.0,
-            "title": "Active Runs",
-            "type": "integer"
-          },
-          "available_runs": {
-            "default": 1,
-            "maximum": 128.0,
-            "minimum": 0.0,
-            "title": "Available Runs",
-            "type": "integer"
-          },
-          "max_runs": {
-            "default": 1,
-            "maximum": 128.0,
-            "minimum": 0.0,
-            "title": "Max Runs",
-            "type": "integer"
-          }
-        },
-        "title": "AgentHostCapacity",
-        "type": "object"
-      },
-      "AgentHostCommand": {
-        "properties": {
-          "command_id": {
-            "format": "uuid",
-            "title": "Command Id",
-            "type": "string"
-          },
-          "created_at": {
-            "format": "date-time",
-            "title": "Created At",
-            "type": "string"
-          },
-          "expires_at": {
-            "format": "date-time",
-            "title": "Expires At",
-            "type": "string"
-          },
-          "kind": {
-            "$ref": "#/components/schemas/AgentHostCommandKind"
-          },
-          "lease_epoch": {
-            "anyOf": [
-              {
-                "minimum": 1.0,
-                "type": "integer"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Lease Epoch"
-          },
-          "payload": {
-            "additionalProperties": true,
-            "title": "Payload",
-            "type": "object"
-          },
-          "run_id": {
-            "anyOf": [
-              {
-                "format": "uuid",
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Run Id"
-          }
-        },
-        "required": [
-          "command_id",
-          "kind",
-          "created_at",
-          "expires_at"
-        ],
-        "title": "AgentHostCommand",
-        "type": "object"
-      },
-      "AgentHostCommandKind": {
-        "enum": [
-          "START_RUN",
-          "CANCEL_RUN",
-          "RESOLVE_PERMISSION",
-          "REFRESH_CREDENTIAL"
-        ],
-        "title": "AgentHostCommandKind",
-        "type": "string"
-      },
-      "AgentHostCommandRejection": {
-        "properties": {
-          "code": {
-            "$ref": "#/components/schemas/AgentHostRejectionCode"
-          },
-          "command_id": {
-            "format": "uuid",
-            "title": "Command Id",
-            "type": "string"
-          },
-          "detail": {
-            "anyOf": [
-              {
-                "maxLength": 2048,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Detail"
-          },
-          "lease_epoch": {
-            "minimum": 1.0,
-            "title": "Lease Epoch",
-            "type": "integer"
-          },
-          "retryable": {
-            "title": "Retryable",
-            "type": "boolean"
-          },
-          "run_id": {
-            "format": "uuid",
-            "title": "Run Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "command_id",
-          "run_id",
-          "lease_epoch",
-          "code",
-          "retryable"
-        ],
-        "title": "AgentHostCommandRejection",
-        "type": "object"
-      },
-      "AgentHostConfigOption": {
-        "properties": {
-          "category": {
-            "maxLength": 128,
-            "minLength": 1,
-            "title": "Category",
-            "type": "string"
-          },
-          "current_value": {
-            "title": "Current Value"
-          },
-          "description": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Description"
-          },
-          "id": {
-            "maxLength": 255,
-            "minLength": 1,
-            "title": "Id",
-            "type": "string"
-          },
-          "metadata": {
-            "additionalProperties": true,
-            "title": "Metadata",
-            "type": "object"
-          },
-          "name": {
-            "maxLength": 255,
-            "minLength": 1,
-            "title": "Name",
-            "type": "string"
-          },
-          "options": {
-            "items": {
-              "additionalProperties": true,
-              "type": "object"
-            },
-            "title": "Options",
-            "type": "array"
-          }
-        },
-        "required": [
-          "id",
-          "category",
-          "name"
-        ],
-        "title": "AgentHostConfigOption",
-        "type": "object"
-      },
-      "AgentHostEvent": {
-        "description": "One run event on its way to the run's Redis Stream.\n\nThere is no event id: events are deduplicated by ``sequence`` against the\nstream's watermark, which is what a resend after a Redis flush relies on.\nThere is no host timestamp either -- a Redis stream id already embeds the\nmillisecond it was appended.",
-        "properties": {
-          "lease_epoch": {
-            "minimum": 1.0,
-            "title": "Lease Epoch",
-            "type": "integer"
-          },
-          "object_id": {
-            "anyOf": [
-              {
-                "maxLength": 255,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Object Id"
-          },
-          "payload": {
-            "additionalProperties": true,
-            "title": "Payload",
-            "type": "object"
-          },
-          "run_id": {
-            "format": "uuid",
-            "title": "Run Id",
-            "type": "string"
-          },
-          "sequence": {
-            "minimum": 1.0,
-            "title": "Sequence",
-            "type": "integer"
-          },
-          "type": {
-            "$ref": "#/components/schemas/AgentHostEventType"
-          }
-        },
-        "required": [
-          "run_id",
-          "lease_epoch",
-          "sequence",
-          "type"
-        ],
-        "title": "AgentHostEvent",
-        "type": "object"
-      },
-      "AgentHostEventAck": {
-        "properties": {
-          "acked_through": {
-            "minimum": 0.0,
-            "title": "Acked Through",
-            "type": "integer"
-          },
-          "lease_epoch": {
-            "title": "Lease Epoch",
-            "type": "integer"
-          },
-          "run_id": {
-            "format": "uuid",
-            "title": "Run Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "run_id",
-          "lease_epoch",
-          "acked_through"
-        ],
-        "title": "AgentHostEventAck",
-        "type": "object"
-      },
-      "AgentHostEventBatch": {
-        "properties": {
-          "events": {
-            "items": {
-              "$ref": "#/components/schemas/AgentHostEvent"
-            },
-            "maxItems": 256,
-            "minItems": 1,
-            "title": "Events",
-            "type": "array"
-          }
-        },
-        "required": [
-          "events"
-        ],
-        "title": "AgentHostEventBatch",
-        "type": "object"
-      },
-      "AgentHostEventType": {
-        "enum": [
-          "run_state",
-          "user_message",
-          "agent_message_chunk",
-          "agent_message_upsert",
-          "agent_thought_chunk",
-          "agent_thought_upsert",
-          "plan_upsert",
-          "tool_call_upsert",
-          "tool_call_update",
-          "usage_update",
-          "config_update",
-          "permission_request",
-          "terminal"
-        ],
-        "title": "AgentHostEventType",
-        "type": "string"
-      },
-      "AgentHostHarnessCapabilities": {
-        "additionalProperties": true,
-        "description": "Harness capabilities the server actually branches on.\n\n``images`` adds the vision capability to the runtime picker;\n``load_session`` is what lets a conversation keep one provider session\nacross turns, so it decides whether a run is dispatched with a\n``resume_session_id``. Anything else a host reports is kept verbatim by\n``extra: allow`` rather than typed here, so the wire format stays open\nwithout inventing fields no code reads.",
-        "properties": {
-          "images": {
-            "default": false,
-            "title": "Images",
-            "type": "boolean"
-          },
-          "load_session": {
-            "default": false,
-            "title": "Load Session",
-            "type": "boolean"
-          }
-        },
-        "title": "AgentHostHarnessCapabilities",
-        "type": "object"
-      },
-      "AgentHostHarnessHealth": {
-        "enum": [
-          "READY",
-          "AUTH_REQUIRED",
-          "UNSUPPORTED_VERSION",
-          "CONFIG_INVALID",
-          "PROBE_FAILED",
-          "INSTALLING",
-          "DISABLED"
-        ],
-        "title": "AgentHostHarnessHealth",
-        "type": "string"
-      },
       "AgentHostHarnessListResponse": {
         "properties": {
           "items": {
@@ -966,40 +626,6 @@
           "items"
         ],
         "title": "AgentHostHarnessListResponse",
-        "type": "object"
-      },
-      "AgentHostHarnessPublishRequest": {
-        "properties": {
-          "harnesses": {
-            "items": {
-              "$ref": "#/components/schemas/AgentHostHarnessSnapshot"
-            },
-            "maxItems": 32,
-            "minItems": 1,
-            "title": "Harnesses",
-            "type": "array"
-          }
-        },
-        "required": [
-          "harnesses"
-        ],
-        "title": "AgentHostHarnessPublishRequest",
-        "type": "object"
-      },
-      "AgentHostHarnessPublishResponse": {
-        "properties": {
-          "items": {
-            "items": {
-              "$ref": "#/components/schemas/AgentHostHarnessResponse"
-            },
-            "title": "Items",
-            "type": "array"
-          }
-        },
-        "required": [
-          "items"
-        ],
-        "title": "AgentHostHarnessPublishResponse",
         "type": "object"
       },
       "AgentHostHarnessResponse": {
@@ -1089,85 +715,6 @@
         "title": "AgentHostHarnessResponse",
         "type": "object"
       },
-      "AgentHostHarnessSnapshot": {
-        "properties": {
-          "adapter_version": {
-            "maxLength": 128,
-            "minLength": 1,
-            "title": "Adapter Version",
-            "type": "string"
-          },
-          "capabilities": {
-            "$ref": "#/components/schemas/AgentHostHarnessCapabilities"
-          },
-          "config_options": {
-            "items": {
-              "$ref": "#/components/schemas/AgentHostConfigOption"
-            },
-            "title": "Config Options",
-            "type": "array"
-          },
-          "config_revision": {
-            "maxLength": 255,
-            "minLength": 1,
-            "title": "Config Revision",
-            "type": "string"
-          },
-          "display_name": {
-            "maxLength": 255,
-            "minLength": 1,
-            "title": "Display Name",
-            "type": "string"
-          },
-          "harness_key": {
-            "maxLength": 128,
-            "minLength": 1,
-            "title": "Harness Key",
-            "type": "string"
-          },
-          "health": {
-            "$ref": "#/components/schemas/AgentHostHarnessHealth"
-          },
-          "stale_after": {
-            "format": "date-time",
-            "title": "Stale After",
-            "type": "string"
-          },
-          "stale_reason": {
-            "anyOf": [
-              {
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Stale Reason"
-          },
-          "upstream_version": {
-            "anyOf": [
-              {
-                "maxLength": 128,
-                "type": "string"
-              },
-              {
-                "type": "null"
-              }
-            ],
-            "title": "Upstream Version"
-          }
-        },
-        "required": [
-          "harness_key",
-          "display_name",
-          "adapter_version",
-          "health",
-          "config_revision",
-          "stale_after"
-        ],
-        "title": "AgentHostHarnessSnapshot",
-        "type": "object"
-      },
       "AgentHostListResponse": {
         "properties": {
           "items": {
@@ -1182,57 +729,6 @@
           "items"
         ],
         "title": "AgentHostListResponse",
-        "type": "object"
-      },
-      "AgentHostPairingComplete": {
-        "properties": {
-          "display_name": {
-            "maxLength": 255,
-            "minLength": 1,
-            "title": "Display Name",
-            "type": "string"
-          },
-          "hello": {
-            "$ref": "#/components/schemas/HostHello"
-          },
-          "pairing_code": {
-            "maxLength": 512,
-            "minLength": 16,
-            "title": "Pairing Code",
-            "type": "string"
-          }
-        },
-        "required": [
-          "pairing_code",
-          "display_name",
-          "hello"
-        ],
-        "title": "AgentHostPairingComplete",
-        "type": "object"
-      },
-      "AgentHostPairingCompleted": {
-        "properties": {
-          "host_id": {
-            "format": "uuid",
-            "title": "Host Id",
-            "type": "string"
-          },
-          "host_secret": {
-            "title": "Host Secret",
-            "type": "string"
-          },
-          "user_id": {
-            "format": "uuid",
-            "title": "User Id",
-            "type": "string"
-          }
-        },
-        "required": [
-          "host_id",
-          "user_id",
-          "host_secret"
-        ],
-        "title": "AgentHostPairingCompleted",
         "type": "object"
       },
       "AgentHostPairingCreate": {
@@ -1274,90 +770,6 @@
         ],
         "title": "AgentHostPairingCreated",
         "type": "object"
-      },
-      "AgentHostPollRequest": {
-        "properties": {
-          "acknowledged_command_ids": {
-            "items": {
-              "format": "uuid",
-              "type": "string"
-            },
-            "maxItems": 256,
-            "title": "Acknowledged Command Ids",
-            "type": "array"
-          },
-          "capacity": {
-            "$ref": "#/components/schemas/AgentHostCapacity"
-          },
-          "checkpoints": {
-            "items": {
-              "$ref": "#/components/schemas/AgentHostRunCheckpoint"
-            },
-            "maxItems": 256,
-            "title": "Checkpoints",
-            "type": "array"
-          },
-          "hello": {
-            "$ref": "#/components/schemas/HostHello"
-          },
-          "rejections": {
-            "items": {
-              "$ref": "#/components/schemas/AgentHostCommandRejection"
-            },
-            "maxItems": 256,
-            "title": "Rejections",
-            "type": "array"
-          }
-        },
-        "required": [
-          "hello"
-        ],
-        "title": "AgentHostPollRequest",
-        "type": "object"
-      },
-      "AgentHostPollResponse": {
-        "properties": {
-          "commands": {
-            "items": {
-              "$ref": "#/components/schemas/AgentHostCommand"
-            },
-            "title": "Commands",
-            "type": "array"
-          },
-          "host_status": {
-            "$ref": "#/components/schemas/AgentHostStatus"
-          },
-          "poll_after_ms": {
-            "default": 0,
-            "maximum": 60000.0,
-            "minimum": 0.0,
-            "title": "Poll After Ms",
-            "type": "integer"
-          },
-          "protocol_version": {
-            "default": 2,
-            "title": "Protocol Version",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "host_status"
-        ],
-        "title": "AgentHostPollResponse",
-        "type": "object"
-      },
-      "AgentHostRejectionCode": {
-        "enum": [
-          "DRAINING",
-          "COMMAND_EXPIRED",
-          "HARNESS_NOT_FOUND",
-          "CONFIG_REVISION_STALE",
-          "CAPACITY_LOST",
-          "ADAPTER_UNAVAILABLE",
-          "INVALID_COMMAND"
-        ],
-        "title": "AgentHostRejectionCode",
-        "type": "string"
       },
       "AgentHostResponse": {
         "properties": {
@@ -1453,52 +865,6 @@
         ],
         "title": "AgentHostResponse",
         "type": "object"
-      },
-      "AgentHostRunCheckpoint": {
-        "properties": {
-          "detail": {
-            "additionalProperties": true,
-            "title": "Detail",
-            "type": "object"
-          },
-          "lease_epoch": {
-            "minimum": 1.0,
-            "title": "Lease Epoch",
-            "type": "integer"
-          },
-          "run_id": {
-            "format": "uuid",
-            "title": "Run Id",
-            "type": "string"
-          },
-          "state": {
-            "$ref": "#/components/schemas/AgentHostRunState"
-          }
-        },
-        "required": [
-          "run_id",
-          "lease_epoch",
-          "state"
-        ],
-        "title": "AgentHostRunCheckpoint",
-        "type": "object"
-      },
-      "AgentHostRunState": {
-        "enum": [
-          "QUEUED_FOR_HOST",
-          "LEASED",
-          "ACCEPTED",
-          "DISPATCHING",
-          "RUNNING",
-          "RECOVERING",
-          "WAITING_INPUT",
-          "SUCCEEDED",
-          "FAILED",
-          "CANCELLED",
-          "DISPATCH_UNKNOWN"
-        ],
-        "title": "AgentHostRunState",
-        "type": "string"
       },
       "AgentHostStatus": {
         "enum": [
@@ -2035,6 +1401,16 @@
             },
             "title": "Items",
             "type": "array"
+          },
+          "organization_default_runtime": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/AgentRuntimeConfig"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -2171,6 +1547,38 @@
           "derived_harness_kind"
         ],
         "title": "AgentRuntimeProfileResponse",
+        "type": "object"
+      },
+      "AgentRuntimeProfileTestResponse": {
+        "properties": {
+          "message": {
+            "title": "Message",
+            "type": "string"
+          },
+          "models": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Models"
+          },
+          "ok": {
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "message"
+        ],
+        "title": "AgentRuntimeProfileTestResponse",
         "type": "object"
       },
       "AgentSummaryResponse": {
@@ -3502,6 +2910,16 @@
               }
             ],
             "title": "Title"
+          },
+          "unavailable_reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/SurfaceUnavailableReason"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -3836,6 +3254,19 @@
             "description": "Auth config ID to connect",
             "title": "Auth Config Id"
           },
+          "connection_fields": {
+            "anyOf": [
+              {
+                "additionalProperties": true,
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-connection values the sign-in itself does not carry, such as Shopify's store `subdomain`. Validated against the connector kind's `config_schema`; omit for connectors that declare none.",
+            "title": "Connection Fields"
+          },
           "connector_id": {
             "anyOf": [
               {
@@ -4020,6 +3451,18 @@
             },
             "title": "Kinds",
             "type": "array"
+          },
+          "oauth_redirect_uri": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The redirect URI an OAuth app registered for this deployment must allow -- the callback every sign-in returns to. The same for every connector; published here because this is what a person reads while registering their own app, and a hand-built copy of it is how a wrong path reached users as redirect_uri_mismatch.",
+            "title": "Oauth Redirect Uri"
           },
           "operations": {
             "additionalProperties": {
@@ -4410,6 +3853,11 @@
             "title": "Is Archived",
             "type": "boolean"
           },
+          "last_activity_at": {
+            "format": "date-time",
+            "title": "Last Activity At",
+            "type": "string"
+          },
           "last_run_error": {
             "anyOf": [
               {
@@ -4572,6 +4020,7 @@
           "id",
           "user_id",
           "pod_id",
+          "last_activity_at",
           "created_at",
           "updated_at",
           "workspace_cwd",
@@ -5269,6 +4718,13 @@
             "default": "OPENAI_COMPATIBLE",
             "title": "Source",
             "type": "string"
+          },
+          "vision_model_names": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Vision Model Names",
+            "type": "array"
           }
         },
         "required": [
@@ -5998,6 +5454,40 @@
           }
         },
         "title": "DisplaySizeResponse",
+        "type": "object"
+      },
+      "EmailDeliveryStatusResponse": {
+        "properties": {
+          "configured": {
+            "description": "Whether mail sent from this server can reach an inbox. False while no provider is set up, and while mail is written to a local spool (EMAIL_TRANSPORT=filesystem) instead of being sent.",
+            "title": "Configured",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "configured"
+        ],
+        "title": "EmailDeliveryStatusResponse",
+        "type": "object"
+      },
+      "EmailDeliveryTestResponse": {
+        "properties": {
+          "message": {
+            "description": "What happened, in words to show the person: where the email went, or what to change. Never the provider's own error.",
+            "title": "Message",
+            "type": "string"
+          },
+          "ok": {
+            "description": "Whether the test email was handed to the provider",
+            "title": "Ok",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "ok",
+          "message"
+        ],
+        "title": "EmailDeliveryTestResponse",
         "type": "object"
       },
       "EndNode": {
@@ -7144,6 +6634,7 @@
             "enum": [
               "existing",
               "surface_join",
+              "invitation",
               "domain_join",
               "new_org"
             ],
@@ -8740,34 +8231,6 @@
           "agents"
         ],
         "title": "HomePodResponse",
-        "type": "object"
-      },
-      "HostHello": {
-        "properties": {
-          "host_release": {
-            "maxLength": 128,
-            "minLength": 1,
-            "title": "Host Release",
-            "type": "string"
-          },
-          "installation_id": {
-            "maxLength": 255,
-            "minLength": 1,
-            "title": "Installation Id",
-            "type": "string"
-          },
-          "protocol_version": {
-            "minimum": 1.0,
-            "title": "Protocol Version",
-            "type": "integer"
-          }
-        },
-        "required": [
-          "installation_id",
-          "host_release",
-          "protocol_version"
-        ],
-        "title": "HostHello",
         "type": "object"
       },
       "IconUploadRequest": {
@@ -10449,8 +9912,22 @@
           },
           "payload": {
             "additionalProperties": true,
+            "description": "The operation's arguments. A file argument takes a reference -- `{\"pod_path\": \"/me/report.pdf\"}`, `{\"file_id\": \"...\"}`, `{\"url\": \"https://...\"}` or `{\"base64\": \"...\", \"filename\": \"...\"}` -- read with the caller's own access before the call is made. `output_path` chooses where a file result lands in the pod.",
             "title": "Payload",
             "type": "object"
+          },
+          "pod_id": {
+            "anyOf": [
+              {
+                "format": "uuid",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The pod that `pod_path` and `file_id` references resolve in, and that file results land in. Implied for a call made from inside a pod; name it when calling as a person from outside one.",
+            "title": "Pod Id"
           }
         },
         "required": [
@@ -10713,6 +10190,18 @@
       "OrganizationInvitationResponse": {
         "description": "Organization invitation response schema.",
         "properties": {
+          "accept_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "The link the invitee opens to accept, as the invitation email carries it. Returned to the organization's owners and editors, so an invitation can be handed over another way when email is not set up here.",
+            "title": "Accept Url"
+          },
           "accepted_at": {
             "anyOf": [
               {
@@ -10734,6 +10223,18 @@
             "format": "email",
             "title": "Email",
             "type": "string"
+          },
+          "emailed": {
+            "anyOf": [
+              {
+                "type": "boolean"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Whether this server emails invitations. False means email is not set up here: the invitation exists, but nobody was sent it, so share `accept_url` with the invitee yourself.",
+            "title": "Emailed"
           },
           "expires_at": {
             "format": "date-time",
@@ -13753,6 +13254,32 @@
         "title": "SetDefaultSurfaceRequest",
         "type": "object"
       },
+      "SetOrganizationDefaultRuntimeRequest": {
+        "properties": {
+          "model_name": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Name"
+          },
+          "profile_id": {
+            "minLength": 1,
+            "title": "Profile Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "profile_id"
+        ],
+        "title": "SetOrganizationDefaultRuntimeRequest",
+        "type": "object"
+      },
       "SignInOutcomeResponse": {
         "properties": {
           "origin": {
@@ -14024,9 +13551,17 @@
             "type": "array"
           },
           "dm_conversation_reset_after_hours": {
-            "default": 24,
-            "title": "Dm Conversation Reset After Hours",
-            "type": "integer"
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "deprecated": true,
+            "description": "Ignored. The DM reset window is a deployment-wide setting (SURFACE_DM_CONVERSATION_RESET_AFTER_HOURS). Still accepted so existing pod bundles and clients keep working.",
+            "title": "Dm Conversation Reset After Hours"
           },
           "identity": {
             "$ref": "#/components/schemas/SurfaceIdentityConfigInput"
@@ -14111,11 +13646,6 @@
             },
             "title": "Channels",
             "type": "array"
-          },
-          "dm_conversation_reset_after_hours": {
-            "default": 24,
-            "title": "Dm Conversation Reset After Hours",
-            "type": "integer"
           },
           "identity": {
             "$ref": "#/components/schemas/SurfaceIdentityConfigResponse"
@@ -14911,6 +14441,15 @@
         },
         "title": "SurfaceTelegramConfigInput",
         "type": "object"
+      },
+      "SurfaceUnavailableReason": {
+        "description": "Why a platform cannot be connected on this server right now.\n\nPublished so a setup screen can say what to do instead of offering a\nConnect button whose only outcome is a refusal. Each value names the thing\nthat is missing, not the setting that supplies it: the setting is the\noperator's word, and on Desktop the person reading is the operator but\nconfigures it through a form, not an environment variable.",
+        "enum": [
+          "NEEDS_PUBLIC_LINK",
+          "NEEDS_EMAIL_DOMAIN"
+        ],
+        "title": "SurfaceUnavailableReason",
+        "type": "string"
       },
       "SurfaceUpdateRequest": {
         "additionalProperties": false,
@@ -18941,6 +18480,63 @@
         "title": "WorkspaceFileListResponse",
         "type": "object"
       },
+      "WorkspaceStatusResponse": {
+        "properties": {
+          "detail": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "A sentence for a person.",
+            "title": "Detail"
+          },
+          "done_mb": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "While `downloading`: megabytes fetched so far.",
+            "title": "Done Mb"
+          },
+          "state": {
+            "description": "`ready`: running. `downloading`: fetching its image, which the first start after an update does. `starting`: coming up. `asleep`: not running, and starts on first use. `unavailable`: could not be asked.",
+            "enum": [
+              "ready",
+              "downloading",
+              "starting",
+              "asleep",
+              "unavailable"
+            ],
+            "title": "State",
+            "type": "string"
+          },
+          "total_mb": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "While `downloading`: megabytes in total.",
+            "title": "Total Mb"
+          }
+        },
+        "required": [
+          "state"
+        ],
+        "title": "WorkspaceStatusResponse",
+        "type": "object"
+      },
       "attach": {
         "properties": {
           "data": {
@@ -19052,332 +18648,10 @@
   "info": {
     "description": "Authentication API with JWT, user management, and OAuth support",
     "title": "Lemma Backend",
-    "version": "0.8.0"
+    "version": "0.9.0"
   },
   "openapi": "3.1.0",
   "paths": {
-    "/agent-host/events/append": {
-      "post": {
-        "description": "Append one ordered batch to the run's stream.\n\nThere is no second lane to publish on: every event type travels the one\nordered stream, and the ack watermark is the stream's last entry.",
-        "operationId": "agent.host.events.append",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AgentHostEventBatch"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AgentHostEventAck"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Append Agent Host Events",
-        "tags": [
-          "agent_host"
-        ],
-        "x-lemma": {
-          "invalidates": [
-            "agent.host.events"
-          ],
-          "kind": "mutation",
-          "paginates": false,
-          "resource": "agent.host.events",
-          "result": "entity",
-          "verb": "append"
-        }
-      }
-    },
-    "/agent-host/harnesses": {
-      "put": {
-        "description": "Replace this host's harness snapshots with the reported set.",
-        "operationId": "agent.host.harnesses.publish",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AgentHostHarnessPublishRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AgentHostHarnessPublishResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Publish Agent Host Harnesses",
-        "tags": [
-          "agent_host"
-        ],
-        "x-lemma": {
-          "invalidates": [
-            "agent.host.harnesses"
-          ],
-          "kind": "mutation",
-          "paginates": false,
-          "resource": "agent.host.harnesses",
-          "result": "entity",
-          "verb": "publish"
-        }
-      }
-    },
-    "/agent-host/pairings/complete": {
-      "post": {
-        "description": "Consume a pairing code and issue the host secret, shown exactly once.",
-        "operationId": "agent.host.pairing.complete",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AgentHostPairingComplete"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AgentHostPairingCompleted"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Complete Agent Host Pairing",
-        "tags": [
-          "agent_host"
-        ],
-        "x-lemma": {
-          "invalidates": [
-            "agent.host.pairing"
-          ],
-          "kind": "mutation",
-          "paginates": false,
-          "resource": "agent.host.pairing",
-          "result": "entity",
-          "verb": "complete"
-        }
-      }
-    },
-    "/agent-host/poll": {
-      "post": {
-        "description": "Long-poll for commands, carrying the host's control updates up.\n\nThis owns its own units of work rather than the request-scoped one: the\nidle wait below can hold the connection open for 25 seconds, and a\ntransaction must not stay open across it.",
-        "operationId": "agent.host.poll",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/AgentHostPollRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AgentHostPollResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Poll Agent Host Commands",
-        "tags": [
-          "agent_host"
-        ],
-        "x-lemma": {
-          "invalidates": [
-            "agent.host"
-          ],
-          "kind": "mutation",
-          "paginates": false,
-          "resource": "agent.host",
-          "result": "entity",
-          "verb": "poll"
-        }
-      }
-    },
-    "/agent-host/revoke": {
-      "post": {
-        "description": "Let a host retire its own credential, e.g. on uninstall.",
-        "operationId": "agent.host.self_revoke",
-        "parameters": [
-          {
-            "in": "header",
-            "name": "authorization",
-            "required": false,
-            "schema": {
-              "anyOf": [
-                {
-                  "type": "string"
-                },
-                {
-                  "type": "null"
-                }
-              ],
-              "title": "Authorization"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/AgentHostResponse"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ErrorResponse"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Self Revoke Agent Host",
-        "tags": [
-          "agent_host"
-        ],
-        "x-lemma": {
-          "invalidates": [
-            "agent.host"
-          ],
-          "kind": "mutation",
-          "paginates": false,
-          "resource": "agent.host",
-          "result": "entity",
-          "verb": "self_revoke"
-        }
-      }
-    },
     "/auth/verify-token": {
       "get": {
         "description": "Validate the current bearer token and return the resolved user context.",
@@ -19803,7 +19077,7 @@
     },
     "/me/runtime/agent-hosts/{host_id}": {
       "delete": {
-        "description": "Revoke a host, invalidating its secret immediately.",
+        "description": "Revoke a host, invalidating its secret immediately.\n\nThe secret stops authenticating the moment this commits, but a link opened\nwith it before then is already past authentication. The notice closes it,\non whichever replica holds it, instead of leaving it working until the host\nhappens to reconnect.",
         "operationId": "agent.host.revoke",
         "parameters": [
           {
@@ -20523,6 +19797,113 @@
         }
       }
     },
+    "/organizations/{organization_id}/agent-runtime/default": {
+      "delete": {
+        "operationId": "agent.runtime.default.clear",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Organization Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Clear the Organization's Default Model",
+        "tags": [
+          "agent_runtime"
+        ],
+        "x-lemma": {
+          "invalidates": [
+            "agent.runtime.default"
+          ],
+          "kind": "mutation",
+          "paginates": false,
+          "resource": "agent.runtime.default",
+          "result": "void",
+          "verb": "clear"
+        }
+      },
+      "put": {
+        "operationId": "agent.runtime.default.set",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Organization Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetOrganizationDefaultRuntimeRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentRuntimeConfig"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Set the Organization's Default Model",
+        "tags": [
+          "agent_runtime"
+        ],
+        "x-lemma": {
+          "invalidates": [
+            "agent.runtime.default"
+          ],
+          "kind": "mutation",
+          "paginates": false,
+          "resource": "agent.runtime.default",
+          "result": "entity",
+          "verb": "set"
+        }
+      }
+    },
     "/organizations/{organization_id}/agent-runtime/profiles": {
       "get": {
         "operationId": "agent.runtime.profiles.list",
@@ -20923,6 +20304,68 @@
           "resource": "agent.runtime.profiles",
           "result": "entity",
           "verb": "restore"
+        }
+      }
+    },
+    "/organizations/{organization_id}/agent-runtime/profiles/{profile_id}/test": {
+      "post": {
+        "operationId": "agent.runtime.profiles.test",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "organization_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Organization Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "profile_id",
+            "required": true,
+            "schema": {
+              "title": "Profile Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentRuntimeProfileTestResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Test a Saved Model Provider",
+        "tags": [
+          "agent_runtime"
+        ],
+        "x-lemma": {
+          "invalidates": [
+            "agent.runtime.profiles"
+          ],
+          "kind": "mutation",
+          "paginates": false,
+          "resource": "agent.runtime.profiles",
+          "result": "entity",
+          "verb": "test"
         }
       }
     },
@@ -25476,7 +24919,7 @@
     },
     "/pods/{pod_id}/conversations": {
       "get": {
-        "description": "List root conversations for the current user in a pod. Omit agent_name to list conversations across the pod, pass POD_DEFAULT (or pod_default) to list default pod assistant conversations, or pass a name to list conversations for a specific pod agent. Child (sub-agent) conversations are omitted by default; pass parent_id to list the children of a specific conversation instead. Archived conversations are omitted; pass archived=true for the archive.",
+        "description": "List root conversations for the current user in a pod. Omit agent_name to list conversations across the pod, pass POD_DEFAULT (or pod_default) to list default pod assistant conversations, or pass a name to list conversations for a specific pod agent. Child (sub-agent) conversations are omitted by default; pass parent_id to list the children of a specific conversation instead. Archived conversations are omitted; pass archived=true for the archive. Pass search to keep only conversations whose title contains it (case-insensitive). Ordered by last_activity_at, most recent first.",
         "operationId": "agent.conversation.list",
         "parameters": [
           {
@@ -25563,6 +25006,24 @@
               "default": false,
               "title": "Archived",
               "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "search",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "maxLength": 200,
+                  "minLength": 1,
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Search"
             }
           },
           {
@@ -26250,6 +25711,93 @@
         }
       }
     },
+    "/pods/{pod_id}/conversations/{conversation_id}/messages/{message_id}": {
+      "delete": {
+        "description": "Take back a message sent while a run was working, before the agent has seen it. Only a message still queued can be withdrawn: one that a run has read, or that is already on its way to an Agent Host turn, is answered 409.",
+        "operationId": "agent.conversation.message.withdraw",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "pod_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Pod Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "conversation_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Conversation Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "message_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Message Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "404": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Conversation was not found or is not visible"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The message is no longer queued"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Withdraw Queued Conversation Message",
+        "tags": [
+          "agent_conversations"
+        ],
+        "x-lemma": {
+          "invalidates": [
+            "agent.conversation.message"
+          ],
+          "kind": "mutation",
+          "paginates": false,
+          "resource": "agent.conversation.message",
+          "result": "void",
+          "verb": "withdraw"
+        }
+      }
+    },
     "/pods/{pod_id}/conversations/{conversation_id}/retry": {
       "post": {
         "description": "Start a new run from the latest failed run's persisted conversation history without appending a duplicate user message. Retry is allowed only when the failed run produced no assistant, tool, or system activity. Attach to the returned run with the conversation stream endpoint.",
@@ -26923,6 +26471,69 @@
           "resource": "file.markdown",
           "result": "entity",
           "verb": "attach"
+        }
+      }
+    },
+    "/pods/{pod_id}/datastore/files/by-path/retry-processing": {
+      "post": {
+        "description": "Queue a document whose processing failed to be read and indexed again, with a fresh retry budget. A file that did not fail is returned unchanged.",
+        "operationId": "file.retry_processing",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "pod_id",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "title": "Pod Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "path",
+            "required": true,
+            "schema": {
+              "title": "Path",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileDetailResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Retry File Processing",
+        "tags": [
+          "files"
+        ],
+        "x-lemma": {
+          "invalidates": [
+            "file"
+          ],
+          "kind": "mutation",
+          "paginates": false,
+          "resource": "file",
+          "result": "entity",
+          "verb": "retry_processing"
         }
       }
     },
@@ -36958,6 +36569,77 @@
         }
       }
     },
+    "/users/me/email-delivery": {
+      "get": {
+        "description": "Whether this local installation can send email. Local installations only; 404 elsewhere.",
+        "operationId": "user.email_delivery.get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EmailDeliveryStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Get Email Delivery Status",
+        "tags": [
+          "Users"
+        ],
+        "x-lemma": {
+          "kind": "query",
+          "paginates": false,
+          "resource": "user.email_delivery",
+          "result": "entity",
+          "verb": "get"
+        }
+      }
+    },
+    "/users/me/email-delivery/test": {
+      "post": {
+        "description": "Send a short test email to the signed-in user's own address with this installation's email settings. Local installations only; 404 elsewhere.",
+        "operationId": "user.email_delivery.test",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EmailDeliveryTestResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "429": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Too many test emails; see Retry-After"
+          }
+        },
+        "summary": "Send A Test Email",
+        "tags": [
+          "Users"
+        ],
+        "x-lemma": {
+          "invalidates": [
+            "user.email_delivery"
+          ],
+          "kind": "mutation",
+          "paginates": false,
+          "resource": "user.email_delivery",
+          "result": "entity",
+          "verb": "test"
+        }
+      }
+    },
     "/users/me/first-workspace": {
       "post": {
         "description": "Select an eligible organization and idempotently ensure the current user has a private pod and assistant.",
@@ -37754,6 +37436,34 @@
           "resource": "workspace.files",
           "result": "entity",
           "verb": "stat"
+        }
+      }
+    },
+    "/workspace/status": {
+      "get": {
+        "operationId": "workspace.status",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkspaceStatusResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "Whether your computer is ready",
+        "tags": [
+          "Workspace"
+        ],
+        "x-lemma": {
+          "kind": "query",
+          "paginates": false,
+          "resource": "workspace",
+          "result": "entity",
+          "verb": "status"
         }
       }
     }

@@ -8,6 +8,7 @@ The provider waits for the HTTP client to observe text before it can finish.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import shlex
 import signal
@@ -30,6 +31,7 @@ from app.modules.agent.api.agent_host_schemas import (
 from app.modules.agent.domain.value_objects import JsonObject
 from app.modules.test_support.e2e.builders import E2EScenario
 from app.modules.test_support.e2e.waiters import eventually
+from app.modules.test_support.e2e.agent_host_binary import agent_host_binary
 
 pytestmark = [pytest.mark.e2e, pytest.mark.local_cli, pytest.mark.approval_worker]
 
@@ -68,6 +70,13 @@ class AcpMessage(BaseModel):
     result: JsonValue = None
 
 
+class EnvironmentRecord(BaseModel):
+    """What the scripted agent recorded of the environment it started in."""
+
+    direction: Literal["environment"]
+    message: dict[str, str]
+
+
 class AcpRecord(BaseModel):
     direction: str
     message: AcpMessage
@@ -101,13 +110,7 @@ async def running_host(
     root: Path, base_url: str, pairing_code: SecretStr, *, scenario_file: str
 ) -> AsyncIterator[Path]:
     assert os.name == "posix", "The scripted ACP process lane runs on macOS or Linux"
-    binary = Path(
-        os.environ.get(
-            "LEMMA_AGENT_HOST_E2E_BINARY",
-            str(_REPOSITORY / "desktop/target/debug/lemma-agent-host"),
-        )
-    )
-    assert binary.is_file(), "Build lemma-agent-host first: make desktop-agent-host-e2e"
+    binary = agent_host_binary()
     fixture = _REPOSITORY / "desktop/agent-host/tests/fixtures/scripted_acp_agent.py"
     shims = root / "shim-bin"
     shims.mkdir()
@@ -184,7 +187,9 @@ async def running_host(
                     await process.wait()
 
 
-async def ready_harness(client: httpx.AsyncClient) -> AgentHostHarnessResponse:
+async def ready_harness(
+    client: httpx.AsyncClient, harness_key: str = "cursor"
+) -> AgentHostHarnessResponse:
     response = await client.get("/me/runtime/agent-hosts")
     assert response.is_success, response.text
     hosts = AgentHostListResponse.model_validate(response.json()).items
@@ -200,17 +205,17 @@ async def ready_harness(client: httpx.AsyncClient) -> AgentHostHarnessResponse:
         label="scripted agent ready on the real Rust host",
         probe=published,
         done=lambda items: any(
-            item.harness_key == "cursor" and item.health == "READY" for item in items
+            item.harness_key == harness_key and item.health == "READY" for item in items
         ),
         timeout_seconds=45,
     )
-    return next(item for item in harnesses if item.harness_key == "cursor")
+    return next(item for item in harnesses if item.harness_key == harness_key)
 
 
 async def create_host_conversation(
-    client: httpx.AsyncClient, scenario: E2EScenario
+    client: httpx.AsyncClient, scenario: E2EScenario, harness_key: str = "cursor"
 ) -> str:
-    harness = await ready_harness(client)
+    harness = await ready_harness(client, harness_key)
     profile_id = await create_resource(
         client,
         f"/organizations/{scenario.org_id}/agent-runtime/profiles",
@@ -237,6 +242,73 @@ async def create_host_conversation(
         {"agent_name": agent_name, "title": "Full host streaming"},
     )
     return f"/pods/{scenario.pod_id}/conversations/{conversation_id}"
+
+
+@pytest.mark.asyncio
+async def test_a_coding_agent_keeps_its_own_setup_and_gets_its_run_identity(
+    scenario: E2EScenario,
+    backend_server: dict[str, str],
+    worker: object,
+    tmp_path: Path,
+) -> None:
+    """What the real host starts an agent with, as the agent sees it.
+
+    The scripted agent stands in for OpenCode here, so it is started the way
+    OpenCode is: on the person's own setup, with none of the switches that
+    would leave their skills out (`acp::session_options`); only Lemma's
+    web-fetch override, when the run has Lemma's. And like every agent it is
+    handed the run's Lemma identity, now including the conversation the
+    `lemma` CLI's conversation commands default to.
+    """
+    del worker
+    await scenario.create_org_with_pod(name_prefix="Host session options")
+    minted = await scenario.owner_client.post(
+        "/me/runtime/agent-host-pairings",
+        json={"display_name": "isolated session-options host"},
+    )
+    assert minted.is_success, minted.text
+    pairing = PairingCode.model_validate(minted.json())
+    base_url = backend_server["host_base_url"]
+    async with running_host(
+        tmp_path, base_url, pairing.pairing_code, scenario_file="stream.json"
+    ) as traffic:
+        async with httpx.AsyncClient(
+            base_url=base_url, headers=scenario.owner_client.headers, timeout=90
+        ) as client:
+            conversation_path = await create_host_conversation(
+                client, scenario, harness_key="opencode"
+            )
+            traffic.with_suffix(".release").write_text("continue")
+            async with asyncio.timeout(90):
+                async with client.stream(
+                    "POST",
+                    f"{conversation_path}/messages",
+                    json={"content": "Hello."},
+                ) as response:
+                    assert response.is_success, await response.aread()
+                    async for line in response.aiter_lines():
+                        if line.startswith("data: ") and '"completed"' in line:
+                            break
+
+    environments = [
+        EnvironmentRecord.model_validate_json(line).message
+        for line in traffic.read_text().splitlines()
+        if '"direction":"environment"' in line
+    ]
+    assert environments, "the scripted agent never recorded its environment"
+    # The last one is the run's: the probe that found the agent started it too,
+    # with nothing of a run's.
+    environment = environments[-1]
+    # Names only in the messages: the values are the host's environment.
+    names = sorted(environment)
+    assert "OPENCODE_DISABLE_EXTERNAL_SKILLS" not in environment, names
+    assert "OPENCODE_DISABLE_CLAUDE_CODE" not in environment, names
+    if "OPENCODE_CONFIG_CONTENT" in environment:
+        # Only there when the run has Lemma's own page fetch.
+        overlay = json.loads(environment["OPENCODE_CONFIG_CONTENT"])
+        assert overlay == {"permission": {"webfetch": "deny"}}, overlay
+    conversation_id = conversation_path.rsplit("/", 1)[-1]
+    assert environment.get("LEMMA_CONVERSATION_ID") == conversation_id, names
 
 
 @pytest.mark.asyncio
@@ -484,8 +556,10 @@ async def test_json_acp_tools_obey_the_public_conversation_decision(
                 ), "every tool and approval must have one matching result"
                 for tool_id in expected_ids:
                     native_call = next(m for m in calls if m.tool_call_id == tool_id)
+                    # Canonical: the host names a read's path `file_path`,
+                    # whatever the adapter called it.
                     assert native_call.tool_args == {
-                        "path": f"{tool_id.removeprefix('read-')}.md"
+                        "file_path": f"{tool_id.removeprefix('read-')}.md"
                         if action == "parallel"
                         else "README.md"
                     }
@@ -493,9 +567,9 @@ async def test_json_acp_tools_obey_the_public_conversation_decision(
                         m.tool_result for m in returns if m.tool_call_id == tool_id
                     )
                     if action == "approve":
-                        assert native_result == {"text": "# Mock project"}
+                        assert native_result == {"content": "# Mock project"}
                     elif action == "parallel" and tool_id == "read-a":
-                        assert native_result == {"text": "# File A"}
+                        assert native_result == {"content": "# File A"}
                     else:
                         assert isinstance(native_result, dict)
                         assert native_result["success"] is False
@@ -549,6 +623,12 @@ async def test_browser_chat_replays_json_acp_and_retains_results_after_reload(
 ) -> None:
     del worker
     await scenario.create_org_with_pod(name_prefix="Browser ACP")
+    # A new account with no name is asked for one before anything else, and
+    # that step would stand between the journey and the chat it drives.
+    named = await scenario.owner_client.post(
+        "/users/me/profile", json={"first_name": "Journey", "last_name": "Owner"}
+    )
+    assert named.status_code == 201, named.text
     if action == "stream":
         # Exercise a valid URL-safe token that CLI parsers can mistake for a flag.
         monkeypatch.setattr(

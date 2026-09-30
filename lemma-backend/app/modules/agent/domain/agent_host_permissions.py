@@ -1,7 +1,7 @@
 """ACP permission requests expressed as ordinary Lemma approvals.
 
 An Agent Host run pauses when its ACP agent asks to use a native tool. The host
-holds that request open (``desktop/agent-host/src/permissions.rs``) until a decision
+holds that request open (``desktop/agent-host/src/permissions/``) until a decision
 comes back as a ``RESOLVE_PERMISSION`` command, so the pause sits *inside* a
 live run rather than at a run boundary — unlike ``ask_user`` /
 ``request_approval``, which end their run and resume through a new one.
@@ -112,23 +112,33 @@ def permission_approval_tool_args(
     the surface approval plan alike — needs no Agent Host special case. There
     is no ``args`` key: nothing here is executed by Lemma.
 
-    ``tool_name`` is the name the caller already resolved for the tool call this
-    request belongs to, so the card and the call it interrupts say the same
-    word. Without one, the payload's own ``kind`` is the fallback — a category
-    ("fetch", "execute") rather than a name, which is why the caller resolving
-    it properly is preferred.
+    ``payload`` is the host's normalized request
+    (docs/architecture/agent-host-events.md#permission-requests): ``tool`` is
+    the same ``AgentHostToolRef`` the gated ``tool_call`` carried, so its
+    ``name`` is already Lemma's word for the tool and its ``title`` the
+    adapter's own description of this call. ``tool_name`` is the name the
+    caller already announced the gated call under, preferred so the card and
+    the call it interrupts cannot disagree.
     """
-    tool_call = payload.get("toolCall")
-    tool_call = tool_call if isinstance(tool_call, dict) else {}
-    title = _first_string(tool_call, "title") or "The local agent needs permission"
-    tool_name = tool_name or _first_string(tool_call, "kind", "title") or "native tool"
+    tool = payload.get("tool")
+    tool = tool if isinstance(tool, dict) else {}
+    title = (
+        _first_string(payload, "title")
+        or _first_string(tool, "title")
+        or "The local agent needs permission"
+    )
+    tool_name = tool_name or _first_string(tool, "name") or "native tool"
     reason = _first_string(payload, "message", "reason")
+    # What the agent would run, for the card to show under the marker rather
+    # than as ``args``: shown to the person deciding, never executed by Lemma.
+    tool_input = payload.get("input")
     return {
         "title": title,
         "reason": reason,
         "tool_name": tool_name,
         AGENT_HOST_PERMISSION_KEY: {
             "request_id": request_id,
+            "input": tool_input if isinstance(tool_input, dict) else {},
             "options": [
                 {
                     "option_id": option.option_id,

@@ -11,14 +11,14 @@ only a promise marked `covered` with no test is.
 
 | Status | Scenarios |
 | --- | ---: |
-| `covered` | 166 |
+| `covered` | 170 |
 | `gap` | 2 |
-| `manual` | 12 |
+| `manual` | 16 |
 | `planned` | 0 |
 | `withdrawn` | 0 |
-| **total** | **180** |
+| **total** | **188** |
 
-Scenario tests declaring a promise: 400.
+Scenario tests declaring a promise: 422.
 
 ## Contract coverage
 
@@ -28,7 +28,7 @@ the module suites may cover it — but it is untested *as product*.
 
 | Surface | Exercised | Total |
 | --- | ---: | ---: |
-| OpenAPI operations | 248 | 264 |
+| OpenAPI operations | 243 | 267 |
 | Product events | 28 | 28 |
 
 ## Covered, but only in a lane that is not routinely run
@@ -43,6 +43,7 @@ working one. It is listed because `covered` otherwise reads as
 
 | Scenario | Lane |
 | --- | --- |
+| `PS-AGENT-016` Everyday requests finish while the person waits | `live` |
 | `PS-FUNC-002` A function runs isolated from everything else | `sandbox` |
 | `PS-FUNC-010` A quick function answers immediately | `sandbox` |
 | `PS-FUNC-011` A long function is queued and reports progress | `sandbox` |
@@ -62,12 +63,13 @@ working one. It is listed because `covered` otherwise reads as
 | `PS-AGENT-002` An agent gets only the access it was granted | `covered` | `test_an_agents_reach_can_be_set`, `test_a_data_grant_brings_its_own_tools`, `test_the_universal_abilities_need_no_declaring`, `test_an_agents_grants_are_readable`, `test_an_agent_uses_github_only_when_granted`, `test_an_agent_cannot_call_an_ungranted_connector` |
 | `PS-AGENT-003` A pod has an agent without anyone creating one | `covered` | `test_a_pod_can_be_asked_without_building_an_agent`, `test_deleting_an_agent_keeps_the_default` |
 | `PS-AGENT-005` A person gives an agent a memory | `covered` | `test_memory_comes_with_the_access_it_needs`, `test_memory_access_is_not_handed_out_unasked`, `test_memory_access_leaves_with_the_capability` |
-| `PS-AGENT-004` A person chooses which model an agent uses | `covered` | `test_runtime_profiles_are_listable`, `test_an_outsider_cannot_see_profiles`, `test_an_organization_can_add_a_provider`, `test_a_provider_key_is_never_returned`, `test_a_provider_can_be_archived_and_restored`, `test_an_outsider_cannot_add_a_provider` |
+| `PS-AGENT-004` A person chooses which model an agent uses | `covered` | `test_runtime_profiles_are_listable`, `test_an_outsider_cannot_see_profiles`, `test_an_organization_can_add_a_provider`, `test_a_provider_key_is_never_returned`, `test_a_key_the_provider_rejects_is_refused`, `test_a_provider_can_be_archived_and_restored`, `test_an_outsider_cannot_add_a_provider` |
 | `PS-AGENT-010` A person starts a conversation and gets an answer | `covered` | `test_a_conversation_can_be_retitled`, `test_a_conversation_gets_an_answer`, `test_a_conversation_is_readable_afterwards` |
 | `PS-AGENT-011` A person watches the answer arrive | `covered` | `test_reasoning_is_never_shown_as_the_answer`, `test_a_conversation_can_be_watched` |
 | `PS-AGENT-012` A person can stop an agent | `covered` | `test_stopping_a_run_leaves_the_conversation_usable` |
 | `PS-AGENT-013` A failed run can be tried again | `covered` | `test_retrying_a_healthy_run_is_refused` |
 | `PS-AGENT-015` A person can add to what the agent is already doing | `covered` | `test_a_message_sent_mid_run_is_answered` |
+| `PS-AGENT-016` Everyday requests finish while the person waits | `covered` | `test_a_question_about_data`, `test_a_record_is_added`, `test_a_doc_is_edited_in_place`, `test_a_csv_is_exported`, `test_a_pdf_report_is_made`, `test_a_word_document_is_made`, `test_a_research_memo`, `test_a_web_lookup`, `test_something_is_remembered` |
 | `PS-AGENT-014` A conversation is private to the pod | `covered` | `test_an_outsider_cannot_read_a_conversation` |
 | `PS-AGENT-020` Consequential actions come back to a person first | `covered` | `test_deciding_an_unknown_approval_is_refused`, `test_approvals_are_listable`, `test_approving_runs_the_described_action`, `test_denying_leaves_the_action_undone`, `test_a_destructive_attempt_asks_rather_than_failing_silently`, `test_an_approval_is_offered_with_native_controls` |
 | `PS-AGENT-021` An agent can ask a person a question mid-run | `covered` | `test_an_agent_asks_and_resumes_with_the_answer`, `test_an_unanswered_question_keeps_waiting` |
@@ -105,13 +107,13 @@ working one. It is listed because `covered` otherwise reads as
 | `PS-POD-001` A member of an organization creates a pod and administers it | `covered` | `test_pod_creator_administers_it`, `test_outsider_cannot_create_a_pod` |
 | `PS-POD-002` A pod's name identifies it within its organization | `covered` | `test_pod_names_are_unique_within_an_organization`, `test_a_pod_name_is_scoped_to_its_organization`, `test_a_deleted_pods_name_is_reusable` |
 | `PS-POD-003` A pod carries the settings its work depends on | `covered` | `test_a_partial_update_leaves_the_rest_of_the_settings`, `test_an_icon_round_trips` |
-| `PS-POD-010` A pod admin adds an organization member to the pod | `covered` | `test_a_member_can_be_found`, `test_adding_an_existing_member_again_is_refused`, `test_a_pod_cannot_widen_its_organization`, `test_admin_adds_an_organization_member` |
+| `PS-POD-010` A pod admin adds an organization member to the pod | `covered` | `test_an_organization_owner_administers_a_pod_they_are_not_in`, `test_a_member_can_be_found`, `test_adding_an_existing_member_again_is_refused`, `test_a_pod_cannot_widen_its_organization`, `test_admin_adds_an_organization_member` |
 | `PS-POD-011` A person's pod role decides what they may do inside it | `covered` | `test_an_outsider_cannot_create_a_workflow`, `test_a_viewer_reads_but_does_not_write`, `test_a_role_change_applies_to_the_next_request` |
 | `PS-POD-012` A person can find out what they may do, before trying | `covered` | `test_effective_permissions_are_readable`, `test_reported_permissions_are_honest` |
 | `PS-POD-013` A pod admin defines roles the built-in ones do not cover | `covered` | `test_a_roles_permissions_can_change`, `test_a_role_can_be_described_and_removed`, `test_a_custom_role_is_created_and_assignable`, `test_a_role_cannot_exceed_its_creator`, `test_an_unknown_permission_is_refused_clearly` |
 | `PS-POD-020` A pod decides who may walk in | `covered` | `test_a_new_pod_is_invite_only`, `test_an_org_open_pod_admits_members`, `test_an_outsider_cannot_join_an_org_open_pod` |
-| `PS-POD-021` A person asks for access and an admin decides | `covered` | `test_a_person_sees_their_own_request`, `test_a_join_request_is_approved` |
-| `PS-POD-022` Approving a request cannot be used to gain authority | `covered` | `test_approving_cannot_confer_a_higher_organization_role`, `test_approving_within_your_own_authority_is_allowed`, `test_approving_cannot_confer_unheld_pod_permissions` |
+| `PS-POD-021` A person asks for access and an admin decides | `covered` | `test_an_organization_editor_cannot_make_themselves_a_pod_administrator`, `test_a_person_sees_their_own_request`, `test_a_join_request_is_approved` |
+| `PS-POD-022` Approving a request cannot be used to gain authority | `covered` | `test_approving_cannot_confer_a_higher_organization_role`, `test_approving_within_your_own_authority_is_allowed`, `test_approving_cannot_confer_unheld_pod_permissions`, `test_an_organization_editor_cannot_make_themselves_a_pod_administrator`, `test_an_invitation_cannot_smuggle_a_pod_administrator` |
 | `PS-POD-030` A person sees exactly the pods they may open | `covered` | `test_a_non_member_cannot_open_the_pod`, `test_an_outsider_cannot_open_the_pod`, `test_the_cli_lists_pods`, `test_the_python_sdk_lists_pods`, `test_the_typescript_sdk_lists_pods` |
 | `PS-POD-031` A person sees their pods across every organization at once | `covered` | `test_an_organization_has_a_home` |
 | `PS-POD-040` Removing someone from a pod takes their access away immediately | `covered` | `test_removing_a_member_revokes_access`, `test_a_non_admin_cannot_remove_members` |
@@ -146,22 +148,28 @@ working one. It is listed because `covered` otherwise reads as
 | `PS-ONB-002` A person who has joined nothing sees an empty start, not an error | `covered` | `test_person_with_no_organization_sees_an_empty_start` |
 | `PS-ONB-003` A signed-in person is identified consistently everywhere | `covered` | `test_a_credential_identifies_its_owner`, `test_a_forged_credential_is_refused` |
 | `PS-ONB-004` A person sets a display name and preferences that follow them | `covered` | `test_a_profile_is_one_thing` |
+| `PS-ONB-005` A person chooses comfortable chat text on their device | `manual` | — |
+| `PS-ONB-006` Authentication resumes the person's requested destination | `manual` | — |
+| `PS-ONB-007` A new person confirms their name and can prove their phone before they start | `manual` | — |
 | `PS-ONB-010` The person who creates an organization owns it | `covered` | `test_creator_of_an_organization_owns_it`, `test_a_person_can_own_several_organizations` |
 | `PS-ONB-011` An organization has a handle that survives being renamed | `covered` | `test_renaming_an_organization_keeps_its_handle`, `test_handle_availability_is_checkable` |
 | `PS-ONB-014` Two organizations may share a display name | `covered` | `test_two_organizations_may_share_a_display_name` |
 | `PS-ONB-013` Only an owner changes what the organization is | `covered` | `test_only_an_owner_changes_the_organization` |
-| `PS-ONB-020` An invited person joins with the role they were offered | `covered` | `test_an_invited_person_joins_with_the_offered_role`, `test_an_invitation_is_addressed` |
-| `PS-ONB-021` An invitation can carry a pod, and accepting it grants both | `covered` | `test_an_invitation_carries_its_pod`, `test_an_invitation_to_a_vanished_pod_is_not_silently_half_applied` |
+| `PS-ONB-020` An invited person joins with the role they were offered | `covered` | `test_an_invited_person_joins_with_the_offered_role`, `test_an_editor_invites_up_to_their_own_level`, `test_an_invitation_is_addressed` |
+| `PS-ONB-021` An invitation can carry a pod, and accepting it grants both | `covered` | `test_an_invitation_cannot_smuggle_a_pod_administrator`, `test_an_invitation_carries_its_pod`, `test_an_invitation_to_a_vanished_pod_is_not_silently_half_applied` |
 | `PS-ONB-022` An invitation stops working when it should | `covered` | `test_a_revoked_invitation_is_dead`, `test_an_invitation_is_single_use` |
 | `PS-ONB-023` Inviting someone already inside is refused clearly | `covered` | `test_inviting_an_existing_member_is_refused` |
-| `PS-ONB-024` A person can see the invitations waiting for them | `covered` | `test_a_person_sees_their_invitations`, `test_an_owner_sees_sent_invitations` |
+| `PS-ONB-024` A person can see the invitations waiting for them | `covered` | `test_an_unproven_address_is_not_shown_its_invitations`, `test_an_owner_sees_sent_invitations` |
 | `PS-ONB-030` A person is offered the organizations they could join | `covered` | `test_suggestions_are_empty_without_a_matching_domain` |
 | `PS-ONB-031` A person joins an organization that is open to them | `covered` | `test_invite_only_refuses_self_join`, `test_an_open_organization_admits_anyone_as_a_member`, `test_joining_again_changes_nothing` |
-| `PS-ONB-040` An owner changes what a member may do | `covered` | `test_an_owner_changes_a_role`, `test_a_member_cannot_change_roles` |
+| `PS-ONB-040` Whoever manages people changes what a member may do | `covered` | `test_an_owner_changes_a_role`, `test_a_member_cannot_change_roles`, `test_an_editor_changes_roles_up_to_their_own_level`, `test_an_editor_cannot_make_an_owner`, `test_an_editor_cannot_reach_over_an_owner`, `test_a_member_manages_nobody` |
 | `PS-ONB-041` An organization always has at least one owner | `covered` | `test_the_last_owner_cannot_step_down` |
-| `PS-ONB-042` Removal respects the role hierarchy | `covered` | `test_removing_a_member_takes_their_access` |
+| `PS-ONB-042` Removal respects the role hierarchy | `covered` | `test_an_editor_cannot_reach_over_an_owner`, `test_an_editor_removes_members_and_editors`, `test_a_member_manages_nobody`, `test_removing_a_member_takes_their_access` |
 | `PS-ONB-043` A person can leave on their own | `covered` | `test_removing_a_member_takes_their_access` |
 | `PS-ONB-050` First-chat setup yields one usable personal workspace | `covered` | `test_first_chat_workspace_is_ready_and_reused`, `test_importer_can_defer_personal_pod_creation` |
+| `PS-ONB-060` A visitor can learn about Lemma without signing in | `covered` | `test_public_guides_and_company_pages` |
+| `PS-ONB-061` An AI reader can discover and read the public website | `covered` | `test_machine_readable_site` |
+| `PS-ONB-062` Existing public and workspace entry links keep working | `covered` | `test_existing_links` |
 
 ## [Operating a deployment](journeys/operating-a-deployment.md)
 
@@ -178,7 +186,7 @@ working one. It is listed because `covered` otherwise reads as
 | `PS-OPS-030` The platform reports its own health honestly | `covered` | `test_web_search_says_when_it_is_unavailable` |
 | `PS-OPS-031` Work that cannot be completed is not lost silently | `manual` | `test_feedback_can_be_reported` |
 | `PS-OPS-032` A deployment can be configured for its own region and rules | `manual` | — |
-| `PS-OPS-040` Desktop settings keep drafts until a deliberate decision | `manual` | — |
+| `PS-OPS-040` This computer's settings keep drafts until saved or discarded | `manual` | — |
 | `PS-OPS-041` Desktop reopens the last workspace page after Quit | `manual` | — |
 
 ## [Packaging and reuse](journeys/packaging-and-reuse.md)
@@ -255,6 +263,7 @@ working one. It is listed because `covered` otherwise reads as
 | `PS-SURF-004` A stranger on a shared bot proves who they are before getting a workspace | `manual` | — |
 | `PS-SURF-005` Signup inside a company installation stays inside that company | `manual` | — |
 | `PS-SURF-006` Nothing about signup appears in a channel | `manual` | — |
+| `PS-SURF-007` The owner of a Desktop install chats with the shared Telegram bot by sharing their contact | `manual` | — |
 | `PS-SURF-010` Only genuine messages from the platform are acted on | `covered` | `test_a_real_message_reaches_a_real_person`, `test_verification_needs_no_session`, `test_a_bad_verification_token_is_refused`, `test_a_message_is_answered`, `test_an_unsigned_email_is_refused`, `test_an_unknown_sender_is_told_how_to_get_access`, `test_an_unsigned_delivery_is_rejected`, `test_a_wrongly_signed_delivery_is_rejected`, `test_a_surface_webhook_can_be_verified`, `test_the_manager_webhook_rejects_unsigned`, `test_webhook_verification_needs_no_session`, `test_an_unsigned_webhook_is_rejected` |
 | `PS-SURF-011` The same message delivered twice is answered once | `covered` | `test_an_image_is_understood`, `test_a_repeated_delivery_is_answered_once`, `test_a_raced_delivery_is_answered_once` |
 | `PS-SURF-012` A person on a platform is resolved to who they are in Lemma | `covered` | `test_an_unknown_sender_is_told_how_to_get_access`, `test_reaching_the_bot_is_not_membership_of_the_pod`, `test_a_sender_is_the_same_person_on_every_message` |

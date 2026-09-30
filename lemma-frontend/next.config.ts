@@ -1,48 +1,33 @@
 import type { NextConfig } from "next";
 import path from "node:path";
 
-const devOrigins: string[] = [
-  "localhost",
-  "127.0.0.1",
-  "127.0.0.2",
-  "127.0.0.3",
-  "127.0.1.1",
-  "127.0.2.2",
-  "127.0.2.3",
-  "127.1",
-  "127.0.0.1.nip.io",
-  "127-0-0-1.sslip.io",
-  "127-0-0-2.sslip.io",
-  "127-0-0-3.sslip.io",
-];
+/* The desktop app runs this frontend from a host pack: a Node binary, this
+ * app's standalone tree, and nothing else -- no `npm ci` on somebody's laptop.
+ * Opt-in rather than always on because the hosted image (`Dockerfile`) ships
+ * the whole `node_modules` and starts `server.mjs` against `next.config.ts`,
+ * and tracing a second copy of the dependency graph into `.next/standalone`
+ * would only make that image bigger. `scripts/complete-standalone.mjs` adds
+ * what Next's tracer cannot see: the custom server and its gateways. */
+// The linked SDK has development peers of its own. Its hooks must resolve the
+// same context module as the workspace's QueryClientProvider.
+const queryPackage = path.resolve(process.cwd(), "node_modules/@tanstack/react-query");
 
-const siteUrl = process.env.NEXT_PUBLIC_SITE_URL;
-if (siteUrl) {
-  try {
-    devOrigins.push(new URL(siteUrl).hostname);
-  } catch {}
-}
+const standalone = process.env.LEMMA_STANDALONE === "1";
 
-const authUrl = process.env.NEXT_PUBLIC_AUTH_URL;
-if (authUrl) {
-  try {
-    devOrigins.push(new URL(authUrl).hostname);
-  } catch {}
-}
-
-const apiUrl = process.env.NEXT_PUBLIC_API_URL;
-if (apiUrl) {
-  try {
-    devOrigins.push(new URL(apiUrl).hostname);
-  } catch {}
-}
-
-const nextConfig: NextConfig = {
-  allowedDevOrigins: devOrigins,
-  output: "standalone",
-  transpilePackages: ["lemma-sdk"],
+const config: NextConfig = {
+  ...(standalone ? { output: "standalone" as const } : {}),
+  /* A second dev server (the sample-data one) builds into its own
+     folder, so it can run beside the live one instead of fighting it for
+     `.next`. Unset in every other case. */
+  ...(process.env.LEMMA_DIST_DIR ? { distDir: process.env.LEMMA_DIST_DIR } : {}),
+  poweredByHeader: false,
+  skipTrailingSlashRedirect: true,
   async redirects() {
     return [
+      { source: "/terms", destination: "/tos", permanent: true },
+      { source: "/llm.txt", destination: "/llms.txt", permanent: true },
+      { source: "/login", destination: "/auth", permanent: false },
+      { source: "/signup", destination: "/auth/signup", permanent: false },
       {
         source: "/verify-email",
         destination: "/auth/verify-email",
@@ -53,59 +38,61 @@ const nextConfig: NextConfig = {
         destination: "/auth/reset-password",
         permanent: false,
       },
+      { source: "/landing", destination: "/", permanent: true },
+      ...["home", "pods", "conversations"].map((p) => ({
+        source: "/" + p,
+        destination: "/t",
+        permanent: false,
+      })),
     ];
   },
-  // Required by the /ingest rewrites below: PostHog's ingestion endpoints rely
-  // on trailing slashes (`/batch/`, `/decide/`), and Next's default 307 to the
-  // slash-less form breaks them. Without this the proxy looks configured and
-  // silently delivers nothing.
-  skipTrailingSlashRedirect: true,
   async rewrites() {
-    // Same-origin analytics ingestion. Ad blockers drop a meaningful share of
-    // direct calls to an analytics vendor, and the share they drop skews toward
-    // the technical users Lemma sells to, so the loss is not random noise.
-    //
-    // Both hosts are read at BUILD time, not run time: Next serialises rewrites
-    // into `routes-manifest.json` and the runtime server never re-evaluates this
-    // function. The Docker builder stage has no NEXT_PUBLIC_* set, so overriding
-    // these on a container does nothing — which is also why this rewrite is NOT
-    // gated on the analytics key. A build-time gate would evaluate to "no key"
-    // in every image, including Cloud's, and kill analytics with no error
-    // anywhere. Unconfigured deployments are already inert: with no key the
-    // client never initialises, so nothing ever requests /ingest and this
-    // proxies zero bytes.
-    const ingestHost =
-      process.env.NEXT_PUBLIC_ANALYTICS_INGEST_HOST || "https://eu.i.posthog.com";
-    // Assets live on a *different* host from ingestion. Pointing /static at the
-    // ingest host — as this did — misroutes the remote-config bootstrap.
-    const assetsHost =
-      process.env.NEXT_PUBLIC_ANALYTICS_ASSETS_HOST || "https://eu-assets.i.posthog.com";
+    const ingest =
+      process.env.NEXT_PUBLIC_ANALYTICS_INGEST_HOST ||
+      "https://eu.i.posthog.com";
+    const assets =
+      process.env.NEXT_PUBLIC_ANALYTICS_ASSETS_HOST ||
+      "https://eu-assets.i.posthog.com";
     return [
-      { source: "/ingest/static/:path*", destination: `${assetsHost}/static/:path*` },
-      { source: "/ingest/array/:path*", destination: `${assetsHost}/array/:path*` },
-      { source: "/ingest/:path*", destination: `${ingestHost}/:path*` },
+      {
+        source: "/ingest/static/:path*",
+        destination: assets + "/static/:path*",
+      },
+      { source: "/ingest/array/:path*", destination: assets + "/array/:path*" },
+      { source: "/ingest/:path*", destination: ingest + "/:path*" },
     ];
   },
-  serverExternalPackages: ["esbuild"],
+  transpilePackages: ["lemma-sdk"],
   turbopack: {
     root: path.resolve(process.cwd(), ".."),
+    resolveAlias: { "@tanstack/react-query": "./node_modules/@tanstack/react-query" },
   },
-  images: {
-    remotePatterns: [
+  webpack(config) {
+    config.resolve.alias = { ...config.resolve.alias, "@tanstack/react-query": queryPackage };
+    return config;
+  },
+  async headers() {
+    return [
       {
-        protocol: "https",
-        hostname: "logos.composio.dev",
+        source: "/demo/:path*",
+        headers: [
+          {
+            key: "Content-Security-Policy",
+            value:
+              "connect-src 'self'; form-action 'self'; frame-ancestors 'self'",
+          },
+        ],
       },
       {
-        protocol: "https",
-        hostname: "picsum.photos",
+        source: "/connector-logos/:path*",
+        headers: [
+          {
+            key: "Cache-Control",
+            value: "public, max-age=86400, stale-while-revalidate=604800",
+          },
+        ],
       },
-    ],
-    // Composio logos are SVGs; Next blocks SVG optimization unless explicitly enabled.
-    dangerouslyAllowSVG: true,
-    contentDispositionType: "attachment",
-    contentSecurityPolicy: "default-src 'self'; script-src 'none'; sandbox;",
+    ];
   },
 };
-
-export default nextConfig;
+export default config;

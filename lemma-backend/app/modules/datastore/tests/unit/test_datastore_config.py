@@ -87,6 +87,11 @@ EXPECTED = [
     ),
     ("kreuzberg_circuit_failure_threshold", "KREUZBERG_CIRCUIT_FAILURE_THRESHOLD", 5),
     ("kreuzberg_circuit_reset_seconds", "KREUZBERG_CIRCUIT_RESET_SECONDS", 30.0),
+    (
+        "kreuzberg_max_response_bytes",
+        "KREUZBERG_MAX_RESPONSE_BYTES",
+        256 * 1024 * 1024,
+    ),
     ("pdf_render_dpi", "PDF_RENDER_DPI", 150),
     ("pdf_render_max_long_edge", "PDF_RENDER_MAX_LONG_EDGE", 1568),
     ("pdf_render_jpeg_quality", "PDF_RENDER_JPEG_QUALITY", 80),
@@ -120,6 +125,11 @@ EXPECTED = [
         604800,
     ),
     ("datastore_signed_url_code_bytes", "DATASTORE_SIGNED_URL_CODE_BYTES", 9),
+    (
+        "datastore_orphan_schema_retention_days",
+        "DATASTORE_ORPHAN_SCHEMA_RETENTION_DAYS",
+        30,
+    ),
 ]
 
 # Non-numeric fields (bool / Literal) that the "env=7" parametrization below

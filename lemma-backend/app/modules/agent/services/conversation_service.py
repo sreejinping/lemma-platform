@@ -14,6 +14,7 @@ from app.modules.agent.services.conversation_resume_return import (
     ResumeToolReturnBuilder,
 )
 from app.modules.agent.domain.sentinels import UNSET, UnsetType
+from app.core.authorization.delegation import POD_DEFAULT_AGENT_SELECTOR
 from app.core.authorization.permissions import Permissions
 from app.core.infrastructure.db.uow import SqlAlchemyUnitOfWork
 from app.modules.agent.services.conversation_access import (
@@ -32,6 +33,7 @@ from app.modules.agent.domain.entities import (
 )
 from app.modules.agent.domain.errors import (
     ConversationNotFoundError,
+    ConversationStateError,
 )
 from app.modules.agent.domain.ports import (
     AgentRepository,
@@ -49,6 +51,9 @@ from app.modules.agent.services.workspace_location import (
 )
 from app.modules.pod.contracts.agent_access import pod_organization_id
 from app.modules.usage.contracts.execution import UsageService
+from app.modules.agent.infrastructure.queued_message_queries import (
+    QueuedMessageRepository,
+)
 from app.modules.agent.infrastructure.wait_repository import (
     AgentConversationWaitRepository,
 )
@@ -114,6 +119,7 @@ class ConversationService:
         require_execute_grant: bool = True,
     ) -> Conversation:
         organization_id = await self._get_pod_organization_id(pod_id)
+        agent_name = _named_agent(agent_name)
         agent = (
             await resolve_agent_for_path(
                 self.agent_repository, pod_id=pod_id, agent_name=agent_name
@@ -199,6 +205,7 @@ class ConversationService:
         metadata: dict[str, object] | None | UnsetType = UNSET,
         is_archived: bool | UnsetType = UNSET,
     ) -> Conversation:
+        agent_name = _named_agent(agent_name)
         expected_agent_id = await resolve_expected_agent_id(
             self.agent_repository,
             pod_id=pod_id,
@@ -399,6 +406,9 @@ class ConversationService:
         message_metadata: dict[str, object] | None = None,
         require_execute_grant: bool = True,
     ) -> AgentRunStartResult:
+        # Once, here, so creating the conversation and checking it against the
+        # expected agent read the same answer.
+        agent_name = _named_agent(agent_name)
         conversation = await self._get_or_create_conversation_for_message(
             conversation_id=conversation_id,
             user_id=user_id,
@@ -479,7 +489,62 @@ class ConversationService:
             agent_name=agent_name,
         )
 
+    async def withdraw_queued_message(
+        self,
+        *,
+        conversation_id: UUID,
+        message_id: UUID,
+        user_id: UUID,
+        pod_id: UUID,
+    ) -> None:
+        """Take back a message the agent has not seen yet.
+
+        Only a queued message nobody is carrying: once a run has claimed it, or
+        a steer is on its way to a host, it may already be in the agent's
+        context, and deleting it would leave the agent answering something the
+        person can no longer see. That is a conflict, not a missing message --
+        the client drew it as queued a moment ago and should redraw it.
+        """
+        conversation = validate_conversation_access(
+            await self.conversation_repository.get_conversation(conversation_id),
+            user_id=user_id,
+            pod_id=pod_id,
+        )
+        await require_agent_action(
+            user_id=user_id,
+            pod_id=pod_id,
+            agent_id=conversation.agent_id,
+            action=Permissions.AGENT_EXECUTE,
+        )
+        withdrawn = await QueuedMessageRepository(
+            self.uow
+        ).withdraw_queued_user_message(
+            conversation_id=conversation.id, message_id=message_id
+        )
+        if not withdrawn:
+            raise ConversationStateError(
+                "This message is no longer waiting: the agent already has it."
+            )
+        await self.uow.commit()
+
     @property
     def wait_repository(self) -> AgentConversationWaitRepository:
         """The conversation wait store, reached through the turn coordinator."""
         return self.turns.wait_repository
+
+
+def _named_agent(agent_name: str | None) -> str | None:
+    """The agent a conversation names, or None for the pod's own assistant.
+
+    Blank means "no agent named", and so does the `POD_DEFAULT` selector the
+    list endpoint already accepts, which is not any agent's name. Treating `""`
+    as a name looked up an agent called nothing and answered 404 -- which every
+    CLI chat without `--agent` sent. (`pod_default`, the assistant's stored
+    name, already resolves to it by name.)
+    """
+    if agent_name is None:
+        return None
+    name = agent_name.strip()
+    if not name or name == POD_DEFAULT_AGENT_SELECTOR:
+        return None
+    return name

@@ -3,6 +3,7 @@ use super::*;
 pub(super) fn compose_backend_environment(
     mut operator: HashMap<String, String>,
     infrastructure: Option<HashMap<String, String>>,
+    agent_host_config: &Path,
 ) -> HashMap<String, String> {
     if let Some(infrastructure) = infrastructure {
         // Infrastructure endpoints describe the currently running private
@@ -11,6 +12,16 @@ pub(super) fn compose_backend_environment(
         // these addresses.
         operator.extend(infrastructure);
     }
+    // Where this Mac's own Agent Host keeps its config. The backend reads the
+    // host ids of its pairings from it -- and nothing else -- to tell this
+    // machine's host apart from any other host paired to it: only a user
+    // paired to *this* host gets the loopback relay onto this Mac. A path,
+    // not the ids, because the host writes them when it pairs, which is
+    // usually after the backend started.
+    operator.insert(
+        "DESKTOP_AGENT_HOST_CONFIG_PATH".into(),
+        agent_host_config.to_string_lossy().into_owned(),
+    );
     operator
 }
 
@@ -24,6 +35,7 @@ const SHARED_DESKTOP_AUTH_CREATE_LIMIT: u32 = 100;
 pub(crate) fn sharing_environment(
     origin: &str,
     mode: SharingMode,
+    who_can_join: WhoCanJoin,
 ) -> (HashMap<String, String>, HashMap<String, String>) {
     let origin = origin.trim_end_matches('/');
     let api_url = format!("{origin}/_lemma/api");
@@ -90,6 +102,22 @@ pub(crate) fn sharing_environment(
             SHARED_DESKTOP_AUTH_CREATE_LIMIT.to_string(),
         ),
         ("DEBUG".into(), "false".into()),
+        // The installation is reachable by people other than this Mac's user.
+        //
+        // `ENVIRONMENT` stays `local` -- it chooses storage, embeddings and key
+        // handling that do not change with who can connect -- so it cannot be
+        // what tells the backend to drop the relaxations it grants a machine
+        // nobody else can reach: model providers on this Mac's loopback (which
+        // would let any member aim the backend at Ollama, a dev server or
+        // Lemma's own ports), the loopback CORS defaults, and the
+        // configuration block `/health` shows the scenario suite. This does.
+        ("INSTALLATION_SHARED".into(), "true".into()),
+        // Who may create an account, now that somebody other than this Mac's user
+        // can reach the sign-up page. With `SIGNUP_MODE` unset the backend's
+        // signup is open, so this overlay is the only thing that restricts it.
+        // Written for every choice, `open` included, so a reader of the
+        // running environment can check what was decided.
+        ("SIGNUP_MODE".into(), who_can_join.signup_mode().into()),
     ]);
     let frontend = HashMap::from([
         ("NEXT_PUBLIC_API_URL".into(), api_url),
@@ -133,7 +161,40 @@ pub(super) fn exact_origin_regex(origin: &str) -> String {
     escaped
 }
 
-pub(super) fn validate_canonical_origin(origin: &str) -> io::Result<()> {
+/// What activation checks through the shared origin before sharing commits.
+///
+/// Both halves of the gateway, because either can be what is broken: the
+/// frontend's runtime config, and a real API call. The API call is the ALTCHA
+/// challenge a sign-in asks for first, so a shared stack that could not sign
+/// anybody in -- which is what a missing ALTCHA key produced -- fails here and
+/// is rolled back, instead of being committed and discovered by a visitor.
+pub(crate) const ACTIVATION_PROBES: [&str; 2] = [
+    "/runtime-config.js",
+    "/_lemma/api/auth/altcha/challenge?purpose=signin-risk",
+];
+
+/// Whether an activation probe's answer shows that path working.
+///
+/// The challenge must say ALTCHA is on: the overlay turns it on, so an answer
+/// of `{"enabled": false}` is a backend that did not pick the overlay up.
+pub(crate) fn activation_probe_passed(path: &str, status: u16, body: &str) -> bool {
+    if !(200..300).contains(&status) {
+        return false;
+    }
+    if !path.starts_with("/_lemma/api/") {
+        return true;
+    }
+    serde_json::from_str::<Value>(body)
+        .ok()
+        .and_then(|challenge| challenge.get("enabled").and_then(Value::as_bool))
+        == Some(true)
+}
+
+pub(super) fn validate_canonical_origin(
+    origin: &str,
+    probe_token: &str,
+    provider: Option<crate::sharing::TunnelProvider>,
+) -> io::Result<()> {
     // no_proxy, like every other client in this crate. locald talks to the
     // stack it is itself supervising, and a proxy configured without a
     // `<local>` bypass would route that at something that has never heard of
@@ -147,18 +208,41 @@ pub(super) fn validate_canonical_origin(origin: &str) -> io::Result<()> {
         .build()
         .map_err(io::Error::other)?;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
-    let target = format!("{}/runtime-config.js", origin.trim_end_matches('/'));
-    let mut last_error = String::new();
-    while std::time::Instant::now() < deadline {
-        match client.get(&target).send() {
-            Ok(response) if response.status().is_success() => return Ok(()),
-            Ok(response) => last_error = format!("HTTP {}", response.status()),
-            Err(error) => last_error = error.to_string(),
+    let origin = origin.trim_end_matches('/');
+    for path in ACTIVATION_PROBES {
+        let target = format!("{origin}{path}");
+        let mut last_error;
+        loop {
+            // The gateway is held until this passes; the token is how locald's
+            // own check gets through it.
+            let mut request = client
+                .get(&target)
+                .header(crate::sharing::ACTIVATION_PROBE_HEADER, probe_token);
+            if provider == Some(crate::sharing::TunnelProvider::Ngrok) {
+                // ngrok's free tier puts an HTML interstitial in front of the
+                // first browser request, and this header is its documented way
+                // past for a non-browser client.
+                request = request.header("ngrok-skip-browser-warning", "1");
+            }
+            match request.send() {
+                Ok(response) => {
+                    let status = response.status().as_u16();
+                    let body = response.text().unwrap_or_default();
+                    if activation_probe_passed(path, status, &body) {
+                        break;
+                    }
+                    last_error = format!("{path}: HTTP {status}");
+                }
+                Err(error) => last_error = format!("{path}: {error}"),
+            }
+            if std::time::Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("the shared canonical origin did not become healthy: {last_error}"),
+                ));
+            }
+            thread::sleep(std::time::Duration::from_millis(500));
         }
-        thread::sleep(std::time::Duration::from_millis(500));
     }
-    Err(io::Error::new(
-        io::ErrorKind::TimedOut,
-        format!("the shared canonical origin did not become healthy: {last_error}"),
-    ))
+    Ok(())
 }

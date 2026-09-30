@@ -47,17 +47,42 @@ async def _report_system_model_pricing(
     yield
 
 
+@asynccontextmanager
+async def _drain_agent_host_links(_context: object) -> AsyncIterator[None]:
+    """Tell every host on this replica when to reconnect, as the API stops.
+
+    See ``AgentHostLinkRegistry.drain`` for why this is usually a no-op under
+    uvicorn, and why it is still the only place ``reconnect`` can come from.
+    """
+    yield
+    from app.modules.agent.services.agent_host_link_registry import link_registry
+
+    await link_registry.drain()
+
+
 def _routers():
     from app.modules.agent.api.controllers.agent_controller import router as agent
     from app.modules.agent.api.controllers.agent_host_controller import (
         router as agent_host,
     )
+    from app.modules.agent.api.controllers.agent_host_link_controller import (
+        router as agent_host_link,
+    )
+    from app.modules.agent.api.controllers.agent_host_legacy_controller import (
+        router as agent_host_legacy,
+    )
     from app.modules.agent.api.controllers.runtime_config_controller import (
         router as runtime_config,
+    )
+    from app.modules.agent.api.controllers.runtime_default_controller import (
+        router as runtime_default,
     )
     from app.modules.agent.api.controllers.tool_controller import router as tool
     from app.modules.agent.api.controllers.conversation_controller import (
         router as conversation,
+    )
+    from app.modules.agent.api.controllers.conversation_queue_controller import (
+        router as conversation_queue,
     )
 
     # serve_router is included before the main widget router (more specific path).
@@ -69,9 +94,13 @@ def _routers():
     return [
         agent,
         agent_host,
+        agent_host_link,
+        agent_host_legacy,
         runtime_config,
+        runtime_default,
         tool,
         conversation,
+        conversation_queue,
         widget_serve,
         widget,
     ]
@@ -110,7 +139,7 @@ module = LemmaModule(
     resource_names=_resource_names,
     routers=_routers,
     event_routers=_event_routers,
-    api_lifespans=(_report_system_model_pricing,),
+    api_lifespans=(_report_system_model_pricing, _drain_agent_host_links),
     # The worker is where agent runs actually dispatch, so a deployment
     # whose models cannot back its spend limit has to hear it there too.
     worker_lifespans=(_report_system_model_pricing,),

@@ -5,6 +5,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import HTMLResponse
 
+from app.core.config import reveal_secret
 from app.core.api.callback_page import (
     message_html,
     render_callback_page,
@@ -38,10 +39,14 @@ from app.modules.agent_surfaces.api.controllers.webhook_ingest import (
     _handled_slack_modal,
     _published_whatsapp_verification,
     _redacted_headers,
-    _surface_source_event_id,
     _verify_inbound_request,
 )
+from app.modules.agent_surfaces.api.controllers.webhook_rejections import (
+    record_whatsapp_number_mismatch,
+    record_whatsapp_signature_rejected,
+)
 from app.modules.agent_surfaces.domain.events import SurfaceWebhookReceivedEvent
+from app.modules.agent_surfaces.domain.source_event_ids import webhook_source_event_id
 from app.modules.agent_surfaces.services import teams_consent
 from app.modules.agent_surfaces.services.onboarding_slack_modal import (
     open_onboarding_modal,
@@ -51,6 +56,9 @@ from app.modules.agent_surfaces.services.surface_service import (
 )
 from app.modules.agent_surfaces.services.telegram_manager_service import (
     TelegramManagedBotProvisioningInProgressError,
+)
+from app.modules.agent_surfaces.services.webhook_security_service import (
+    SurfaceWebhookAuthenticationError,
 )
 
 router = APIRouter(prefix="/surfaces", tags=["Agent Surfaces (Ingress)"])
@@ -65,7 +73,9 @@ async def handle_telegram_manager_webhook(
     request: Request,
     service: TelegramManagerServiceDep,
 ):
-    expected = str(surface_settings.telegram_manager_webhook_secret or "").strip()
+    expected = str(
+        reveal_secret(surface_settings.telegram_manager_webhook_secret) or ""
+    ).strip()
     provided = str(request.headers.get("x-telegram-bot-api-secret-token") or "").strip()
     if not expected:
         raise HTTPException(
@@ -150,7 +160,7 @@ async def handle_platform_webhook(
     ):
         return Response(status_code=200)
 
-    source_event_id = _surface_source_event_id(
+    source_event_id = webhook_source_event_id(
         platform, payload, raw_body, receiver=SHARED_PLATFORM_RECEIVER
     )
     event = SurfaceWebhookReceivedEvent(
@@ -245,16 +255,25 @@ async def handle_whatsapp_number_webhook(
     # something the sender chose. Select by path, verify the HMAC over the raw
     # bytes, and only then parse.
     number = await pooled_number(phone_number_id)
-    app_secret = (
-        number.app_secret if number else None
-    ) or surface_settings.whatsapp_app_secret
+    app_secret = (number.app_secret if number else None) or reveal_secret(
+        surface_settings.whatsapp_app_secret
+    )
     # Raises SurfaceWebhookAuthenticationError (a DomainError) on a bad or
     # missing signature, translated to the right status by the global handler.
-    security_service.verify_whatsapp_app_secret(
-        headers=headers,
-        raw_body=raw_body,
-        app_secret=app_secret,
-    )
+    try:
+        security_service.verify_whatsapp_app_secret(
+            headers=headers,
+            raw_body=raw_body,
+            app_secret=app_secret,
+        )
+    except SurfaceWebhookAuthenticationError:
+        record_whatsapp_signature_rejected(
+            phone_number_id=phone_number_id,
+            number=number,
+            headers=headers,
+            app_secret=app_secret,
+        )
+        raise
 
     payload = _decode_webhook_payload(raw_body, headers)
 
@@ -280,6 +299,9 @@ async def handle_whatsapp_number_webhook(
     # notifications do not), and refusing those would break them for a check
     # they cannot answer. The signature already established who sent them.
     if addressed and addressed != {phone_number_id}:
+        record_whatsapp_number_mismatch(
+            phone_number_id=phone_number_id, addressed=addressed
+        )
         raise HTTPException(
             status_code=400,
             detail="Webhook payload is addressed to a different phone number",
@@ -290,8 +312,8 @@ async def handle_whatsapp_number_webhook(
 
     # The number is the receiver, not `SHARED_PLATFORM_RECEIVER`: this URL has
     # one per pooled number, and the content-hash fallback in
-    # `_surface_source_event_id` is only unique per receiver.
-    source_event_id = _surface_source_event_id(
+    # `webhook_source_event_id` is only unique per receiver.
+    source_event_id = webhook_source_event_id(
         "whatsapp", payload, raw_body, receiver=phone_number_id
     )
     event = SurfaceWebhookReceivedEvent(
@@ -339,7 +361,7 @@ async def handle_surface_webhook(
     # Named by the surface, not just the platform: a Telegram ``update_id`` is a
     # per-bot counter, so every bot's first update is 1 and two of them would
     # otherwise share one inbox row.
-    source_event_id = _surface_source_event_id(
+    source_event_id = webhook_source_event_id(
         source, payload, raw_body, receiver=str(surface.id)
     )
     event = SurfaceWebhookReceivedEvent(
@@ -417,7 +439,7 @@ async def verify_surface_webhook(
     return _webhook_verification_response(
         platform,
         dict(request.query_params),
-        whatsapp_verify_token=surface_settings.whatsapp_verify_token,
+        whatsapp_verify_token=reveal_secret(surface_settings.whatsapp_verify_token),
     )
 
 
@@ -438,9 +460,9 @@ async def verify_whatsapp_number_webhook(
     # per-number `verify_token` was not expressible before this route existed.
     # Here the path is the identifier, and it is enough.
     number = await pooled_number(phone_number_id)
-    verify_token = (
-        number.verify_token if number else None
-    ) or surface_settings.whatsapp_verify_token
+    verify_token = (number.verify_token if number else None) or reveal_secret(
+        surface_settings.whatsapp_verify_token
+    )
     # `_token_matches` is constant-time and treats an absent expected token as
     # never matching, so a number with no stored token and a deployment with
     # none in settings refuses the handshake instead of handing out the
@@ -475,7 +497,7 @@ async def verify_direct_surface_webhook(
     whatsapp_verify_token = (
         await security_service.resolve_whatsapp_verify_token(surface)
         if platform == "whatsapp"
-        else surface_settings.whatsapp_verify_token
+        else reveal_secret(surface_settings.whatsapp_verify_token)
     )
     return _webhook_verification_response(
         platform,

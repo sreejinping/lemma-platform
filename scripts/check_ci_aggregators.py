@@ -38,11 +38,6 @@ AGGREGATORS = {
     # Every job in security.yml is path-filtered, so none of them can be named
     # in a ruleset directly; this is the one that can.
     "security.yml": "security-passed",
-    # Required as of the audit backlog. It was advisory for as long as it
-    # enforced floors several modules were below; every module has one recorded
-    # from measurement now, so the gate is green by construction and there is
-    # nothing left to be lenient about.
-    "backend-coverage.yml": "coverage-passed",
 }
 
 # Jobs that legitimately stand outside their workflow's aggregator: they are
@@ -57,6 +52,14 @@ EXEMPT = {
     # job that never starts, since its `if:` includes `github.event_name ==
     # 'push'`. A red one is "look in the morning".
     ("ci.yml", "host-pack-macos"),
+    # New, and so not yet a merge gate: it launches the built app on macOS,
+    # and earns a place in "CI passed" by being boring first. The ruleset can
+    # require it by name in the meantime.
+    ("ci.yml", "desktop-launch-smoke"),
+    # Posts CodeQL's findings as a pull request comment. It reports what the
+    # analyze jobs found, and those jobs are already in "Security passed"; a
+    # comment that failed to post is not a reason to block a merge.
+    ("security.yml", "codeql-pr-comment"),
 }
 
 # The workflow that announces a failure nobody is looking at. It watches the
@@ -64,23 +67,9 @@ EXEMPT = {
 # state every scheduled lane in this repository was in.
 NOTIFIER = "notify-failure.yml"
 
-# Workflows the notifier deliberately does not watch.
-UNWATCHED = {
-    # A `workflow_run` consumer, and the only one here. Such a run always
-    # reports `head_branch: main` and `event: workflow_run`, whatever commit it
-    # is actually about -- so there is no expression the notifier can write that
-    # tells "coverage failed on main" from "coverage failed on somebody's pull
-    # request", and the second is far more common. Announcing both would put
-    # pull-request noise in a channel that exists for the runs nobody sees,
-    # which is how a channel stops being read.
-    #
-    # It is a required check now, which is what replaces the paging: a
-    # regression arrives on the pull request that caused it, in front of the
-    # person who can fix it, rather than in a channel. That was always the
-    # better answer than a Slack message the notifier cannot even attribute to
-    # the right branch.
-    "backend-coverage.yml",
-}
+# Workflows the notifier deliberately does not watch. Empty: the only entry was
+# the `workflow_run` coverage gate, which is now a job inside e2e.yml.
+UNWATCHED: set[str] = set()
 
 # Every workflow is checked for timeouts, not just the two with aggregators.
 # Release workflows are exempt: their jobs legitimately run for well over an

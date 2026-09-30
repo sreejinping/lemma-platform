@@ -1,7 +1,7 @@
 //! What the ACP driver reports back while a run is in flight.
 
 use super::{
-    AcpCallbacks, Arc, AtomicBool, EventType, Journal, JsonMap, Ordering, RunState, Uuid, Value,
+    AcpCallbacks, AtomicBool, EventType, Journal, JsonMap, Ordering, RunState, Uuid, Value,
 };
 
 pub(crate) struct JournalCallbacks {
@@ -14,11 +14,9 @@ pub(crate) struct JournalCallbacks {
     /// Whether the prompt has actually gone out. See `event`.
     pub(crate) dispatched: AtomicBool,
     pub(crate) stream_segments: std::sync::Mutex<StreamSegments>,
-    /// Raised whenever this run journals an event, so the poll loop stops
-    /// waiting and flushes. Without it a run's output sits in the journal until
-    /// the current 25s long poll returns — the agent answered in eight seconds
-    /// and the conversation still waited twenty.
-    pub(crate) events_ready: Arc<tokio::sync::Notify>,
+    /// Raised whenever this run journals something, so it is delivered now
+    /// rather than on the next heartbeat.
+    pub(crate) events_ready: super::OutboxSignal,
 }
 
 /// How much streamed text is held before it is sealed into an upsert.
@@ -138,9 +136,9 @@ impl AcpCallbacks for JournalCallbacks {
         if let Some(cwd) = &self.host_cwd {
             detail.insert("host_cwd".to_owned(), Value::String(cwd.clone()));
         }
-        // Control polling and streaming are independent. Put the binding at
-        // the head of this run's event stream so the backend saves it before
-        // processing any answer, even while its control poll is waiting.
+        // Control frames and event delivery are independent. Put the binding
+        // at the head of this run's event stream so the backend saves it
+        // before processing any answer, whenever the next control frame goes.
         self.journal.append_event(
             self.target_id,
             self.run_id,

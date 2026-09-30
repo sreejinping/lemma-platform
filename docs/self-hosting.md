@@ -170,8 +170,10 @@ The three that most deployments change first:
 
 **Email.** Ships as `EMAIL_TRANSPORT=filesystem`, which writes messages to disk
 instead of sending them. Fine for a trial, wrong for anything with a second
-person in it — invitations and password resets do not arrive. Set SMTP or Resend
-credentials, then turn on `AUTH_EMAIL_VERIFICATION_REQUIRED`. See
+person in it — invitations and password resets do not arrive, and a sender a
+shared chat bot does not recognise is not asked for an address no code can
+reach. Set SMTP or Resend credentials, then turn on
+`AUTH_EMAIL_VERIFICATION_REQUIRED`. See
 [authentication hardening](authentication-hardening.md).
 
 **Models.** `LEMMA_OPENAI_API_KEY` plus `LEMMA_OPENAI_DEFAULT_MODEL`, or the
@@ -252,7 +254,7 @@ already has it.
 ## Upgrades
 
 ```bash
-./bootstrap.sh --force --version 0.8.0   # writes new image digests into .env
+./bootstrap.sh --force --version 0.9.0   # writes new image digests into .env
 docker compose up -d
 ```
 

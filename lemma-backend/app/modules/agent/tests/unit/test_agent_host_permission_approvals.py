@@ -22,6 +22,7 @@ from app.modules.agent.domain.agent_host_permissions import (
     permission_approval_tool_call_id,
 )
 from app.modules.agent.domain.entities import Message
+from app.modules.agent.domain.errors import ApprovalNotOwnedError
 from app.modules.agent.domain.value_objects import (
     AgentRunApprovalDecision,
     MessageKind,
@@ -41,16 +42,20 @@ from app.modules.agent.services.conversation_approvals import (
 )
 
 _PAYLOAD = {
-    "toolCall": {
-        "toolCallId": "call-9",
+    "request_id": "call-9",
+    "tool_call_id": "call-9",
+    "tool": {
+        "name": "exec_command",
+        "source": "native",
         "title": "Run rm -rf build",
         "kind": "execute",
     },
+    "input": {"cmd": "rm -rf build"},
     "message": "The local agent asked for permission to use a native tool.",
     "options": [
-        {"optionId": "reject", "kind": "reject_once", "name": "No"},
-        {"optionId": "once", "kind": "allow_once", "name": "Allow once"},
-        {"optionId": "always", "kind": "allow_always", "name": "Always allow"},
+        {"option_id": "reject", "kind": "reject_once", "name": "No"},
+        {"option_id": "once", "kind": "allow_once", "name": "Allow once"},
+        {"option_id": "always", "kind": "allow_always", "name": "Always allow"},
     ],
 }
 
@@ -69,7 +74,7 @@ class TestApprovalShape:
         args = permission_approval_tool_args(_PAYLOAD, request_id="call-9")
 
         assert args["title"] == "Run rm -rf build"
-        assert args["tool_name"] == "execute"
+        assert args["tool_name"] == "exec_command"
         assert "asked for permission" in str(args["reason"])
 
     def test_no_args_key_because_lemma_executes_nothing(self) -> None:
@@ -79,6 +84,28 @@ class TestApprovalShape:
         args = permission_approval_tool_args(_PAYLOAD, request_id="call-9")
 
         assert "args" not in args
+
+    def test_the_marker_carries_what_would_run_and_every_option(self) -> None:
+        """The card shows the gated call's input, and offers "for this
+        conversation" only when an allow_always option exists -- labelled
+        with that option's own name."""
+        args = permission_approval_tool_args(_PAYLOAD, request_id="call-9")
+        marker = args[AGENT_HOST_PERMISSION_KEY]
+
+        assert marker["input"] == {"cmd": "rm -rf build"}
+        assert {
+            "option_id": "always",
+            "kind": "allowalways",
+            "name": "Always allow",
+        } in marker["options"]
+        # Still read back the same way.
+        assert agent_host_permission_request(args) is not None
+
+    def test_a_request_without_input_carries_an_empty_one(self) -> None:
+        payload = {key: value for key, value in _PAYLOAD.items() if key != "input"}
+        args = permission_approval_tool_args(payload, request_id="call-9")
+
+        assert args[AGENT_HOST_PERMISSION_KEY]["input"] == {}
 
     def test_call_id_does_not_collide_with_the_native_tool_call(self) -> None:
         """The ACP request id *is* the native tool call id, which the host has
@@ -149,8 +176,9 @@ class TestDispatch:
     async def test_decision_is_queued_and_the_host_is_woken(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Without the poke the decision waits out the host's long-poll deadline
-        while the user watches an agent that looks stuck."""
+        """The poke wakes the host's link to push the decision now; without it
+        the decision waits for the link's next push while the user watches an
+        agent that looks stuck."""
         host_id = uuid4()
         run_id = uuid7()
         enqueued: dict = {}
@@ -491,14 +519,18 @@ class TestResolutionRouting:
         host is still executing — the whole reason this branch exists."""
         dispatched: list = []
         service, repository, run_id = self._service(monkeypatch, dispatched)
+        # The owner decides: an approval lends the owner's authority.
         conversation = SimpleNamespace(
-            id=repository.call.conversation_id, agent_id=None, pod_id=uuid4()
+            id=repository.call.conversation_id,
+            agent_id=None,
+            pod_id=uuid4(),
+            user_id=uuid4(),
         )
 
         resolution = await service.resolve_user_approval_internal(
             conversation=conversation,
             approval_id=repository.call.tool_call_id,
-            user_id=uuid4(),
+            user_id=conversation.user_id,
             pod_id=conversation.pod_id,
             decision=AgentRunApprovalDecision.APPROVE_ONCE,
         )
@@ -508,20 +540,51 @@ class TestResolutionRouting:
         assert repository.created_runs == 0
 
     @pytest.mark.asyncio
+    async def test_only_the_owner_can_approve(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """An approved call runs with the owner's authority, so a decision from
+        anyone else is refused before anything is recorded -- the one place
+        every entry point (HTTP, buttons, typed replies) passes through."""
+        service, repository, _ = self._service(monkeypatch, [])
+        conversation = SimpleNamespace(
+            id=repository.call.conversation_id,
+            agent_id=None,
+            pod_id=uuid4(),
+            user_id=uuid4(),
+        )
+
+        with pytest.raises(ApprovalNotOwnedError):
+            await service.resolve_user_approval_internal(
+                conversation=conversation,
+                approval_id=repository.call.tool_call_id,
+                user_id=uuid4(),
+                pod_id=conversation.pod_id,
+                decision=AgentRunApprovalDecision.APPROVE_ONCE,
+            )
+
+        assert repository.decision is None
+        assert repository.appended == []
+
+    @pytest.mark.asyncio
     async def test_the_card_is_closed_with_a_tool_return(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         """Pending approvals are listed by "call without a return". Skipping the
         return would leave the card stuck asking forever."""
         service, repository, _ = self._service(monkeypatch, [])
+        # The owner decides: an approval lends the owner's authority.
         conversation = SimpleNamespace(
-            id=repository.call.conversation_id, agent_id=None, pod_id=uuid4()
+            id=repository.call.conversation_id,
+            agent_id=None,
+            pod_id=uuid4(),
+            user_id=uuid4(),
         )
 
         await service.resolve_user_approval_internal(
             conversation=conversation,
             approval_id=repository.call.tool_call_id,
-            user_id=uuid4(),
+            user_id=conversation.user_id,
             pod_id=conversation.pod_id,
             decision=AgentRunApprovalDecision.APPROVE_ONCE,
         )
@@ -538,14 +601,18 @@ class TestResolutionRouting:
         a wake-up is milliseconds, and someone is watching the agent wait."""
         dispatched: list = []
         service, repository, _ = self._service(monkeypatch, dispatched)
+        # The owner decides: an approval lends the owner's authority.
         conversation = SimpleNamespace(
-            id=repository.call.conversation_id, agent_id=None, pod_id=uuid4()
+            id=repository.call.conversation_id,
+            agent_id=None,
+            pod_id=uuid4(),
+            user_id=uuid4(),
         )
 
         resolution = await service.resolve_user_approval_internal(
             conversation=conversation,
             approval_id=repository.call.tool_call_id,
-            user_id=uuid4(),
+            user_id=conversation.user_id,
             pod_id=conversation.pod_id,
             decision=AgentRunApprovalDecision.APPROVE_ONCE,
             defer_reconciliation=True,
@@ -631,14 +698,18 @@ class TestAParkedInteractionDoesNotResume:
         repository.paused_run = SimpleNamespace(
             id=run_id, status=AgentRunStatus.RUNNING
         )
+        # The owner decides: an approval lends the owner's authority.
         conversation = SimpleNamespace(
-            id=repository.call.conversation_id, agent_id=None, pod_id=uuid4()
+            id=repository.call.conversation_id,
+            agent_id=None,
+            pod_id=uuid4(),
+            user_id=uuid4(),
         )
 
         await service.resolve_user_approval_internal(
             conversation=conversation,
             approval_id=repository.call.tool_call_id,
-            user_id=uuid4(),
+            user_id=conversation.user_id,
             pod_id=conversation.pod_id,
             # Denied rather than approved: an approval would run the wrapped
             # tool as the user, which is a different mechanism entirely. The

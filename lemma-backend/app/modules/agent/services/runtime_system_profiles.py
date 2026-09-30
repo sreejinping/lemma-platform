@@ -27,6 +27,8 @@ from pydantic import HttpUrl, SecretStr
 from app.modules.agent.config import agent_settings
 from app.core.config import reveal_secret, settings
 from app.core.domain.errors import DomainError
+from app.core.log.log import get_logger
+from app.modules.identity.contracts.installation import is_desktop_installation
 from app.modules.agent.services.context_budget import (
     catalog_metadata_for,
 )
@@ -41,6 +43,8 @@ from app.modules.agent.domain.runtime_profiles import (
     RuntimeProfileProtocol,
     RuntimeProfileScope,
 )
+
+logger = get_logger(__name__)
 
 SYSTEM_LEMMA_PROFILE_ID = "system:lemma"
 DEFAULT_SYSTEM_AGENT_RUNTIME_PROFILE_ID = SYSTEM_LEMMA_PROFILE_ID
@@ -66,13 +70,42 @@ def _load_runtime_env() -> None:
     Every value this module reads is `LEMMA_`-prefixed, so nothing else needs to
     be in scope. `setdefault` keeps `override=False`: a variable already in the
     environment wins.
+
+    Skipped on a desktop install. There the only model configuration is what
+    the app itself writes into the server's environment, and a source-mode run
+    of the app sits inside a checkout whose `.env` names a developer's keys --
+    which quietly answered "is a model set up?" with yes, so the first-run path
+    where nothing is configured could not be exercised at all.
     """
+    if is_desktop_installation():
+        return
     root = Path(__file__).resolve().parents[5]
     backend = Path(__file__).resolve().parents[4]
     for path in (backend / ".env", root / ".env"):
         for key, value in dotenv_values(path).items():
             if key.startswith("LEMMA_") and value is not None:
                 os.environ.setdefault(key, value)
+
+
+_REASONING_EFFORTS = frozenset({"none", "minimal", "low", "medium", "high"})
+
+
+def _reasoning_effort_setting() -> dict[str, str]:
+    """The deployment's chosen reasoning effort, when it chose one.
+
+    A thinking model left at its provider default thinks at length before every
+    step of a turn, and a turn is many steps: the time a person waits is
+    mostly that. Unset keeps the provider default.
+    """
+    effort = (os.getenv("LEMMA_OPENAI_REASONING_EFFORT") or "").strip().lower()
+    if not effort:
+        return {}
+    if effort not in _REASONING_EFFORTS:
+        raise DomainError(
+            "LEMMA_OPENAI_REASONING_EFFORT must be one of "
+            + ", ".join(sorted(_REASONING_EFFORTS))
+        )
+    return {"openai_reasoning_effort": effort}
 
 
 def _openai_compat_vision_model_names() -> set[str]:
@@ -219,7 +252,10 @@ def _system_lemma_openai_profile() -> AgentRuntimeProfile | None:
             # which a strict endpoint rejects outright.
             # `_UsageOnlyStreamOptionsChatModel` keeps that half off the wire --
             # see its docstring for why the two halves have to be separated.
-            model_settings={"openai_continuous_usage_stats": True},
+            model_settings={
+                "openai_continuous_usage_stats": True,
+                **_reasoning_effort_setting(),
+            },
         ),
         credentials=ApiKeyRuntimeCredentials(api_key=SecretStr(api_key)),
     )
@@ -295,6 +331,63 @@ def _env_or_setting(env_name: str, setting_value: SecretStr | str | None) -> str
     return normalized or None
 
 
+MODEL_NOT_CONFIGURED_CODE = "model_not_configured"
+
+_DESKTOP_NO_MODEL_MESSAGE = (
+    "No AI model is set up yet. Set up an AI model in This Mac \u2192 Server "
+    "setup, or add a provider in Settings \u2192 Models."
+)
+_SERVER_NO_MODEL_MESSAGE = (
+    "No AI model is set up yet. Add a provider in Settings \u2192 Models."
+)
+#: For whoever reads the server's logs, never for the person whose message
+#: failed: they cannot set an environment variable, and a sentence naming one
+#: reads as a fault in the app.
+SERVER_NO_MODEL_OPERATOR_HINT = (
+    "Set LEMMA_OPENAI_API_KEY (plus LEMMA_OPENAI_BASE_URL if not OpenAI) or "
+    "LEMMA_ANTHROPIC_API_KEY with LEMMA_DEFAULT_MODEL_TYPE=anthropic_compat to "
+    "give this deployment a model of its own."
+)
+
+
+def model_not_configured_error() -> DomainError:
+    """The error for "there is no model to run on", said to whoever sent it.
+
+    Role-neutral: the reader may be a member with no settings access at all, so
+    it names the page where a model is added rather than the environment
+    variables an operator would set (those go to the log, see
+    `SERVER_NO_MODEL_OPERATOR_HINT`). Desktop also names Server setup, because
+    there the reader is the operator. The code is the same on both, because the
+    web app keys its "add a model" action off it.
+    """
+    return DomainError(
+        _DESKTOP_NO_MODEL_MESSAGE
+        if is_desktop_installation()
+        else _SERVER_NO_MODEL_MESSAGE,
+        code=MODEL_NOT_CONFIGURED_CODE,
+        status_code=503,
+    )
+
+
+def is_model_not_configured(error: DomainError) -> bool:
+    """Whether this is "there is no model", as opposed to any other failure --
+    the one case where looking at the workspace instead is right."""
+    return error.code == MODEL_NOT_CONFIGURED_CODE
+
+
+def system_profile_configured() -> bool:
+    """Whether the deployment itself supplies a model provider.
+
+    A half-configured one (a key and no model names) still counts: the operator
+    meant to supply one, and resolving it reports exactly which setting is
+    missing. Only "no credentials at all" means "look elsewhere".
+    """
+    try:
+        return system_lemma_profile() is not None
+    except DomainError:
+        return True
+
+
 def _no_models_configured(
     *,
     credential_setting: str,
@@ -309,10 +402,25 @@ def _no_models_configured(
     that is empty, so the most likely half-configuration of a fresh self-host (a
     key and no model list) explains itself instead of 500ing.
     """
+    # The settings to fill in are the operator's to read, in the log. The
+    # person whose message failed gets a sentence about the provider instead.
+    logger.info(
+        "agent.runtime_profile.model_names_not_configured.observed",
+        operator_hint=(
+            f"{credential_setting} is set but no models are configured for the "
+            f"Lemma system model provider. Set {names_setting} to a "
+            f"comma-separated list of model names, or set {default_setting}."
+        ),
+    )
+    where = (
+        "This Mac \u2192 Server setup"
+        if is_desktop_installation()
+        else "the server's AI settings"
+    )
     return DomainError(
-        f"{credential_setting} is set but no models are configured for the "
-        f"Lemma system model provider. Set {names_setting} to a "
-        f"comma-separated list of model names, or set {default_setting}.",
+        "This server's AI provider has an API key but no model names, so "
+        f"nothing can run on it yet. Name at least one model in {where}, or "
+        "add a provider in Settings \u2192 Models.",
         code="model_names_not_configured",
         status_code=503,
     )

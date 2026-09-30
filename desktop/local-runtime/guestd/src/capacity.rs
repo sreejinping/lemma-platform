@@ -30,18 +30,67 @@ pub(crate) const SANDBOX_STOP_GRACE_SECONDS: u32 = 1;
 ///
 /// Postgres's `SIGINT` is a fast shutdown: roll back what is open, checkpoint,
 /// exit. Ordinarily well under a second here; the case this covers is a
-/// checkpoint that has to write out a full container's worth of buffers. Redis
-/// is quick and SuperTokens keeps nothing of its own, so the number is
+/// checkpoint that has to write out a full container's worth of buffers.
+/// Redis's `SIGTERM` is a `SHUTDOWN` that fsyncs the append-only file and
+/// writes the snapshot its save points ask for, and is as quick. The number is
 /// Postgres's.
 pub(crate) const CORE_STOP_GRACE_SECONDS: u32 = 15;
 
-/// The data services, in no particular order -- the stop is one engine call.
+/// The core containers that keep nothing of their own, by name.
+///
+/// SuperTokens stores every session and user in Postgres. And it never answers
+/// `SIGTERM`: PID 1 in its image is the `supertokens` CLI, which starts the
+/// real server as a second JVM and waits on it, and its shutdown hook only
+/// joins that wait -- the signal never reaches the server. Every stop spent the
+/// whole data-service grace on it, fifteen seconds of every quit, and ended in
+/// the SIGKILL it could have had at once.
+// Not named `..._CORE_CONTAINERS`: the runtime manager's budget test finds
+// the core list's declaration in this file by its text.
+pub(crate) const STATELESS_SERVICES: [&str; 1] = ["lemma-core-supertokens"];
+
+/// How long a stateless core container is given: it has nothing to flush.
+pub(crate) const STATELESS_STOP_GRACE_SECONDS: u32 = 1;
+
+/// The core containers' OOM preference: far below any sandbox's.
+pub(crate) const CORE_OOM_SCORE_ADJ: i32 = -900;
+
+/// Free space on the data disk below which no sandbox is started.
+///
+/// Everything in the guest shares that disk, and it is a fixed size; the
+/// first thing to notice it filling was PostgreSQL refusing to write. A new
+/// sandbox is where growth starts -- an image unpacked, a workspace written --
+/// so it is refused while there is still room for the database to keep
+/// working, and the person is told what to free.
+pub(crate) const SANDBOX_DISK_FLOOR_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+
+/// Refuse a new sandbox when the data disk is below the floor. A disk that
+/// cannot be measured is not a reason to refuse.
+pub(crate) fn admit_disk(free_bytes: Option<u64>) -> Result<(), GuestError> {
+    match free_bytes {
+        Some(free) if free < SANDBOX_DISK_FLOOR_BYTES => Err(GuestError {
+            code: "resource_capacity".into(),
+            message: format!(
+                "The private runtime's disk is nearly full ({} MiB free), so no new \
+                 sandbox was started. Delete workspaces or files you no longer need.",
+                free / (1024 * 1024),
+            ),
+            retryable: true,
+            status_code: 429,
+        }),
+        _ => Ok(()),
+    }
+}
+
+/// The data services, in no particular order -- each is stopped on its own.
 pub(crate) const CORE_CONTAINERS: [&str; 3] = ["supertokens", "redis", "postgres"];
 
 /// The longest a guest stop can take before the engine has killed everything.
 ///
-/// `nerdctl stop` works through its arguments one at a time, so this is the sum
-/// rather than the maximum. The host's `system.shutdown` budget must exceed it:
+/// A sum, and deliberately a bound rather than a forecast. The stops now run
+/// side by side -- one `nerdctl stop` per container, so the core costs its
+/// slowest member rather than all three -- but an engine is free to serialise
+/// them underneath, and a budget that assumed it would not is the kind that
+/// cuts a database off. The host's `system.shutdown` budget must exceed it:
 /// a budget below this terminates the guest while a database is still
 /// checkpointing, which is the failure this arithmetic exists to prevent.
 /// Computed from `MAX_SANDBOX_CEILING`, not from the default. An installation
@@ -66,6 +115,10 @@ const _: () = assert!(
     "a data service must not be given less grace than a scratch workload",
 );
 const _: () = assert!(
+    STATELESS_STOP_GRACE_SECONDS <= CORE_STOP_GRACE_SECONDS,
+    "a service with nothing to flush must not hold a stop longer than a database",
+);
+const _: () = assert!(
     MAX_SANDBOX_CEILING >= DEFAULT_MAX_SANDBOXES,
     "the ceiling cannot sit below the default, or the default is unreachable",
 );
@@ -82,12 +135,36 @@ const _: () = assert!(
 pub(crate) struct StoppedContainers {
     pub(crate) sandboxes: usize,
     pub(crate) core: usize,
+    /// How long each phase took, so a slow stop names what it waited on.
+    pub(crate) sandboxes_ms: u64,
+    pub(crate) core_ms: u64,
 }
 
 impl StoppedContainers {
     pub(crate) fn total(self) -> usize {
         self.sandboxes + self.core
     }
+}
+
+/// Each running core container with the grace it gets.
+///
+/// Stateless only when the engine named it so; everything else -- the
+/// databases, and anything unrecognised -- keeps the data-service grace.
+pub(crate) fn core_stop_plan(core: &[String], stateless: &[String]) -> Vec<(String, u32)> {
+    core.iter()
+        .map(|id| {
+            let grace = if stateless.contains(id) {
+                STATELESS_STOP_GRACE_SECONDS
+            } else {
+                CORE_STOP_GRACE_SECONDS
+            };
+            (id.clone(), grace)
+        })
+        .collect()
+}
+
+pub(crate) fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
 /// The ids `ps --quiet` printed, refusing anything that is not one.
@@ -124,7 +201,35 @@ pub(crate) fn max_sandboxes() -> usize {
         .min(MAX_SANDBOX_CEILING)
 }
 
+/// How long a running-sandbox count is reused for the health answer.
+///
+/// Shorter than the host's five-second probe interval would defeat the point;
+/// much longer would make `active_sandboxes` visibly stale in a status pane.
+const SANDBOX_COUNT_TTL: std::time::Duration = std::time::Duration::from_secs(15);
+
 impl<E: Engine + 'static> GuestService<E> {
+    /// The count, reused if it was taken recently.
+    ///
+    /// For the health answer only. Counting forks `nerdctl ps`, and the host
+    /// asks every five seconds for as long as the app is open, so an idle
+    /// machine spent a containerd CLI process 17,280 times a day being told
+    /// the same number. Admission calls the uncached version deliberately: a
+    /// stale count there would let a sandbox start that should not.
+    pub(crate) fn cached_running_sandbox_count(&self) -> Result<usize, GuestError> {
+        if let Ok(cache) = self.sandbox_count_cache.lock() {
+            if let Some((taken_at, count)) = *cache {
+                if taken_at.elapsed() < SANDBOX_COUNT_TTL {
+                    return Ok(count);
+                }
+            }
+        }
+        let count = self.running_sandbox_count()?;
+        if let Ok(mut cache) = self.sandbox_count_cache.lock() {
+            *cache = Some((Instant::now(), count));
+        }
+        Ok(count)
+    }
+
     pub(crate) fn running_sandbox_count(&self) -> Result<usize, GuestError> {
         let output = self.run_checked(&[
             "ps".into(),
@@ -167,6 +272,8 @@ impl<E: Engine + 'static> GuestService<E> {
                 status_code: 429,
             });
         }
+
+        admit_disk(data_disk_space(&self.state_root).map(|(free, _)| free))?;
 
         let available = guest_available_memory_bytes()?;
         let needed = SANDBOX_MEMORY_REQUEST_BYTES.saturating_add(GUEST_MEMORY_HEADROOM_BYTES);
@@ -231,24 +338,12 @@ impl<E: Engine + 'static> GuestService<E> {
     /// the day someone changes how these paths are built is the day it starts
     /// mattering. The comment used to credit it with the symlink defence, which
     /// is the wrong line to trust.
+    ///
+    /// Counts homes. The runtime overlays beside them go too, uncounted: they
+    /// belong to sandboxes that no longer exist.
     pub(crate) fn remove_all_workspaces(&self) -> Result<usize, GuestError> {
-        let root = self.state_root.join("workspaces");
-        let Ok(entries) = fs::read_dir(&root) else {
-            return Ok(0);
-        };
-        let mut removed = 0;
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.parent() != Some(root.as_path()) {
-                return Err(GuestError::invalid("workspace escaped managed root"));
-            }
-            if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                continue;
-            }
-            fs::remove_dir_all(&path).map_err(|error| GuestError::engine(error.to_string()))?;
-            removed += 1;
-        }
-        Ok(removed)
+        remove_every_sandbox_directory(&self.state_root.join("runtime"))?;
+        remove_every_sandbox_directory(&self.state_root.join("workspaces"))
     }
 
     /// Stop everything, giving each container a grace period that matches what
@@ -298,24 +393,96 @@ impl<E: Engine + 'static> GuestService<E> {
             .cloned()
             .collect();
 
+        let stateless = if core.is_empty() {
+            Vec::new()
+        } else {
+            self.running_stateless_core_ids()
+        };
+
         // Sandboxes before the data services, so nothing is still working
-        // while the database it might be working through is going away.
-        self.stop_containers(&sandboxes, SANDBOX_STOP_GRACE_SECONDS)?;
-        self.stop_containers(&core, CORE_STOP_GRACE_SECONDS)?;
+        // while the database it might be working through is going away. Within
+        // each phase every container is stopped at once: one `nerdctl stop`
+        // over several ids works through them in turn, so the phase cost the
+        // sum of its members' graces instead of the slowest one's.
+        let started = Instant::now();
+        let sandbox_stops: Vec<(String, u32)> = sandboxes
+            .iter()
+            .map(|id| (id.clone(), SANDBOX_STOP_GRACE_SECONDS))
+            .collect();
+        self.stop_concurrently(&sandbox_stops)?;
+        let sandboxes_ms = elapsed_ms(started);
+
+        let started = Instant::now();
+        self.stop_concurrently(&core_stop_plan(&core, &stateless))?;
         Ok(StoppedContainers {
             sandboxes: sandboxes.len(),
             core: core.len(),
+            sandboxes_ms,
+            core_ms: elapsed_ms(started),
         })
     }
 
-    fn stop_containers(&self, ids: &[String], grace_seconds: u32) -> Result<(), GuestError> {
-        if ids.is_empty() {
-            return Ok(());
-        }
-        let mut arguments = vec!["stop".into(), "--time".into(), grace_seconds.to_string()];
-        arguments.extend(ids.iter().cloned());
-        self.run_checked(&arguments)?;
+    /// Stop each container with its own grace, all at once, and wait for every one.
+    ///
+    /// The first failure is reported, but only after the rest have been asked:
+    /// giving up part-way would leave a database running under a guest that is
+    /// about to power off.
+    fn stop_concurrently(&self, stops: &[(String, u32)]) -> Result<(), GuestError> {
+        let results: Vec<Result<String, GuestError>> = thread::scope(|scope| {
+            let workers: Vec<_> = stops
+                .iter()
+                .map(|(id, grace)| {
+                    scope.spawn(move || {
+                        self.run_checked(&[
+                            "stop".into(),
+                            "--time".into(),
+                            grace.to_string(),
+                            id.clone(),
+                        ])
+                    })
+                })
+                .collect();
+            workers
+                .into_iter()
+                .map(|worker| {
+                    worker
+                        .join()
+                        .unwrap_or_else(|_| Err(GuestError::engine("a container stop panicked")))
+                })
+                .collect()
+        });
+        results
+            .into_iter()
+            .find(Result::is_err)
+            .unwrap_or(Ok(String::new()))?;
         Ok(())
+    }
+
+    /// The running core containers that keep nothing of their own.
+    ///
+    /// Asked by name, and allowed to fail: an engine that cannot answer leaves
+    /// every core container on the longer grace, which is slower and safe.
+    fn running_stateless_core_ids(&self) -> Vec<String> {
+        let mut ids = Vec::new();
+        for name in STATELESS_SERVICES {
+            let answer = self
+                .run_checked(&[
+                    "ps".into(),
+                    "--quiet".into(),
+                    "--filter".into(),
+                    format!("name=^{name}$"),
+                ])
+                .and_then(|output| parse_container_ids(&output));
+            match answer {
+                Ok(found) => ids.extend(found),
+                Err(error) => eprintln!(
+                    "lemma-guestd: could not find {name} to stop it briefly; \
+                     it gets the data-service grace instead: {}",
+                    error.message
+                ),
+            }
+        }
+        ids
     }
 
     fn running_container_ids(&self) -> Result<Vec<String>, GuestError> {
@@ -368,4 +535,23 @@ pub(crate) fn data_disk_space(root: &Path) -> Option<(u64, u64)> {
         u64::from(measured.f_bavail as u32).saturating_mul(block),
         u64::from(measured.f_blocks as u32).saturating_mul(block),
     ))
+}
+
+fn remove_every_sandbox_directory(root: &Path) -> Result<usize, GuestError> {
+    let Ok(entries) = fs::read_dir(root) else {
+        return Ok(0);
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.parent() != Some(root) {
+            return Err(GuestError::invalid("workspace escaped managed root"));
+        }
+        if !entry.file_type().is_ok_and(|kind| kind.is_dir()) {
+            continue;
+        }
+        fs::remove_dir_all(&path).map_err(|error| GuestError::engine(error.to_string()))?;
+        removed += 1;
+    }
+    Ok(removed)
 }

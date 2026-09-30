@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import pytest
 
+from app.core.config import reveal_secret
 from app.modules.agent.config import AgentSettings
 
 pytestmark = pytest.mark.unit
@@ -38,6 +39,7 @@ EXPECTED = [
         60,
     ),
     ("agent_memory_index_max_chars", "AGENT_MEMORY_INDEX_MAX_CHARS", 2000),
+    ("agent_attached_document_max_chars", "AGENT_ATTACHED_DOCUMENT_MAX_CHARS", 24000),
     ("agent_memory_section_max_chars", "AGENT_MEMORY_SECTION_MAX_CHARS", 6000),
     (
         "agent_memory_brief_cache_ttl_seconds",
@@ -169,4 +171,15 @@ def test_agent_settings_reads_legacy_env_var(monkeypatch, field, env, default):
     _clear(monkeypatch)
     raw, expected = _override_for(default, field)
     monkeypatch.setenv(env, raw)
-    assert getattr(AgentSettings(), field) == expected
+    # Secret settings (provider API keys) are SecretStr so a traceback or repr
+    # cannot print them; compare what they hold.
+    assert reveal_secret(getattr(AgentSettings(), field)) == expected
+
+
+def test_the_deepgram_key_never_prints(monkeypatch):
+    monkeypatch.setenv("DEEPGRAM_API_KEY", "do-not-print-me")
+
+    loaded = AgentSettings()
+
+    assert reveal_secret(loaded.deepgram_api_key) == "do-not-print-me"
+    assert "do-not-print-me" not in repr(loaded)

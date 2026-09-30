@@ -1,17 +1,28 @@
 //! The guest's guards, grouped the way the code they cover is grouped.
 
+mod app_health;
 mod clock;
 mod concurrency;
+mod container_stop;
 mod core_data;
 mod data_binding;
 mod diagnostics;
 mod engine;
+mod firewall_model;
+mod host_dns;
+mod host_gateway_firewall;
+mod host_loopback;
+mod image_prune;
 mod images;
 mod inspect;
 mod limits;
 mod network;
 mod protocol;
+mod pull_progress;
+mod replacement;
 mod run_contract;
+mod runtime_overlay;
+mod sandbox_tunnel;
 
 use super::*;
 use crate::protocol::*;
@@ -124,10 +135,11 @@ impl Engine for GatedPullEngine {
                     .contains(arguments.last().unwrap()),
                 "",
             )),
-            "run" => Ok(output(
-                !self.invalid.lock().unwrap().contains(&arguments[6]),
-                "",
-            )),
+            "run" => Ok(if self.invalid.lock().unwrap().contains(&arguments[6]) {
+                exited(MARKER_MISSING)
+            } else {
+                output(true, "")
+            }),
             "rmi" => {
                 self.present
                     .lock()
@@ -168,6 +180,11 @@ pub(super) struct FakeEngine {
 }
 
 impl FakeEngine {
+    /// Every argv this engine was asked to run, for tests that care how often.
+    pub(super) fn commands(&self) -> Vec<Vec<String>> {
+        self.commands.lock().unwrap().clone()
+    }
+
     fn new(outputs: Vec<Output>) -> Self {
         Self {
             commands: Mutex::new(Vec::new()),
@@ -208,6 +225,15 @@ pub(super) const UNHURRIED_TEST_TIMEOUT_SECS: u64 = 30;
 /// second constant that could drift away from it.
 pub(super) const FORKING_ENGINE_SLEEP_SECS: u64 = 30;
 
+/// A container that ran and exited with `code`, as the engine reports it.
+pub(super) fn exited(code: i32) -> Output {
+    Output {
+        status: std::process::ExitStatus::from_raw(code << 8),
+        stdout: vec![],
+        stderr: vec![],
+    }
+}
+
 pub(super) fn output(success: bool, stdout: &str) -> Output {
     Output {
         status: std::process::ExitStatus::from_raw(if success { 0 } else { 1 }),
@@ -227,7 +253,8 @@ pub(super) fn inspect() -> String {
         "Config": {"Labels": {
             "lemma.work/workload-kind": "workspace",
             "lemma.work/image-ref": "ghcr.io/lemma/workspace@sha256:abc",
-            "lemma.work/metadata": "{\"managed-by\":\"lemma-workspace\"}"
+            "lemma.work/metadata": "{\"managed-by\":\"lemma-workspace\"}",
+            "lemma.work/hardening": SANDBOX_HARDENING_VERSION.to_string()
         }},
         "NetworkSettings": {"Ports": {
             "8080/tcp": [{"HostIp": "0.0.0.0", "HostPort": "49152"}],
@@ -250,6 +277,7 @@ pub(super) fn core_parameters(postgres_image: &str) -> CoreParameters {
             postgres_password: "a".repeat(64),
             redis_password: "b".repeat(64),
         },
+        callback_ports: vec![8711, 3711],
     }
 }
 

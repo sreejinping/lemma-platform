@@ -18,8 +18,9 @@ make init        # create .env files with local defaults (idempotent)
 make dev         # infra + backend + frontend
 ```
 
-`make help` lists everything else. The dev stack uses ports 3710 (frontend) and
-8710 (backend).
+`make help` lists everything else. The dev stack uses ports 3710 (harness) and
+8710 (backend). Run `make dev-frontend` alongside it for the user-facing workspace
+on port 3000. `make init` installs and configures both apps.
 
 ### Toolchain versions
 
@@ -49,6 +50,50 @@ bots trained on older syntax flag it as an error; it is valid, and `ruff` and
 
 [pep758]: https://peps.python.org/pep-0758/
 
+## Local development
+
+Run these through `make`, not the tools by hand: each target runs the tool,
+version and config CI does, so a clean local run predicts the CI step.
+
+| Command | What it does |
+|---|---|
+| `make fix` | Every safe auto-fixer — ruff, `eslint --fix`, `cargo fmt` — on what this branch changed |
+| `make lint` | Every fast linter on what changed: ruff, eslint, tsc, rustfmt, clippy on the changed crates, shellcheck, actionlint, hadolint, typos, yamllint |
+| `make lint-<group>` | One group: `python`, `frontend`, `rust`, `shell`, `ci`, `docker`, `docs`, `config` |
+| `make quality` | The full pre-PR gate, over everything — what CI's quality job runs |
+| `make quality-frontend` | The frontend gates `quality` cannot see; add it when you touched a frontend package or the SDK |
+| `make check` | `quality` and `quality-frontend` together |
+
+"What changed" is the diff from the merge base with `origin/main`, committed
+or not, plus untracked files. `ALL=1` covers the whole repository, `STAGED=1`
+only the index, and `FAST=1` skips tsc and clippy. The loop is `make fix`,
+`make lint` while you work, and `make quality` before opening a pull request.
+
+**Hooks.** `make hooks` opts this clone, and every worktree of it, into
+`.githooks/`: `pre-commit` runs `make lint STAGED=1 FAST=1` (seconds) and
+`pre-push` runs `make quality`, plus `quality-frontend` when the branch touches
+a frontend package. `SKIP_HOOKS=1` skips them for one command.
+
+**CodeQL runs in CI only.** A local analysis holds several cores and gigabytes
+of memory for minutes, so `make check` no longer runs it. On every pull
+request the Security workflow posts one comment listing what CodeQL found on
+the lines you changed, and an inline comment on each high or critical one.
+`make codeql` still reproduces a finding locally when you want it.
+
+**Disk.** Each worktree carries its own build output: a Rust dev
+`desktop/target` of several gigabytes, and roughly a gigabyte each for
+`node_modules` and `lemma-backend/.venv`. With many worktrees that fills a
+disk, and `make dev` warns when less than 30 GB is free. `make dev-clean` lists
+what can go and why — build output in idle worktrees, stale Rust artifacts,
+worktrees and branches whose work has landed, old sandbox images — and
+`make dev-clean-apply` removes it. Nothing it removes is unrecoverable: it
+keeps anything with uncommitted changes or commits no remote has. Each worktree
+keeps its own `desktop/target` on purpose; a shared `CARGO_TARGET_DIR` would
+make concurrent builds on different branches wait on one lock and rebuild over
+each other. [sccache](https://github.com/mozilla/sccache) is optional and
+works here if you want compiled dependencies shared across worktrees
+(`RUSTC_WRAPPER=sccache`).
+
 ## Find the right component
 
 Each component has its own setup and its own checks. Run the ones you touched.
@@ -56,12 +101,41 @@ Each component has its own setup and its own checks. Run the ones you touched.
 | You changed… | Read | Run before opening a PR |
 |---|---|---|
 | `lemma-backend/` | [backend README](lemma-backend/README.md), [development guidelines](lemma-backend/docs/development.md), [module guide](lemma-backend/docs/modules/README.md) | see below |
-| `lemma-frontend/` | [frontend README](lemma-frontend/README.md), [frontend contributing](lemma-frontend/CONTRIBUTING.md) | `npm run check && npm test` |
+| `lemma-frontend/` | [frontend README](lemma-frontend/README.md) | `npm run check && npm test && npm run build` |
+| `lemma-harness/` | [frontend README](lemma-harness/README.md), [frontend contributing](lemma-harness/CONTRIBUTING.md) | `npm run check && npm test` |
 | `lemma-cli/` | [CLI README](lemma-cli/README.md), [conventions](lemma-cli/CONVENTIONS.md) | `make test && make lint` |
 | `lemma-typescript/` | [SDK README](lemma-typescript/README.md) | `npm run build && npm test` |
 | `lemma-python/` | [SDK README](lemma-python/README.md) | `uv run pytest` |
 | `lemma-skills/` | [skills README](lemma-skills/README.md) | — |
-| `desktop/` | [maintainer guide](desktop/README.md), [architecture](docs/architecture/desktop.md) | `make desktop-test && make desktop-lint` |
+| `desktop/` | [maintainer guide](desktop/README.md), [architecture](docs/architecture/desktop.md), the [Desktop test matrix](#desktop-test-matrix) | `make desktop-test && make desktop-lint`, plus the lane the matrix names |
+
+## Desktop test matrix
+
+`make desktop-test && make desktop-lint` is the floor for any `desktop/`
+change, not the whole of it. Desktop is several processes on two sides of a
+wire, and each seam has one lane that holds it. A change extends the lane for
+the seam it touches and updates the document that describes that seam, in the
+same pull request. The lanes, and what CI runs when, are in
+[docs/testing.md](docs/testing.md#the-lanes-and-what-runs-when).
+
+| You changed… | Extend | Update |
+|---|---|---|
+| How an ACP adapter's output becomes run events (`desktop/agent-host/src/normalize/`, `acp/`) | Rust unit tests in the crate, and the golden transcripts: re-record `tests/fixtures/acp/<adapter>@<version>/` with `record_transcript.py`, regenerate with `UPDATE_GOLDEN=1 cargo test -p lemma-agent-host --test normalize_golden`, and review the diff | [agent-host-events.md](docs/architecture/agent-host-events.md) |
+| A pinned adapter in `desktop/agent-host/agent-adapters.lock.json` | A recording for the new version, or a reason in `tests/fixtures/acp/unrecorded.json`. `normalize_golden` refuses a bump with neither, and an excuse for a version no longer pinned | [agent-host-events.md](docs/architecture/agent-host-events.md) |
+| A link frame, close code or body (`desktop/agent-host/src/link/`, `lemma-backend/app/modules/agent/domain/agent_host_link.py`) | `desktop/agent-host/tests/fixtures/wire_contract.json`, which both sides are held to (`--test wire_contract` in Rust, `test_agent_host_wire_contract.py` in the backend); the link tests on each side (`tests/link_control_e2e.rs`, `test_agent_host_link_*.py`) | [agent-host.md](docs/architecture/agent-host.md#the-link) |
+| Run delivery, the outbox, leases, recovery or dispatch, on either side | Unit tests on the side you changed, the hermetic real-binary e2e (`test_agent_host_process_e2e.py`), and the chaos e2e (`test_agent_host_chaos_e2e.py`) when the change touches what survives a crash or a dropped link | [agent-host.md](docs/architecture/agent-host.md#delivery), [agent-host-events.md](docs/architecture/agent-host-events.md) |
+| Host execution: op frames, the exec-server, Seatbelt, the host provider or run selection | Seatbelt tests on macOS (`tests/seatbelt.rs`, `src/host_exec/tests.rs`); backend unit (`test_host_execution_selection.py`, `test_agent_host_provider.py`, `test_host_routing.py`); `test_host_execution_link_e2e.py`, and `test_host_execution_binary_e2e.py` through the real binary | [desktop-host-execution.md](docs/architecture/desktop-host-execution.md), [desktop-security.md](docs/architecture/desktop-security.md), [provider-adapters.md](docs/architecture/sandbox/provider-adapters.md) |
+| What the workspace asks of the shell (`lemma-frontend/src/desktop/`) | The frontend's tests (`npm test` in `lemma-frontend`), including `tests/desktop-ipc.test.ts`, which holds every command the page invokes to a grant in `desktop/capabilities/workspace.json` and a handler in `desktop/src/app.rs` | [desktop.md](docs/architecture/desktop.md#tauri-ipc-commands-and-who-may-call-them) |
+| A Tauri command, a capability, or who may call it (`desktop/src/`, `desktop/capabilities/`) | The app crate's tests (every registered command is granted somewhere), `desktop/ui-tests`, and the IPC contract test above | [desktop.md](docs/architecture/desktop.md#tauri-ipc-commands-and-who-may-call-them), [desktop-security.md](docs/architecture/desktop-security.md) |
+| Anything that runs when the app starts: launch, the hosted path, locald's supervision of the Agent Host, bundling | The launch smoke, `desktop/e2e/launch_smoke.py` (CI job "Desktop launch smoke") | [desktop.md](docs/architecture/desktop.md), [agent-host.md](docs/architecture/agent-host.md) |
+| The chat's rendering of Agent Host runs | `make desktop-agent-host-browser-e2e` and its JSON ACP scenarios | [agent-host-events.md](docs/architecture/agent-host-events.md) |
+
+The Agent Host lanes use scripted ACP agents
+(`desktop/agent-host/tests/fixtures/scripted_acp_agent.py` and
+`scenarios/*.json`), never a real provider, and the real `lemma-agent-host`
+binary rather than a stand-in for it: a double proves the half you wrote, not
+what the other side actually sends. A new failure mode gets a scenario there,
+not a fake host.
 
 ## Backend
 

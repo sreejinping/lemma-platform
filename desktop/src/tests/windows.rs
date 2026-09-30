@@ -375,8 +375,8 @@ fn the_pod_app_window_is_granted_no_commands() {
 /// extend anything.
 #[test]
 fn every_page_that_ships_on_windows_renames_the_machine() {
-    let splash = include_str!("../../ui/index.html").replace("\r\n", "\n");
-    let control = include_str!("../../ui/control.js").replace("\r\n", "\n");
+    let splash = SPLASH.replace("\r\n", "\n");
+    let control = CONTROL.replace("\r\n", "\n");
 
     for (page, source) in [("index.html", &splash), ("control.js", &control)] {
         assert!(
@@ -438,12 +438,12 @@ fn every_page_that_ships_on_windows_renames_the_machine() {
 /// one gesture whose whole purpose is bringing it back -- and the arm that
 /// handles it only ever showed a window that already existed. This is the
 /// part of the fix with cases in it; the arm itself needs a Tauri runtime.
-#[cfg(target_os = "macos")]
+/// Every platform now: a second launch and the tray icon reach it too.
 #[test]
 fn reopening_with_every_window_closed_goes_somewhere() {
     assert_eq!(
-        reopen_target("local", true, false, "http://app.127.0.0.1.sslip.io:1/"),
-        ReopenTarget::Workspace("http://app.127.0.0.1.sslip.io:1/".into()),
+        reopen_target("local", true, false, "http://app.lemma.localhost:1/"),
+        ReopenTarget::Workspace("http://app.lemma.localhost:1/".into()),
         "a running local stack goes straight back to the workspace"
     );
 
@@ -455,13 +455,13 @@ fn reopening_with_every_window_closed_goes_somewhere() {
 
     for (label, ready, error, url) in [
         ("still starting", false, false, ""),
-        ("failed", true, true, "http://app.127.0.0.1.sslip.io:1/"),
+        ("failed", true, true, "http://app.lemma.localhost:1/"),
         ("ready but with no url yet", true, false, ""),
         (
             "undecided mode",
             true,
             false,
-            "http://app.127.0.0.1.sslip.io:1/",
+            "http://app.lemma.localhost:1/",
         ),
     ] {
         let mode = if label == "undecided mode" {

@@ -215,6 +215,13 @@ var LemmaUI = (() => {
     }
     return normalizeStatus(payload);
   }
+  function extractNotice(payload) {
+    if (!isRecord2(payload)) return void 0;
+    const detail = typeof payload.detail === "string" ? payload.detail.trim() : "";
+    if (!detail) return void 0;
+    const kind = typeof payload.status === "string" ? payload.status.trim().toLowerCase() : void 0;
+    return kind ? { notice: detail, noticeKind: kind } : { notice: detail };
+  }
   function extractTitle(payload) {
     const title = typeof payload === "string" ? payload : isRecord2(payload) && typeof payload.title === "string" ? payload.title : void 0;
     return title && title.trim().length > 0 ? title.trim() : void 0;
@@ -265,7 +272,9 @@ var LemmaUI = (() => {
     }
     if (eventType === "status" || eventType === "conversation_status" || eventType === "conversation_updated" || eventType === "run_status") {
       const status = extractStatus(payload);
-      return status ? { status } : {};
+      if (status) return { status };
+      const notice = extractNotice(payload);
+      return notice != null ? notice : {};
     }
     if (eventType === "completed") {
       const conversationStatus = isRecord2(payload) ? normalizeStatus(payload.conversation_status) : void 0;
@@ -653,13 +662,14 @@ var LemmaUI = (() => {
         streamConversationId,
         syncAfterStream
       }) => {
-        var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m;
+        var _a, _b, _c, _d, _e, _f, _g, _h, _i, _j, _k, _l, _m, _n, _o, _p;
         this.patch({ isStreaming: true, error: null });
         this.clearStreamingText();
         this.clearStreamingThinking();
         let sawTerminalStatus = false;
         let unclaimedAnswer = false;
         let streamFailure = null;
+        let deliveredEvent = false;
         try {
           for await (const event of readSSE(stream)) {
             if (controller.signal.aborted) break;
@@ -669,11 +679,15 @@ var LemmaUI = (() => {
             if (parsed.interrupted) {
               continue;
             }
+            deliveredEvent = true;
+            if (parsed.notice) {
+              (_d = (_c = this.options).onNotice) == null ? void 0 : _d.call(_c, parsed.notice, parsed.noticeKind);
+            }
             if (parsed.error) {
               const streamError = new Error(parsed.error);
               this.patch({ error: streamError });
-              (_d = (_c = this.options).onError) == null ? void 0 : _d.call(_c, streamError);
-              this.setConversationStatus((_e = parsed.status) != null ? _e : "FAILED");
+              (_f = (_e = this.options).onError) == null ? void 0 : _f.call(_e, streamError);
+              this.setConversationStatus((_g = parsed.status) != null ? _g : "FAILED");
               sawTerminalStatus = true;
               this.clearStreamingText();
               this.clearStreamingThinking();
@@ -704,7 +718,7 @@ var LemmaUI = (() => {
             }
             if (parsed.message) {
               this.patch({ messages: upsertConversationMessage(this.state.messages, parsed.message) });
-              (_g = (_f = this.options).onMessage) == null ? void 0 : _g.call(_f, parsed.message);
+              (_i = (_h = this.options).onMessage) == null ? void 0 : _i.call(_h, parsed.message);
               const role = typeof parsed.message.role === "string" ? parsed.message.role.toLowerCase() : "";
               if (role === "assistant" || role === "tool") {
                 this.clearStreamingText();
@@ -715,7 +729,7 @@ var LemmaUI = (() => {
             if (parsed.title) {
               this.setConversationTitle(
                 parsed.title,
-                (_i = (_h = parsed.conversationId) != null ? _h : streamConversationId) != null ? _i : this.state.conversationId
+                (_k = (_j = parsed.conversationId) != null ? _j : streamConversationId) != null ? _k : this.state.conversationId
               );
             }
             if (parsed.status) {
@@ -738,11 +752,13 @@ var LemmaUI = (() => {
           if (!controller.signal.aborted) {
             const syncConversationId = streamConversationId != null ? streamConversationId : this.state.conversationId;
             if (!sawTerminalStatus && syncConversationId) {
+              if (deliveredEvent) this.streamReconnectCount = 0;
               while (!controller.signal.aborted) {
+                if (((_l = this.client.auth) == null ? void 0 : _l.getState().status) === "unauthenticated") break;
                 const latestConversation = await this.refreshConversation(syncConversationId);
                 await this.loadMessages({ conversationId: syncConversationId, limit: 100 });
                 if (controller.signal.aborted) break;
-                const latestStatus = (_j = latestConversation == null ? void 0 : latestConversation.status) != null ? _j : this.state.status;
+                const latestStatus = (_m = latestConversation == null ? void 0 : latestConversation.status) != null ? _m : this.state.status;
                 if (!isConversationRunningStatus(latestStatus)) {
                   this.streamReconnectCount = 0;
                   streamFailure = null;
@@ -758,10 +774,9 @@ var LemmaUI = (() => {
                   const scope = normalizeScope(this.client, this.scopeDefaults);
                   const scopedClient = applyPodScope(this.client, scope.podId);
                   const newStream = await scopedClient.conversations.resumeStream(syncConversationId, {
-                    pod_id: (_k = scope.podId) != null ? _k : void 0,
+                    pod_id: (_n = scope.podId) != null ? _n : void 0,
                     signal: controller.signal
                   });
-                  this.streamReconnectCount = 0;
                   return await this.consume({
                     stream: newStream,
                     controller,
@@ -785,7 +800,7 @@ var LemmaUI = (() => {
             if (!controller.signal.aborted && streamFailure) {
               const normalized = normalizeError(streamFailure, "Failed to stream conversation.");
               this.patch({ error: normalized });
-              (_m = (_l = this.options).onError) == null ? void 0 : _m.call(_l, streamFailure);
+              (_p = (_o = this.options).onError) == null ? void 0 : _p.call(_o, streamFailure);
             }
           }
         } finally {

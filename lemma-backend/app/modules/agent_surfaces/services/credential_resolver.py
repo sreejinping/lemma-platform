@@ -18,6 +18,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 from uuid import UUID
 
+from app.core.config import reveal_secret
 from app.modules.agent_surfaces.config import (
     resolve_resend_api_key,
     surface_settings,
@@ -25,6 +26,7 @@ from app.modules.agent_surfaces.config import (
 from app.core.log.log import get_logger
 from app.modules.agent_surfaces.domain.entities import (
     AgentSurfaceEntity,
+    ParsedInboundSurfaceEvent,
     SurfacePlatform,
 )
 from app.modules.agent_surfaces.domain.surface_connectors import (
@@ -107,17 +109,18 @@ def native_credentials(
     normalized = str(platform or "").upper()
     if normalized == SurfacePlatform.WHATSAPP:
         credentials = {
-            "access_token": surface_settings.whatsapp_access_token or "",
+            "access_token": reveal_secret(surface_settings.whatsapp_access_token) or "",
             "phone_number_id": surface_settings.whatsapp_phone_number_id or "",
             "waba_id": surface_settings.whatsapp_waba_id or "",
         }
-        app_secret = surface_settings.whatsapp_app_secret
+        app_secret = reveal_secret(surface_settings.whatsapp_app_secret)
         if app_secret:
             credentials["app_secret"] = app_secret
         return with_surface_identity(credentials, surface)
     if normalized == SurfacePlatform.TELEGRAM:
         return with_surface_identity(
-            {"bot_token": surface_settings.telegram_bot_token or ""}, surface
+            {"bot_token": reveal_secret(surface_settings.telegram_bot_token) or ""},
+            surface,
         )
     if normalized == SurfacePlatform.RESEND:
         return with_surface_identity(
@@ -134,17 +137,32 @@ def has_native_credentials(platform: str | SurfacePlatform | None) -> bool:
     normalized = str(platform or "").upper()
     if normalized == SurfacePlatform.WHATSAPP:
         return bool(
-            surface_settings.whatsapp_access_token
+            reveal_secret(surface_settings.whatsapp_access_token)
             and surface_settings.whatsapp_phone_number_id
         )
     if normalized == SurfacePlatform.TELEGRAM:
-        return bool(surface_settings.telegram_bot_token)
+        return bool(reveal_secret(surface_settings.telegram_bot_token))
     if normalized == SurfacePlatform.RESEND:
         # Both, because an address on an unowned domain is as unusable as no
         # key: the UI offered SYSTEM mode on the key alone and provisioning then
         # raised for the missing domain.
         return bool(resolve_resend_api_key() and surface_settings.resend_inbound_domain)
     return False
+
+
+def arrival_number(event: ParsedInboundSurfaceEvent | None) -> str | None:
+    """The WhatsApp number an inbound message arrived on, if it names one.
+
+    The one place this is read off an event, so every step that acts on an
+    inbound message -- the read receipt, the typing indicator, the media
+    download, the fallback reply, the reply itself -- asks the resolver about
+    the same number. Each used to decide separately, and the ones that did not
+    ask used the settings token for a message a pooled number received.
+    """
+    if event is None:
+        return None
+    arrived = event.reply_target.get("phone_number_id")
+    return str(arrived) if arrived else None
 
 
 class PooledNumberReader(Protocol):
@@ -169,7 +187,10 @@ class SurfaceCredentialResolver:
         return self._pooled_numbers or WhatsAppNumberRepository(self._uow)
 
     async def _pooled_overrides(
-        self, surface: AgentSurfaceEntity | None, arrived_on: str | None = None
+        self,
+        platform: str | SurfacePlatform | None,
+        surface: AgentSurfaceEntity | None,
+        arrived_on: str | None = None,
     ) -> dict[str, str]:
         """What the number this surface holds answers with, if it holds one.
 
@@ -204,19 +225,24 @@ class SurfaceCredentialResolver:
         The surface still wins where it has an answer. A deliberately allocated
         number is a property of the surface and holds for messages it starts,
         which have no inbound event to have arrived on at all.
+
+        ``platform`` stands in for the surface when there is none: the worker
+        acting on an inbound message holds only the run's context, and the
+        number it arrived on is still the one whose token may mark it read.
         """
+        if surface is not None:
+            platform = surface.surface_type
         phone_number_id = (
             surface.surface_identity_id if surface is not None else None
         ) or arrived_on
         if (
-            surface is None
-            or surface.surface_type is not SurfacePlatform.WHATSAPP
+            str(platform or "").upper() != SurfacePlatform.WHATSAPP.value
             or not phone_number_id
         ):
             return {}
         number = await self._numbers().get_by_phone_number_id(phone_number_id)
         if number is None:
-            if surface.surface_identity_id:
+            if surface is not None and surface.surface_identity_id:
                 # The row was removed while a surface still named it. The
                 # settings number is the wrong answer but it is a working one,
                 # and refusing here would take the surface off the air over an
@@ -248,12 +274,16 @@ class SurfaceCredentialResolver:
         if prefer_native and has_native_credentials(surface.surface_type):
             return {
                 **native_credentials(surface.surface_type, surface=surface),
-                **await self._pooled_overrides(surface, arrived_on),
+                **await self._pooled_overrides(
+                    surface.surface_type, surface, arrived_on
+                ),
             }
         if surface.account_id is None:
             return {
                 **native_credentials(surface.surface_type, surface=surface),
-                **await self._pooled_overrides(surface, arrived_on),
+                **await self._pooled_overrides(
+                    surface.surface_type, surface, arrived_on
+                ),
             }
         credentials = await self.for_account(
             surface.account_id, force_refresh=force_refresh
@@ -267,6 +297,7 @@ class SurfaceCredentialResolver:
         *,
         surface: AgentSurfaceEntity | None,
         force_refresh: bool = False,
+        arrived_on: str | None = None,
     ) -> dict[str, Any]:
         """Credentials when the caller may not have a surface row.
 
@@ -277,11 +308,18 @@ class SurfaceCredentialResolver:
         silently incomplete and the send failed on a missing field. Making the
         argument explicit turns "did you have one?" into something the call site
         has to answer rather than something a reader has to infer.
+
+        ``arrived_on`` is :func:`arrival_number` of the message being acted on,
+        and it matters here more than anywhere: this is what the worker calls,
+        and without it a message that came in on a pooled number was marked
+        read, shown a typing indicator and had its media fetched with the
+        settings token -- which belongs to another number and, under another
+        WABA, is refused outright.
         """
         if not account_id:
             return {
                 **native_credentials(platform, surface=surface),
-                **await self._pooled_overrides(surface),
+                **await self._pooled_overrides(platform, surface, arrived_on),
             }
         credentials = await self.for_account(account_id, force_refresh=force_refresh)
         return with_surface_identity(credentials, surface)
@@ -349,7 +387,7 @@ class SurfaceCredentialResolver:
         if account_id is None:
             return SlackWebhookCredentials(
                 app_id=None,
-                signing_secret=surface_settings.slack_signing_secret,
+                signing_secret=reveal_secret(surface_settings.slack_signing_secret),
                 uses_custom_app=False,
             )
         found = await account_with_secrets(self._uow, account_id)
@@ -406,7 +444,7 @@ class SurfaceCredentialResolver:
         self, install, *, uses_custom_app: bool
     ) -> str | None:
         if not uses_custom_app:
-            return surface_settings.slack_signing_secret
+            return reveal_secret(surface_settings.slack_signing_secret)
         if install is None:
             return None
         return await app_signing_secret(self._uow, install.id)

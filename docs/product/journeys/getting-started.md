@@ -86,6 +86,74 @@ are shown with a retry action rather than an indefinite loading message.
 
 ---
 
+### PS-ONB-005 — A person chooses comfortable chat text on their device
+**Status:** manual
+
+> **Verified by:** opening Settings > Appearance in the browser, selecting each
+> chat text size, inspecting messages and the composer, and reloading to confirm
+> the choice persists. The API scenario suite cannot inspect rendered typography.
+
+- Appearance shall offer Small, Default, and Large chat text with a live preview.
+- The default message size shall be 15px; Small shall be 14px and Large 17px.
+- The choice shall apply immediately to conversation prose and the composer,
+  without changing navigation or document typography.
+- Touch-device composers shall remain at least 16px to avoid focus zoom.
+- The choice shall persist in the current browser and restore before paint.
+  Missing, invalid, or unavailable storage shall use the default.
+
+---
+
+### PS-ONB-006 — Authentication resumes the person's requested destination
+**Status:** manual
+
+> **Verified by:** opening a workspace or app link while signed out, switching
+> to sign-up, completing email verification, and continuing to the original
+> destination. Repeat with password reset and provider sign-in. Browser
+> regressions use `npm run test:auth-browser` in `lemma-frontend`; real provider
+> consent and email delivery require a configured deployment.
+
+- Sign-in and sign-up shall preserve the requested path, query, and fragment.
+- Switching auth screens or completing a provider round trip shall retain the
+  destination. Completing a flow shall clear its saved destination.
+- When verification is required, the portal shall send a verification email
+  and let the person resend or retry without creating another account.
+- Sign-in and sign-up shall offer email code by default, with password and
+  provider options available. A verified code shall resume the requested
+  destination without an additional email-verification step.
+- A waiting tab shall recognize verification completed in another tab and let
+  the person continue to its saved destination. A separate browser without a
+  saved destination shall use the workspace default after sign-in.
+- An authenticated visitor shall continue without entering credentials again.
+- Auth routes and untrusted origins shall not be accepted as destinations.
+  A refused destination shall not revive a previously saved destination.
+
+### PS-ONB-007 — A new person confirms their name and can prove their phone before they start
+**Status:** manual
+
+> **Verified by:** signing up with an email code on a deployment where WhatsApp
+> mobile verification is enabled, confirming the step opens over the app with
+> the name fields and a scannable code, sending the message from a phone, and
+> reloading to confirm the step does not return. The API scenario suite cannot
+> inspect the rendered dialog.
+
+- When a person lands in the app for the first time and their account has no
+  first name, or has no mobile number where the deployment can verify one over
+  WhatsApp, the system shall ask for what is missing in one step before they
+  start.
+- The step shall offer the name the account already holds, so a name supplied by
+  a sign-in provider is confirmed rather than retyped.
+- The phone shall be proved by sending one message from it, by scanning a code
+  or opening WhatsApp, and never by typing a number the system then trusts.
+- The step shall not imply that a teammate can be reached on WhatsApp yet. At
+  that point none has been connected there, so proving the phone only means a
+  teammate connected later recognises the person.
+- The phone shall be optional, and the whole step shall be skippable.
+- The system shall not ask an account that already has both, an account older
+  than its first week, or a person who has already continued or skipped in that
+  browser.
+
+---
+
 ## Capability: Create an organization
 
 ### PS-ONB-010 — The person who creates an organization owns it
@@ -142,6 +210,9 @@ are shown with a retry action rather than an indefinite loading message.
   create a pending invitation for that email and notify it.
 - When the invited person accepts, the system shall make them a member with
   exactly the role the invitation offered.
+- If an inviter attempts to offer a role carrying permissions they do not hold
+  themselves, then the system shall refuse. An editor may therefore invite an
+  editor or a member, and may not invite an owner.
 - When someone joins an organization, the system shall record
   `organization.member_joined`.
 - If a person attempts to accept an invitation addressed to a different email,
@@ -155,6 +226,10 @@ are shown with a retry action rather than an indefinite loading message.
 - Where an invitation names a pod, accepting it shall make the person both a
   member of the organization and a member of that pod, with the pod role the
   invitation offered.
+- If an inviter attempts to offer a pod role they could not confer by adding the
+  person to that pod themselves — because they do not manage that pod's members,
+  or the role carries permissions they do not hold there — then the system shall
+  refuse. An invitation is a pod grant that lands later, not a way around one.
 - If the pod named by an invitation cannot be granted — because it was deleted
   after the invitation was sent, for example — then the system shall refuse the
   acceptance and shall say which pod it could not grant, leaving the invitation
@@ -191,13 +266,22 @@ are shown with a retry action rather than an indefinite loading message.
 ### PS-ONB-024 — A person can see the invitations waiting for them
 **Status:** covered
 
-- When a person asks for their invitations, the system shall list every pending
-  invitation addressed to their email across all organizations.
+- When a person whose email address is verified asks for their invitations,
+  the system shall list every pending invitation addressed to that email across
+  all organizations.
+- When a person whose email address is not verified asks for their invitations,
+  the system shall list none, and the invitation's own link shall remain the way
+  to accept it. Listing by an unproven address would let whoever signed up as it
+  first take the seat.
 - The system shall show enough on each invitation — the organization, the role,
   and the pod when it names one — for a person to decide without accepting it
   first.
 
 **Contracts:** `org.invitation.list_mine`, `org.invitation.get`
+
+> **Verified by:** the listing for a verified address is proven by the backend's
+> own e2e suite; the scenario suite boots with verification off and proves the
+> unverified half. A lane with verification on would let a scenario prove both.
 
 ---
 
@@ -235,16 +319,20 @@ are shown with a retry action rather than an indefinite loading message.
 
 ## Capability: Change and remove membership
 
-### PS-ONB-040 — An owner changes what a member may do
+### PS-ONB-040 — Whoever manages people changes what a member may do
 **Status:** covered
 
-- When an owner changes a member's role, the system shall apply it immediately
-  to every later request that member makes.
-- If a member who is not an owner attempts to change any role, then the system
-  shall refuse.
-- If a person who is not an owner attempts to grant the owner or editor role
-  through any path, then the system shall refuse — including paths that grant
-  roles as a side effect, such as approving a request to join.
+- When an owner or editor changes a member's role, the system shall apply it
+  immediately to every later request that member makes.
+- If a member who is neither owner nor editor attempts to change any role, then
+  the system shall refuse.
+- If a person attempts to give anyone a role carrying permissions they do not
+  hold themselves — themselves included — then the system shall refuse. An
+  editor may therefore make an editor or a member, and may not make an owner.
+  This holds through every path that grants a role, including those that grant
+  one as a side effect, such as approving a request to join.
+- If an editor attempts to change the role of an owner, then the system shall
+  refuse: nobody may take away authority they do not hold either.
 
 **Contracts:** `org.member.update_role`, `org.member.list`
 
@@ -267,7 +355,7 @@ are shown with a retry action rather than an indefinite loading message.
 
 - When an owner removes any member, the system shall remove them.
 - When an editor removes a member who is not an owner, the system shall remove
-  them.
+  them. An editor may remove another editor.
 - If an editor attempts to remove an owner, then the system shall refuse.
 - If a member who is neither owner nor editor attempts to remove anyone other
   than themselves, then the system shall refuse.
@@ -309,3 +397,35 @@ are shown with a retry action rather than an indefinite loading message.
   a later first-chat request shall still ensure a pod and assistant.
 
 **Contracts:** `users.ensure_first_workspace`
+
+## Capability: Explore the public website
+
+### PS-ONB-060 — A visitor can learn about Lemma without signing in
+**Status:** covered
+
+- When a visitor opens documentation, company information, legal terms, the blog,
+  changelog, templates, or downloads, the system shall show the public content
+  without requiring a session.
+- When a visitor follows an indexed documentation link, the system shall show
+  the named guide; an unknown guide shall return a not-found response.
+- The system shall provide navigation between public pages and the workspace.
+
+### PS-ONB-061 — An AI reader can discover and read the public website
+**Status:** covered
+
+- When a reader requests Markdown for a supported public page, the system shall
+  return the page's content as Markdown at the same address and distinguish the
+  representation in its cache headers.
+- The system shall provide an AI index, a public API specification, a sitemap,
+  crawler rules, and a feed for dated content.
+
+### PS-ONB-062 — Existing public and workspace entry links keep working
+**Status:** covered
+
+- When a person follows an existing sign-in, legal, conversation, table, or
+  account-billing link, the system shall route them to the corresponding view
+  in the main frontend while retaining its resource identity.
+- When a person opens a shared contact, the system shall offer a contact file
+  with the channels carried by the link.
+- When a social crawler requests a public preview image, the system shall
+  return an image suitable for a link preview.

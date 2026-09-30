@@ -78,10 +78,10 @@ class ConnectorSettings(BaseSettings):
             "applies. Env: ``CONNECTOR_COMPOSIO_DEADLINE_SECONDS``."
         ),
     )
-    composio_api_key: Optional[str] = Field(
+    composio_api_key: Optional[SecretStr] = Field(
         default=None, description="Composio API key"
     )
-    composio_webhook_secret: Optional[str] = Field(
+    composio_webhook_secret: Optional[SecretStr] = Field(
         default=None, description="Composio webhook secret"
     )
     composio_sdk_telemetry_enabled: bool = Field(
@@ -146,6 +146,14 @@ class ConnectorSettings(BaseSettings):
         default=64 * 1024 * 1024,
         description="Hard ceiling on a binary result; larger is refused, not buffered.",
     )
+    connector_file_input_max_bytes: int = Field(
+        default=25 * 1024 * 1024,
+        description=(
+            "Ceiling on the files one operation call may send, together. Each "
+            "is read into memory before dispatch, and 25 MB is Gmail's own "
+            "message limit -- the most common reason to send a file at all."
+        ),
+    )
     connector_sql_engine_cache_size: int = Field(
         default=32,
         description=(
@@ -196,7 +204,7 @@ class ConnectorSettings(BaseSettings):
             "Env: CONNECTOR_GITHUB_APP_WEBHOOK_SECRET_PREVIOUS."
         ),
     )
-    connector_encryption_key: Optional[str] = Field(
+    connector_encryption_key: Optional[SecretStr] = Field(
         default=None,
         description=(
             "Fernet key used to encrypt connector auth configs and account "

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+from dataclasses import dataclass
 from collections.abc import AsyncIterable, AsyncIterator, Mapping
 from datetime import datetime, timezone
 import struct
@@ -27,6 +28,7 @@ from sandbox_runtime.protocol import (
     TerminalSize,
 )
 from sandbox_runtime.workspace.models import (
+    RUNTIME_VERSION_HEADER,
     RuntimeCreatePythonSessionRequest,
     RuntimeExecutePythonRequest,
     RuntimeFileListResponse,
@@ -43,48 +45,30 @@ from sandbox_runtime.workspace.models import (
 )
 
 
-class WorkspaceRuntimeError(RuntimeError):
-    pass
+from app.modules.workspace.providers.desktop_tunnel import sandbox_transport
+from app.modules.workspace.providers.runtime_errors import (  # noqa: E402
+    _FILESYSTEM_STATUS_ERRORS,
+    _PROCESS_STATUS_ERRORS,
+    WorkspaceBrowserNotRunning,
+    WorkspaceRuntimeError,
+    WorkspaceRuntimeFileRejected,
+    WorkspaceRuntimePythonAmbiguous,
+    WorkspaceRuntimeStartAmbiguous,
+    WorkspaceRuntimeUnauthorized,
+)
 
 
-class WorkspaceRuntimeStartAmbiguous(WorkspaceRuntimeError):
-    pass
+@dataclass(frozen=True, slots=True)
+class RuntimeState:
+    """What a workspace runtime is running, and whether anything depends on it.
 
-
-class WorkspaceRuntimePythonAmbiguous(WorkspaceRuntimeError):
-    pass
-
-
-class WorkspaceRuntimeFileNotFound(WorkspaceRuntimeError):
-    pass
-
-
-class WorkspaceRuntimeFileConflict(WorkspaceRuntimeError):
-    pass
-
-
-class WorkspaceBrowserNotRunning(WorkspaceRuntimeError):
-    """No browser to attach to.
-
-    Its own type because it is not a failure: a workspace whose browser has been
-    shed — for idleness or memory — is the ordinary resting state, and the
-    caller wants to say "nothing to watch yet" rather than "something broke".
+    `version` is None for a runtime that predates reporting one: unknown, not
+    stale.
     """
 
-
-class WorkspaceRuntimeFileRejected(WorkspaceRuntimeError):
-    def __init__(self, message: str, *, status_code: int) -> None:
-        super().__init__(message)
-        self.status_code = status_code
-
-
-_FILESYSTEM_STATUS_ERRORS: Mapping[int, type[WorkspaceRuntimeError]] = {
-    404: WorkspaceRuntimeFileNotFound,
-    409: WorkspaceRuntimeFileConflict,
-    413: WorkspaceRuntimeFileRejected,
-    422: WorkspaceRuntimeFileRejected,
-    507: WorkspaceRuntimeFileRejected,
-}
+    version: str | None
+    running_processes: int
+    python_sessions: int
 
 
 class WorkspaceRuntimeClient:
@@ -98,6 +82,8 @@ class WorkspaceRuntimeClient:
             base_url=base_url,
             headers={"X-Lemma-Runtime-Token": token},
             timeout=None,
+            # On Desktop, the guest's sandbox addresses go over vsock.
+            transport=sandbox_transport(),
         )
 
     async def close(self) -> None:
@@ -125,6 +111,24 @@ class WorkspaceRuntimeClient:
     async def health(self, *, deadline_at: datetime) -> RuntimeHealthResponse:
         response = await self._request("GET", "/health", deadline_at=deadline_at)
         return RuntimeHealthResponse.model_validate(response.json())
+
+    async def runtime_state(self, *, deadline_at: datetime) -> RuntimeState:
+        """The running code's version, and the work a restart would end.
+
+        Processes are counted by state, not from the health payload: the
+        runtime keeps finished processes for their output, the installer that
+        just ran among them.
+        """
+        response = await self._request("GET", "/health", deadline_at=deadline_at)
+        health = RuntimeHealthResponse.model_validate(response.json())
+        processes = await self.list_processes(deadline_at=deadline_at)
+        return RuntimeState(
+            version=response.headers.get(RUNTIME_VERSION_HEADER) or None,
+            running_processes=sum(
+                1 for item in processes if item.state is ProcessState.RUNNING
+            ),
+            python_sessions=health.active_python_sessions,
+        )
 
     async def browser_targets(
         self, *, deadline_at: datetime
@@ -193,6 +197,7 @@ class WorkspaceRuntimeClient:
             deadline_at=deadline_at,
             content=data,
             content_type="application/octet-stream",
+            status_errors=_PROCESS_STATUS_ERRORS,
         )
 
     async def list_processes(
@@ -223,6 +228,7 @@ class WorkspaceRuntimeClient:
                 "after_seq": str(after_sequence),
                 "wait_seconds": str(wait_seconds),
             },
+            status_errors=_PROCESS_STATUS_ERRORS,
         )
         channels = {
             1: ProcessOutputChannel.STDOUT,
@@ -271,6 +277,7 @@ class WorkspaceRuntimeClient:
             f"/processes/{operation_id}:resize",
             deadline_at=deadline_at,
             json_body=RuntimeResizeRequest(cols=size.cols, rows=size.rows),
+            status_errors=_PROCESS_STATUS_ERRORS,
         )
 
     async def terminate(
@@ -285,6 +292,7 @@ class WorkspaceRuntimeClient:
             f"/processes/{operation_id}",
             deadline_at=deadline_at,
             json_body=RuntimeTerminateRequest(grace_seconds=grace_seconds),
+            status_errors=_PROCESS_STATUS_ERRORS,
         )
         return RuntimeProcessResponse.model_validate(response.json())
 
@@ -344,10 +352,13 @@ class WorkspaceRuntimeClient:
         *,
         expected_sha256: str | None,
         deadline_at: datetime,
+        mode: int | None = None,
     ) -> FileStat:
         params = {"path": path}
         if expected_sha256 is not None:
             params["expected_sha256"] = expected_sha256
+        if mode is not None:
+            params["mode"] = format(mode, "03o")
         response = await self._request(
             "PUT",
             "/files:content",
@@ -376,14 +387,22 @@ class WorkspaceRuntimeClient:
         *,
         recursive: bool,
         deadline_at: datetime,
-    ) -> None:
-        await self._request(
+    ) -> bool:
+        """Whether anything was there to remove.
+
+        200 means something was, 204 means nothing was. An older runtime
+        answers 204 either way, so it reads as "nothing removed" rather than
+        as an error -- which is the safer of the two directions to be wrong in
+        while a sandbox image catches up.
+        """
+        response = await self._request(
             "DELETE",
             "/files",
             deadline_at=deadline_at,
             params={"path": path, "recursive": str(recursive).lower()},
             status_errors=_FILESYSTEM_STATUS_ERRORS,
         )
+        return response.status_code == 200
 
     async def create_python_session(
         self, request: CreatePythonSessionRequest
@@ -545,8 +564,10 @@ class WorkspaceRuntimeClient:
         status_code: int,
         status_errors: Mapping[int, type[WorkspaceRuntimeError]] | None,
     ) -> WorkspaceRuntimeError:
-        error_type = (status_errors or {}).get(status_code, WorkspaceRuntimeError)
         message = f"workspace runtime returned HTTP {status_code}"
+        if status_code in (401, 403):
+            return WorkspaceRuntimeUnauthorized(message, status_code=status_code)
+        error_type = (status_errors or {}).get(status_code, WorkspaceRuntimeError)
         if error_type is WorkspaceRuntimeFileRejected:
             return WorkspaceRuntimeFileRejected(message, status_code=status_code)
         return error_type(message)

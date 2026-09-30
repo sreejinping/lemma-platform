@@ -2,7 +2,7 @@
 
 The check is deliberately quiet: it never runs in front of a command, it reads
 the version off the server the command already dialed, and it prints one line on
-stderr once per released version. These tests pin all four of those.
+stderr at most once a day. These tests pin all four of those.
 """
 
 from __future__ import annotations
@@ -36,6 +36,26 @@ def _updatable() -> update_mod.InstallKind:
 
 def _installed_version(monkeypatch, version: str) -> None:
     monkeypatch.setattr(versions_mod, "cli_version", lambda: version)
+
+
+@pytest.fixture(autouse=True)
+def no_suggestion_from_the_server(monkeypatch):
+    """Start every test as if no response in this process named a release."""
+    monkeypatch.setattr("lemma_sdk.transport._suggested_cli", None)
+
+
+def _server_suggests(monkeypatch, version: str) -> None:
+    monkeypatch.setattr("lemma_sdk.transport._suggested_cli", version)
+
+
+@pytest.fixture
+def installed(monkeypatch, tmp_path) -> None:
+    """A real `uv tool` install, where `lemma update` can act and a notice is due."""
+    import lemma_cli
+
+    monkeypatch.delenv("PIP_PREFIX", raising=False)
+    location = tmp_path / "venv" / "site-packages" / "lemma_cli" / "__init__.py"
+    monkeypatch.setattr(lemma_cli, "__file__", str(location))
 
 
 # --- version comparison ---------------------------------------------------
@@ -76,8 +96,7 @@ def test_notice_names_the_version_and_the_command(config_path, monkeypatch, caps
     assert "lemma update" in captured.err
 
 
-def test_notice_prints_once_per_released_version(config_path, monkeypatch, capsys):
-    monkeypatch.setattr(update_mod, "install_kind", _updatable)
+def test_notice_prints_at_most_once_a_day(config_path, installed, monkeypatch, capsys):
     _installed_version(monkeypatch, "0.7.2")
     update_mod._write_block({"latest_version": "0.7.3"})
 
@@ -87,10 +106,50 @@ def test_notice_prints_once_per_released_version(config_path, monkeypatch, capsy
     update_mod.notify_if_available()
     assert capsys.readouterr().err == ""
 
-    # A newer release speaks up again.
-    update_mod._write_block({"latest_version": "0.7.4"})
+    # A day later, still behind: say it again.
+    update_mod._write_block(
+        {"last_notified": time.time() - update_mod.NOTICE_INTERVAL_SECONDS - 1}
+    )
     update_mod.notify_if_available()
-    assert "0.7.4" in capsys.readouterr().err
+    assert "0.7.3" in capsys.readouterr().err
+
+
+def test_the_servers_header_is_enough_for_a_notice(
+    config_path, installed, monkeypatch, capsys
+):
+    """A response to this very command named a newer release: no background
+    check has to have run first."""
+    _installed_version(monkeypatch, "0.7.2")
+    _server_suggests(monkeypatch, "0.8.0")
+
+    update_mod.notify_if_available()
+
+    assert "lemma 0.8.0 is available" in capsys.readouterr().err
+    # Remembered, so the next invocation knows without asking again.
+    assert update_mod._read_block()["latest_version"] == "0.8.0"
+
+
+def test_the_newer_of_header_and_stored_version_wins(
+    config_path, installed, monkeypatch, capsys
+):
+    _installed_version(monkeypatch, "0.7.2")
+    update_mod._write_block({"latest_version": "0.9.0"})
+    _server_suggests(monkeypatch, "0.8.0")
+
+    update_mod.notify_if_available()
+
+    assert "lemma 0.9.0 is available" in capsys.readouterr().err
+
+
+def test_a_header_no_newer_than_this_cli_says_nothing(
+    config_path, installed, monkeypatch, capsys
+):
+    _installed_version(monkeypatch, "0.8.0")
+    _server_suggests(monkeypatch, "0.8.0")
+
+    update_mod.notify_if_available()
+
+    assert capsys.readouterr().err == ""
 
 
 def test_no_notice_when_already_current(config_path, monkeypatch, capsys):
@@ -287,27 +346,57 @@ def test_update_refuses_in_an_overlaid_image(monkeypatch, tmp_path):
     assert result.stdout == ""
 
 
-def test_update_runs_uv_tool_install(monkeypatch, tmp_path):
-    monkeypatch.setattr(update_mod, "install_kind", _updatable)
-    monkeypatch.setattr(update_mod, "_find_uv", lambda: "/usr/local/bin/uv")
-    calls: list[list[str]] = []
+def _uv_reporting(calls: list[list[str]], installed: str | None):
+    """A `subprocess.run` that records commands, and whose `uv tool list`
+    reports ``installed`` (or nothing, when None)."""
 
     class Completed:
         returncode = 0
-        stdout = ""
         stderr = ""
 
-    monkeypatch.setattr(
-        "subprocess.run", lambda command, **kw: (calls.append(command), Completed())[1]
-    )
+        def __init__(self, stdout: str) -> None:
+            self.stdout = stdout
+
+    def run(command, **kw):
+        calls.append(command)
+        if command[1:3] == ["tool", "list"] and installed is not None:
+            return Completed(f"lemma-terminal v{installed}\n- lemma\n")
+        return Completed("")
+
+    return run
+
+
+@pytest.mark.parametrize(
+    ("installed", "action"),
+    [
+        (None, "upgraded"),
+        ("99.0.0", "upgraded"),
+        # A server can suggest a release minutes before its packages reach
+        # PyPI. The unpinned install then reinstalls this version, and that is
+        # not an upgrade.
+        ("current", "no_newer_release"),
+    ],
+)
+def test_update_runs_uv_tool_install_and_reports_the_result(
+    monkeypatch, tmp_path, installed, action
+):
+    if installed == "current":
+        installed = versions_mod.cli_version()
+    monkeypatch.setattr(update_mod, "install_kind", _updatable)
+    monkeypatch.setattr(update_mod, "_find_uv", lambda: "/usr/local/bin/uv")
+    calls: list[list[str]] = []
+    monkeypatch.setattr("subprocess.run", _uv_reporting(calls, installed))
 
     result = _invoke(["--json", "update"], tmp_path)
 
     assert result.exit_code == 0, result.output
     assert calls == [
-        ["/usr/local/bin/uv", "tool", "install", "--force", "lemma-terminal"]
+        ["/usr/local/bin/uv", "tool", "install", "--force", "lemma-terminal"],
+        ["/usr/local/bin/uv", "tool", "list"],
     ]
-    assert json.loads(result.stdout)["action"] == "upgraded"
+    payload = json.loads(result.stdout)
+    assert payload["action"] == action
+    assert payload["installed"] == installed
 
 
 def test_update_pins_an_explicit_version(monkeypatch, tmp_path):
@@ -373,6 +462,27 @@ def test_update_reports_a_failed_uv_run_without_raising(monkeypatch, tmp_path):
     flat = " ".join(result.stderr.split())
     assert "No solution found" in flat
     assert "uv tool install --force lemma-terminal" in flat
+
+
+# --- what the CLI tells the server it is -----------------------------------
+
+
+def test_the_cli_declares_itself_with_its_own_version(monkeypatch):
+    _installed_version(monkeypatch, "0.7.2")
+    environ: dict[str, str] = {}
+
+    versions_mod.declare_client(environ)
+
+    assert environ == {"LEMMA_CLIENT": "lemma-cli", "LEMMA_CLIENT_VERSION": "0.7.2"}
+
+
+def test_a_caller_that_named_itself_keeps_its_name_and_version(monkeypatch):
+    _installed_version(monkeypatch, "0.7.2")
+    environ = {"LEMMA_CLIENT": "lemma-desktop"}
+
+    versions_mod.declare_client(environ)
+
+    assert environ == {"LEMMA_CLIENT": "lemma-desktop"}
 
 
 # --- telemetry dimension --------------------------------------------------

@@ -9,7 +9,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from uuid import UUID
 
-from sqlalchemy import delete, select
+from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError
 
 from app.core.infrastructure.db.uow import SqlAlchemyUnitOfWork
@@ -18,9 +18,13 @@ from app.modules.agent.domain.agent_host import (
     AgentHostStatus,
     HostHello,
 )
+from app.modules.agent.infrastructure.agent_host.recovery import (
+    terminalize_revoked_host,
+)
 from app.modules.agent.infrastructure.agent_host.repository_common import (
     DEFAULT_PAIRING_TTL_SECONDS,
     AgentHostNotFound,
+    AgentHostInstallationRevoked,
     AgentHostPairingRejected,
     AgentHostProtocolViolation,
     utcnow,
@@ -33,8 +37,73 @@ from app.modules.agent.infrastructure.runtime_models import (
 
 
 # Heartbeat rows are rewritten at most this often; the 90s offline threshold
-# leaves ample slack for a host polling on a 25s long-poll deadline.
+# leaves ample slack for a host whose link heartbeats every 20s.
 _SEEN_WRITE_INTERVAL_SECONDS = 20
+
+
+def _negotiated_status(
+    hello: HostHello, capacity: dict[str, int]
+) -> tuple[int | None, AgentHostStatus]:
+    """The protocol a heartbeat negotiates, and the status it puts the host in."""
+    try:
+        protocol = hello.negotiate()
+    except ValueError:
+        return None, AgentHostStatus.UPGRADE_REQUIRED
+    explicitly_draining = capacity.get("available_runs") == 0 and capacity.get(
+        "active_runs", 0
+    ) < capacity.get("max_runs", 0)
+    return protocol, (
+        AgentHostStatus.DRAINING if explicitly_draining else AgentHostStatus.ONLINE
+    )
+
+
+#: The ``capacity`` key host execution's report is kept under. See
+#: docs/architecture/desktop-host-execution.md §2.
+HOST_EXECUTION_CAPACITY_KEY = "host_execution"
+
+
+def _stored_capacity(
+    previous: dict | None,
+    capacity: dict[str, object],
+    host_execution: dict[str, object] | None,
+) -> dict[str, object]:
+    """The row's ``capacity``: this heartbeat's run slots, and host execution.
+
+    The two arrive separately -- run slots on every frame, host execution on a
+    ``hello`` and on the ``control`` frames that carry it -- and share one
+    column. So neither replaces the other: ``None`` host execution keeps what
+    the row already said.
+    """
+    stored = {
+        key: value
+        for key, value in capacity.items()
+        if key != HOST_EXECUTION_CAPACITY_KEY
+    }
+    kept = (
+        host_execution
+        if host_execution is not None
+        else (previous or {}).get(HOST_EXECUTION_CAPACITY_KEY)
+    )
+    if kept is not None:
+        stored[HOST_EXECUTION_CAPACITY_KEY] = kept
+    return stored
+
+
+def _row_already_says(
+    host: AgentHostModel,
+    *,
+    protocol: int | None,
+    host_release: str,
+    status: AgentHostStatus,
+    capacity: dict[str, object],
+) -> bool:
+    """Whether a heartbeat would write nothing new."""
+    return (
+        host.protocol_version == protocol
+        and host.host_release == host_release
+        and host.status == status.value
+        and (host.capacity or {}) == capacity
+    )
 
 
 class AgentHostRepository:
@@ -76,9 +145,15 @@ class AgentHostRepository:
         host_secret_hash: str,
         display_name: str,
         hello: HostHello,
+        reenable: bool = False,
         now: datetime | None = None,
     ) -> AgentHostModel:
-        """Create or re-pair a host; re-pairing rotates the host secret."""
+        """Create or re-pair a host; re-pairing rotates the host secret.
+
+        An installation its user removed stays removed unless ``reenable``
+        says the person asked for it back: raises
+        ``AgentHostInstallationRevoked``, and the code is left unused.
+        """
         timestamp = now or utcnow()
         pairing = (
             await self.session.execute(
@@ -109,6 +184,8 @@ class AgentHostRepository:
                 .with_for_update()
             )
         ).scalar_one_or_none()
+        if host is not None and host.revoked_at is not None and not reenable:
+            raise AgentHostInstallationRevoked()
         if host is None:
             host = AgentHostModel(
                 user_id=pairing.user_id,
@@ -206,12 +283,15 @@ class AgentHostRepository:
         host_id: UUID,
         hello: HostHello,
         capacity: dict,
+        host_execution: dict[str, object] | None = None,
         now: datetime | None = None,
     ) -> AgentHostModel:
         """Record one heartbeat, rewriting the row only when something changed.
 
-        Polls arrive at least every 25s; skipping no-op writes keeps an idle
-        host from producing a locked row update on every request.
+        ``control`` frames arrive at least every 20s; skipping no-op writes
+        keeps an idle host from producing a locked row update on every one.
+        ``host_execution`` is stored inside ``capacity``; ``None`` keeps the
+        report already there (see ``_stored_capacity``).
         """
         timestamp = now or utcnow()
         host = await self.require(host_id)
@@ -220,30 +300,17 @@ class AgentHostRepository:
         if host.installation_id != hello.installation_id:
             raise AgentHostProtocolViolation("installation identity changed")
 
-        try:
-            protocol = hello.negotiate()
-            explicitly_draining = capacity.get("available_runs") == 0 and capacity.get(
-                "active_runs", 0
-            ) < capacity.get("max_runs", 0)
-            status = (
-                AgentHostStatus.DRAINING
-                if explicitly_draining
-                else AgentHostStatus.ONLINE
-            )
-        except ValueError:
-            protocol = None
-            status = AgentHostStatus.UPGRADE_REQUIRED
-
+        protocol, status = _negotiated_status(hello, capacity)
         recently_seen = host.last_seen_at is not None and host.last_seen_at > (
             timestamp - timedelta(seconds=_SEEN_WRITE_INTERVAL_SECONDS)
         )
-        unchanged = (
-            host.protocol_version == protocol
-            and host.host_release == hello.host_release
-            and host.status == status.value
-            and (host.capacity or {}) == capacity
-        )
-        if recently_seen and unchanged:
+        if recently_seen and _row_already_says(
+            host,
+            protocol=protocol,
+            host_release=hello.host_release,
+            status=status,
+            capacity=_stored_capacity(host.capacity, capacity, host_execution),
+        ):
             return host
 
         host = await self.require(host_id, for_update=True)
@@ -251,11 +318,60 @@ class AgentHostRepository:
             raise AgentHostProtocolViolation("Agent Host is revoked")
         host.protocol_version = protocol
         host.host_release = hello.host_release
-        host.capacity = capacity
+        # Merged against the row as locked, so a report written by another
+        # replica between the two reads is the one kept.
+        host.capacity = _stored_capacity(host.capacity, capacity, host_execution)
         host.status = status.value
         host.last_seen_at = timestamp
         await self.session.flush()
         return host
+
+    async def claim_link_generation(self, host_id: UUID) -> int:
+        """Take the next link generation for a host: the one its new link owns.
+
+        One ``UPDATE ... RETURNING``, so two handshakes racing on different
+        replicas serialize on the row lock and come away with distinct,
+        ordered values. Whichever is greater owns the host.
+        """
+        claimed = await self.session.execute(
+            update(AgentHostModel)
+            .where(AgentHostModel.id == host_id)
+            .values(link_generation=AgentHostModel.link_generation + 1)
+            .returning(AgentHostModel.link_generation)
+            .execution_options(synchronize_session=False)
+        )
+        return int(claimed.scalar_one())
+
+    async def link_generation(self, host_id: UUID) -> int | None:
+        """The generation of the link that owns the host now; None if it is gone."""
+        return (
+            await self.session.execute(
+                select(AgentHostModel.link_generation).where(
+                    AgentHostModel.id == host_id
+                )
+            )
+        ).scalar_one_or_none()
+
+    async def mark_upgrade_required(self, secret_hash: str) -> UUID | None:
+        """Record that the host holding this secret speaks a retired protocol.
+
+        Returns the host's id only when this call changed it, so the caller
+        can say so once per host rather than once per retry. Unknown and
+        revoked secrets change nothing and return None.
+        """
+        return (
+            await self.session.execute(
+                update(AgentHostModel)
+                .where(
+                    AgentHostModel.host_secret_hash == secret_hash,
+                    AgentHostModel.revoked_at.is_(None),
+                    AgentHostModel.status != AgentHostStatus.UPGRADE_REQUIRED.value,
+                )
+                .values(status=AgentHostStatus.UPGRADE_REQUIRED.value)
+                .returning(AgentHostModel.id)
+                .execution_options(synchronize_session=False)
+            )
+        ).scalar_one_or_none()
 
     async def revoke(
         self,
@@ -266,9 +382,9 @@ class AgentHostRepository:
     ) -> AgentHostModel:
         """Revoke a host, invalidating its secret immediately.
 
-        Cancelling the host's in-flight commands and run leases is added
-        alongside the dispatch tables; there is no dispatch state to reconcile
-        while this revision is the head.
+        In the same transaction, its unfinished runs fail and its undelivered
+        or unacknowledged commands are cancelled (``terminalize_revoked_host``):
+        a removed computer must not keep a run waiting on it.
         """
         host = await self.get(host_id, for_update=True)
         if host is None or host.user_id != user_id:
@@ -277,6 +393,7 @@ class AgentHostRepository:
         host.revoked_at = timestamp
         host.status = AgentHostStatus.REVOKED.value
         await self.session.flush()
+        await terminalize_revoked_host(self.session, host_id=host.id, now=timestamp)
         return host
 
     async def publish_harness(

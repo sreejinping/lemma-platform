@@ -23,19 +23,24 @@ from app.modules.agent.domain.entities import (
     AgentRun as AgentRunEntity,
     Message as MessageEntity,
     MessageRole,
+    RuntimeHistoryWindow,
 )
+from app.modules.agent.domain.queued_messages import STEERED_INTO_RUN
 from app.modules.agent.domain.value_objects import (
     AgentRunStatus,
     ACTIVE_AGENT_RUN_STATUSES,
 )
-from app.modules.agent.domain.entities import RuntimeHistoryWindow
-from app.modules.agent.infrastructure.runtime_history_window import (
-    newest_runs,
-    run_count,
+from app.modules.agent.infrastructure.runtime_history_queries import (
+    RuntimeHistoryQueries,
 )
 from app.modules.agent.infrastructure.models import (
     AgentRunModel,
     MessageModel,
+)
+from app.modules.agent.infrastructure.queued_message_queries import (
+    in_order,
+    stamp,
+    unclaimed_queued_messages,
 )
 from app.modules.agent.infrastructure.repositories.conversation_status_repair import (
     list_conversations_stranded_by_a_finished_run,
@@ -245,188 +250,33 @@ class ConversationRunQueriesMixin:
         return await self.list_agent_runs_with_messages(conversation_id)
 
     async def load_runtime_history_digests_by_run_id(
-        self,
-        agent_run_id: UUID,
-        *,
-        limit: int,
+        self, agent_run_id: UUID, *, limit: int
     ) -> RuntimeHistoryWindow:
-        """The newest ``limit`` runs of a conversation, with sizes and timings.
-
-        No messages: the runtime prompt keeps recent runs whole and elides older
-        ones, but *which* runs are recent is decided only after the caller's
-        trims have run -- and the surface age window keeps a run whose newest
-        message is recent even when runs created after it are dropped, so it is
-        a filter rather than a truncation and the surviving list is not a
-        suffix. Deciding what to load from position alone therefore drops
-        messages from a run the trim then keeps in full, without an elision
-        notice, because the shortened list never reaches the elision branch. So
-        the caller gets the shape first, decides, and asks for messages second.
-
-        ``limit`` is the caller's own ceiling, applied here rather than to the
-        result. See `runtime_history_window` for why the total and the resumed
-        run come back with it.
-        """
-        conversation_id = (
-            await self.session.execute(
-                select(AgentRunModel.conversation_id).where(
-                    AgentRunModel.id == agent_run_id
-                )
-            )
-        ).scalar_one_or_none()
-        if conversation_id is None:
-            return RuntimeHistoryWindow(runs=[], total_runs=0, current_run=None)
-
-        rows = list(
-            (await self.session.execute(newest_runs(conversation_id, limit))).scalars()
-        )
-        rows.reverse()
-        total_runs = int(
-            (await self.session.execute(run_count(conversation_id))).scalar_one()
-        )
-        entities = await self._with_message_digests(rows)
-        current_run = next(
-            (entity for entity in entities if entity.id == agent_run_id), None
-        )
-        if current_run is None:
-            # Older than the window. It is still the run being executed, and the
-            # runner refuses the whole request when it cannot find it, so it is
-            # fetched on its own -- one extra statement on the rare path rather
-            # than a wider window on every one.
-            resumed = (
-                (
-                    await self.session.execute(
-                        select(AgentRunModel).where(AgentRunModel.id == agent_run_id)
-                    )
-                )
-                .scalars()
-                .first()
-            )
-            if resumed is not None:
-                current_run = (await self._with_message_digests([resumed]))[0]
-        return RuntimeHistoryWindow(
-            runs=entities, total_runs=total_runs, current_run=current_run
-        )
-
-    async def _with_message_digests(
-        self, rows: list[AgentRunModel]
-    ) -> list[AgentRunEntity]:
-        """Hydrate runs carrying their message count and newest timestamp.
-
-        The count has to come from here rather than from ``len(run.messages)``:
-        the loader deliberately fetches older runs down to two messages, so the
-        list is not the size.
-        """
-        if not rows:
-            return []
-        digests = {
-            row[0]: (row[1], row[2])
-            for row in (
-                await self.session.execute(
-                    select(
-                        MessageModel.agent_run_id,
-                        func.count(),
-                        func.max(MessageModel.created_at),
-                    )
-                    .where(MessageModel.agent_run_id.in_([row.id for row in rows]))
-                    .group_by(MessageModel.agent_run_id)
-                )
-            ).all()
-        }
-        entities: list[AgentRunEntity] = []
-        for row in rows:
-            entity = row.to_entity()
-            count, newest = digests.get(row.id, (0, None))
-            entity.messages = []
-            entity.total_message_count = count
-            entity.newest_message_at = newest
-            entities.append(entity)
-        return entities
+        return await RuntimeHistoryQueries(
+            self.session
+        ).load_runtime_history_digests_by_run_id(agent_run_id, limit=limit)
 
     async def attach_runtime_history_messages(
-        self,
-        runs: list[AgentRunEntity],
-        *,
-        full_run_ids: set[UUID],
+        self, runs: list[AgentRunEntity], *, full_run_ids: set[UUID]
     ) -> list[AgentRunEntity]:
-        """Fill in messages: whole for ``full_run_ids``, first and last for the rest.
+        return await RuntimeHistoryQueries(
+            self.session
+        ).attach_runtime_history_messages(runs, full_run_ids=full_run_ids)
 
-        Three reads serve the elided runs -- two ``DISTINCT ON`` for each run's
-        first and last message, and one for every user message in them, since
-        those are never elided. All are answered by the (agent_run_id, sequence)
-        index rather than by reading the runs.
-        """
-        if not runs:
-            return runs
-        elided_ids = [run.id for run in runs if run.id not in full_run_ids]
-
-        messages: list[MessageModel] = []
-        if full_run_ids:
-            messages.extend(
-                (
-                    await self.session.execute(
-                        select(MessageModel)
-                        .where(MessageModel.agent_run_id.in_(full_run_ids))
-                        .order_by(
-                            MessageModel.agent_run_id, MessageModel.sequence.asc()
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-        if elided_ids:
-            # The user's own messages are never elided, however old the run. An
-            # agent that cannot see what it was asked drifts onto a different
-            # task and then reports that task as the one requested -- which is
-            # exactly how a request for one video became an hour spent building
-            # another. Answered by (agent_run_id, sequence) like its neighbours.
-            messages.extend(
-                (
-                    await self.session.execute(
-                        select(MessageModel)
-                        .where(
-                            MessageModel.agent_run_id.in_(elided_ids),
-                            MessageModel.role == MessageRole.USER.value,
-                        )
-                        .order_by(
-                            MessageModel.agent_run_id, MessageModel.sequence.asc()
-                        )
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            for order in (MessageModel.sequence.asc(), MessageModel.sequence.desc()):
-                messages.extend(
-                    (
-                        await self.session.execute(
-                            select(MessageModel)
-                            .where(MessageModel.agent_run_id.in_(elided_ids))
-                            .distinct(MessageModel.agent_run_id)
-                            .order_by(MessageModel.agent_run_id, order)
-                        )
-                    )
-                    .scalars()
-                    .all()
-                )
-
-        by_run: dict[UUID, list[MessageModel]] = {}
-        seen: set[UUID] = set()
-        for message in messages:
-            # A one-message run is its own first and last; keep it once.
-            if message.id in seen:
-                continue
-            seen.add(message.id)
-            by_run.setdefault(message.agent_run_id, []).append(message)
-
-        for run in runs:
-            run.messages = [
-                model.to_entity()
-                for model in sorted(
-                    by_run.get(run.id, []), key=lambda model: model.sequence
-                )
-            ]
-        return runs
+    async def load_unattached_notifications(
+        self,
+        conversation_id: UUID,
+        *,
+        after_sequence: int | None,
+        before_sequence: int | None,
+        limit: int,
+    ) -> list[MessageEntity]:
+        return await RuntimeHistoryQueries(self.session).load_unattached_notifications(
+            conversation_id,
+            after_sequence=after_sequence,
+            before_sequence=before_sequence,
+            limit=limit,
+        )
 
     async def get_agent_run(self, agent_run_id: UUID) -> AgentRunEntity | None:
         result = await self.session.execute(
@@ -459,45 +309,30 @@ class ConversationRunQueriesMixin:
         ).one()
         return bool(row.total) and not row.non_user
 
-    def _unclaimed_queued_messages(self, agent_run_id: UUID):
-        """Messages that arrived after this run started and nobody has read yet.
-
-        ``start`` stamps ``during_active_run`` on a message it appends to a run
-        already in flight, because that run loaded its history before the
-        message existed. ``steered_into_run`` is stamped back by whoever
-        delivered it into a model request, so the same predicate answers both
-        questions that matter: what to steer in next, and what is still owed an
-        answer once the run ends.
-
-        Compared as text rather than cast to boolean, because the column is free
-        JSONB -- a cast would raise on a row where something else wrote a
-        non-boolean under that key, and a miscount is the better failure.
-        """
-        return (
-            MessageModel.agent_run_id == agent_run_id,
-            MessageModel.role == MessageRole.USER.value,
-            MessageModel.message_metadata["during_active_run"].astext == "true",
-            MessageModel.message_metadata["steered_into_run"].astext.is_(None),
-        )
-
     async def count_queued_user_messages(self, agent_run_id: UUID) -> int:
         """How many of this run's queued messages are still unanswered.
 
         Counted over ``ix_agent_message_run_sequence`` rather than loading the
         run's messages, and asked once when a run ends -- so the answer is
         normally zero and costs one indexed aggregate.
+
+        A message handed to the host as a steer that never landed still counts:
+        ``steer_dispatched_at`` is not a claim, so the follow-up turn is what
+        answers it.
         """
         return int(
             await self.session.scalar(
-                select(func.count()).where(
-                    *self._unclaimed_queued_messages(agent_run_id)
-                )
+                select(func.count()).where(*unclaimed_queued_messages(agent_run_id))
             )
             or 0
         )
 
     async def claim_queued_user_messages(
-        self, agent_run_id: UUID
+        self,
+        agent_run_id: UUID,
+        *,
+        into_run_id: UUID | None = None,
+        message_ids: list[UUID] | None = None,
     ) -> list[MessageEntity]:
         """Take the messages that arrived mid-run, and mark them taken.
 
@@ -507,24 +342,39 @@ class ConversationRunQueriesMixin:
         completion sweep will not pick it up either -- but the run is FAILED, so
         the person is told, which is the recovery that was already there.
 
+        ``into_run_id`` is the run that will deliver them, when that is not the
+        run they were queued behind: the follow-up turn claims its predecessor's
+        queue, and the Agent Host harness reads that claim to know which
+        messages its prompt has to carry.
+
+        ``message_ids`` narrows the claim to messages the caller has in hand --
+        an Agent Host dispatch claims the ones its prompt already carries, and
+        must not claim one that arrived a moment later and is not in it.
+
         Returns them in the order they were appended, which the caller relies on
         to keep several bubbles of one message in sequence.
         """
-        stamped = MessageModel.message_metadata.op("||")(
-            func.jsonb_build_object("steered_into_run", str(agent_run_id))
-        )
         rows = (
             await self.session.execute(
                 update(MessageModel)
-                .where(*self._unclaimed_queued_messages(agent_run_id))
-                .values(message_metadata=stamped)
+                .where(
+                    *unclaimed_queued_messages(agent_run_id),
+                    *(
+                        (MessageModel.id.in_(message_ids),)
+                        if message_ids is not None
+                        else ()
+                    ),
+                )
+                .values(
+                    message_metadata=stamp(
+                        **{STEERED_INTO_RUN: str(into_run_id or agent_run_id)}
+                    )
+                )
                 .returning(MessageModel)
                 .execution_options(synchronize_session=False)
             )
         ).scalars()
-        return sorted(
-            (row.to_entity() for row in rows), key=lambda message: message.sequence
-        )
+        return in_order(rows)
 
     async def get_latest_agent_run_for_conversation(
         self,

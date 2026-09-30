@@ -210,10 +210,19 @@ async def test_changes_ws_rejects_unauthenticated(
     notes_pod: DatastoreApi,
     test_app,
 ):
+    """A rejected session is accepted, then closed 4401.
+
+    A close before accept reaches a browser as a failed upgrade (1006), so the
+    client could never tell an expired session from a network drop.
+    """
     communicator = _ws_communicator(test_app, notes_pod.pod_id, token="")
     await communicator.send_input({"type": "websocket.connect"})
+    accepted = await communicator.receive_output(timeout=5)
+    assert accepted["type"] == "websocket.accept", accepted
     closed = await communicator.receive_output(timeout=5)
-    assert closed["type"] == "websocket.close"
+    assert closed["type"] == "websocket.close", closed
+    assert closed["code"] == 4401, closed
+    await communicator.wait(timeout=3)
 
 
 async def test_changes_ws_disconnect_immediately_after_connect(
@@ -445,4 +454,30 @@ async def test_changes_ws_since_replays_preconnect_record(
     assert frame["payload"]["body"] == "pre-connect"
 
     await communicator.send_input({"type": "websocket.disconnect", "code": 1000})
+    await communicator.wait(timeout=3)
+
+
+async def test_changes_ws_on_a_pod_without_access_closes_forbidden(
+    notes_pod: DatastoreApi,
+    fixed_test_user,
+    test_app,
+):
+    """A signed-in user watching a pod they cannot read gets 4403, not 1011.
+
+    Core authorization raises the missing permission as a plain 403 domain
+    error. Handled only as the datastore subclass, it closed 1011 -- which
+    every client treats as transient, so a browser pointed at a pod it had no
+    access to retried the socket for hours.
+    """
+    import uuid
+
+    communicator = _ws_communicator(
+        test_app, str(uuid.uuid4()), fixed_test_user["token"]
+    )
+    await communicator.send_input({"type": "websocket.connect"})
+    accepted = await communicator.receive_output(timeout=5)
+    assert accepted["type"] == "websocket.accept", accepted
+    closed = await communicator.receive_output(timeout=5)
+    assert closed["type"] == "websocket.close", closed
+    assert closed["code"] in (4403, 4404), closed
     await communicator.wait(timeout=3)

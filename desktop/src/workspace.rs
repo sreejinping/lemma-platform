@@ -1,9 +1,75 @@
 use super::*;
 
 pub(crate) fn read_resume_target() -> Option<ResumeTarget> {
-    let config = read_config();
-    let saved = config.get("resumeTarget")?;
-    let text = |key: &str| saved.get(key)?.as_str().map(str::to_string);
+    resume_target_from(&read_config(), env!("CARGO_PKG_VERSION")).ok()
+}
+
+/// Why a launch could not open straight onto the workspace.
+///
+/// Each is a different story about the last session, and the launch log said
+/// "miss" for all of them -- including the ordinary one, a launch after a
+/// quit, where the miss is the design working: quit stops the stack, so there
+/// is nothing left to resume.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ResumeMiss {
+    /// No session has recorded a workspace yet, or it was unreadable.
+    NoneRecorded,
+    /// Recorded by another release, whose stack this one must not adopt.
+    OtherRelease,
+    /// The recorded workspace is not one this build trusts.
+    Untrusted,
+    /// Nothing is serving the recorded generation: the stack was stopped (a
+    /// quit or an update), or it restarted since.
+    NotServing,
+}
+
+impl ResumeMiss {
+    pub(crate) fn launch_trace(self) -> &'static str {
+        match self {
+            Self::NoneRecorded => "resume: none recorded, showing the splash",
+            Self::OtherRelease => {
+                "resume: recorded by another release, showing the splash"
+            }
+            Self::Untrusted => "resume: recorded origin not trusted, showing the splash",
+            Self::NotServing => {
+                "resume: nothing serving the last session's workspace (stopped by quit or update), showing the splash"
+            }
+        }
+    }
+}
+
+/// Whether a recorded target is one to open straight onto.
+pub(crate) fn decide_resume(
+    recorded: Result<ResumeTarget, ResumeMiss>,
+    is_serving: impl FnOnce(&ResumeTarget) -> bool,
+) -> Result<ResumeTarget, ResumeMiss> {
+    let target = recorded?;
+    // Parsed before the probe, not after: this comes out of a user-writable
+    // config file, and a launch that panicked on a hand-edited route would be
+    // a far worse failure than a slow one. An unparseable target simply is
+    // not a resume.
+    if resume_entry_url(&target).parse::<tauri::Url>().is_err() {
+        return Err(ResumeMiss::Untrusted);
+    }
+    if !is_serving(&target) {
+        return Err(ResumeMiss::NotServing);
+    }
+    Ok(target)
+}
+
+/// The recorded resume target, if this release may use it.
+pub(crate) fn resume_target_from(
+    config: &Value,
+    current_release: &str,
+) -> Result<ResumeTarget, ResumeMiss> {
+    let saved = config.get("resumeTarget").ok_or(ResumeMiss::NoneRecorded)?;
+    let text = |key: &str| {
+        saved
+            .get(key)
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or(ResumeMiss::NoneRecorded)
+    };
     let url = text("url")?;
     let api_url = text("apiUrl")?;
     let generation = text("generation")?;
@@ -16,16 +82,19 @@ pub(crate) fn read_resume_target() -> Option<ResumeTarget> {
     // does not match the new host pack, replaces it, and every service comes
     // back on new ports. The window is left pointed at a port nothing is
     // listening on, which is a permanently blank app.
-    if release != env!("CARGO_PKG_VERSION") {
-        return None;
+    if release != current_release {
+        return Err(ResumeMiss::OtherRelease);
     }
-    if generation.is_empty() || !trusted_workspace_urls(&url, &api_url) {
-        return None;
+    if generation.is_empty() {
+        return Err(ResumeMiss::NoneRecorded);
+    }
+    if !trusted_workspace_urls(&url, &api_url) {
+        return Err(ResumeMiss::Untrusted);
     }
     // A route is a bonus, not a requirement: an install that has only ever
     // reached the workspace root still resumes, it just resumes at the root.
-    let route = text("route").filter(|route| route.starts_with('/'));
-    Some(ResumeTarget {
+    let route = text("route").ok().filter(|route| route.starts_with('/'));
+    Ok(ResumeTarget {
         url,
         api_url,
         generation,
@@ -148,6 +217,68 @@ pub(crate) fn generation_matches(
     response.text().is_ok_and(|body| body.contains(generation))
 }
 
+/// The capability granting this installation's local workspace -- its exact
+/// origin, port included -- the shipped workspace commands.
+///
+/// Not in `capabilities/workspace.json`, because the port is locald's to
+/// allocate and a file can only say `http://app.lemma.localhost:*`. That
+/// pattern would also cover every pod-app alias (`pod_app_alias.rs`): user
+/// code served on the workspace's host at another port, framed inside the
+/// very window this grants. Pinned here to the one origin that is the
+/// workspace, an alias origin matches no capability at all.
+///
+/// `None` for anything but a local workspace origin this build trusts.
+pub(crate) fn local_workspace_capability(workspace: &str) -> Option<String> {
+    let url = tauri::Url::parse(workspace).ok()?;
+    let host = url.host_str()?;
+    let port = url.port()?;
+    if url.scheme() != "http" || !trusted_local_workspace_host(host) {
+        return None;
+    }
+    Some(
+        json!({
+            "identifier": format!("workspace-local-capability-{port}"),
+            "description": "This installation's local workspace, on its exact origin, granted the shipped workspace commands.",
+            "local": false,
+            "webviews": ["main"],
+            "remote": {"urls": [format!("http://{host}:{port}")]},
+            "permissions": shipped_workspace_permissions(),
+        })
+        .to_string(),
+    )
+}
+
+/// Grant the local workspace at `workspace` its commands, once per origin.
+///
+/// Called before anything navigates the main window there: on a resumed
+/// launch, and whenever locald names the workspace's URL.
+pub(crate) fn grant_local_workspace_capability(app: &AppHandle, workspace: &str) {
+    let Some(capability) = local_workspace_capability(workspace) else {
+        return;
+    };
+    let Ok(url) = tauri::Url::parse(workspace) else {
+        return;
+    };
+    let origin = url.origin().ascii_serialization();
+    let shell: State<Shell> = app.state();
+    if !shell
+        .granted_workspace_origins
+        .lock_or_recover()
+        .insert(origin.clone())
+    {
+        return;
+    }
+    if let Err(error) = app.add_capability(capability) {
+        shell
+            .granted_workspace_origins
+            .lock_or_recover()
+            .remove(&origin);
+        append_install_log(&format!(
+            "could not grant the local workspace at {origin} its commands: {error}"
+        ));
+    }
+}
+
 /// The workspace origins `capabilities/workspace.json` already covers.
 /// The origins the shipped capability already covers, read from the file.
 ///
@@ -250,7 +381,7 @@ pub(crate) fn workspace_capability_for(configured: impl Iterator<Item = String>)
 /// window and must not pull a working workspace out from under the user.
 pub(crate) fn resume_still_serving(app: &AppHandle, resumed_url: &str) -> bool {
     let shell: State<Shell> = app.state();
-    let ui = shell.ui.lock().unwrap();
+    let ui = shell.ui.lock_or_recover();
     ui.url.is_empty() || ui.url == resumed_url
 }
 

@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { after, before, test } from 'node:test';
 import { chromium } from 'playwright';
+import { reportPolicyViolations, servedHeaders } from '../drivers/app-csp.mjs';
 let browser;
 before(async () => { browser = await chromium.launch({ channel: process.env.LEMMA_TEST_BROWSER_CHANNEL || undefined }); });
 after(async () => { await browser?.close(); });
@@ -9,10 +10,19 @@ async function prompt(t, overrides = {}) {
   const context = await browser.newContext({ viewport: { width: 650, height: 600 } });
   t.after(() => context.close());
   const page = await context.newPage();
+  const errors = [];
+  page.on('pageerror', (error) => errors.push(error.message));
+  reportPolicyViolations(page, errors);
+  t.after(() => assert.deepEqual(errors, []));
+  const types = { html: 'text/html', js: 'text/javascript', css: 'text/css' };
   await page.route('https://desktop.test/**', async (route) => {
     const name = new URL(route.request().url()).pathname.slice(1);
-    if (!['confirmation.html', 'confirmation.js'].includes(name)) return route.abort();
-    await route.fulfill({ body: await readFile(new URL(`../../ui/${name}`, import.meta.url)), contentType: name.endsWith('html') ? 'text/html' : 'text/javascript' });
+    if (!['confirmation.html', 'confirmation.js', 'confirmation.css'].includes(name)) return route.abort();
+    await route.fulfill({
+      body: await readFile(new URL(`../../ui/${name}`, import.meta.url)),
+      contentType: types[name.slice(name.lastIndexOf('.') + 1)],
+      headers: servedHeaders(name),
+    });
   });
   await page.addInitScript((overrides) => {
     window.__LEMMA_CONFIRMATION__ = { id: 'owned-operation', title: 'Erase local Lemma?', message: 'Permanently deletes local data.\nNo automatic backup.', confirmLabel: 'Erase Local Lemma', cancelable: true, ...overrides };
@@ -61,25 +71,7 @@ test('failed approval remains visible and can be cancelled; notices have one Clo
   assert.equal(await notice.locator(':focus').textContent(), 'Close');
 });
 
-test('settings offers three keyboard-contained choices and Escape always cancels', async (t) => {
-  const page = await prompt(t, { title: 'Save your settings changes?', confirmLabel: 'Save changes', allowDiscard: true });
-  assert.deepEqual(await page.getByRole('button').allTextContents(), ['Cancel', 'Discard', 'Save changes']);
-  assert.equal(await page.locator(':focus').textContent(), 'Cancel');
-  for (const name of ['Discard', 'Save changes', 'Cancel']) {
-    await page.keyboard.press('Tab');
-    assert.equal(await page.locator(':focus').textContent(), name);
-  }
-  await page.keyboard.press('Shift+Tab');
-  assert.equal(await page.locator(':focus').textContent(), 'Save changes');
-  await page.keyboard.press('Escape');
-  assert.deepEqual(await page.evaluate(() => window.calls), [{ command: 'resolve_confirmation', args: { id: 'owned-operation', decision: 'cancel' } }]);
-});
-
-test('discard and save resolve distinct settings decisions without duplicate submissions', async (t) => {
-  for (const [button, decision] of [['Discard', 'discard'], ['Save changes', 'confirm']]) {
-    const page = await prompt(t, { confirmLabel: 'Save changes', allowDiscard: true });
-    await page.getByRole('button', { name: button, exact: true }).click();
-    assert.deepEqual(await page.evaluate(() => window.calls), [{ command: 'resolve_confirmation', args: { id: 'owned-operation', decision } }]);
-    assert.equal(await page.getByRole('button', { name: button, exact: true }).isDisabled(), true);
-  }
-});
+// The three-way save, discard or keep-editing decision on closing Local
+// settings went with the forms that had drafts: those moved to lemma-frontend's
+// This Mac settings, and lemma-frontend/tests/this-mac.test.ts covers leaving
+// them. Nothing in the shell asks for a Discard button any more.

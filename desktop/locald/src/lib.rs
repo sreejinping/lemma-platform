@@ -1,9 +1,17 @@
 pub mod agent_host;
+pub mod app_alias;
 pub mod config_operations;
 pub mod daemon;
+// When Lemma gives disk back: backups, images, trimmed blocks.
+mod disk_hygiene;
 pub mod host_process;
+pub mod instance_lock;
 mod lifecycle;
 pub mod local_domain;
+// The Mac's end of the paired user's loopback relay; served on macOS only, where the
+// VM helper can reach it. See `ManagedRuntimeController::ensure_forwarders`.
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))]
+mod loopback_relay;
 pub mod managed_runtime;
 pub mod native_host_pack;
 pub mod network;
@@ -13,8 +21,11 @@ pub mod port_reservation;
 pub mod protocol;
 pub mod provider_probe;
 pub mod reset;
+mod setup_probe;
 pub mod sharing;
 pub mod state;
+// Quitting: what stops at once, what waits, and how long each took.
+mod stop_plan;
 mod tcp_forwarder;
 pub mod update_transaction;
 pub mod vault_process;

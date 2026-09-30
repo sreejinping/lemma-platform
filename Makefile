@@ -30,16 +30,19 @@ SHELL := /bin/bash
         test-dev-workflow \
         test test-backend test-backend-unit test-backend-e2e \
         test-frontend test-cli test-cli-unit test-cli-e2e test-python \
-        scenarios scenarios-guards scenarios-sandbox scenarios-live scenarios-images \
+        scenarios scenarios-all scenarios-guards scenarios-sandbox scenarios-live scenarios-images \
         scenarios-standing-down \
         scenarios-deployment scenarios-provision scenarios-reset \
+        scenarios-compose scenarios-split \
         scenarios-desktop scenarios-desktop-provision \
         scenarios-record scenarios-replay \
         scenario-coverage scenarios-code-coverage \
         coverage coverage-backend coverage-backend-unit coverage-backend-e2e \
         coverage-backend-module coverage-cli coverage-cli-unit coverage-cli-e2e coverage-frontend \
         lint lint-clients lint-lockfiles measure-clients client-structure-record client-typecheck-record \
-        quality quality-frontend check architecture pre-push codeql codeql-python codeql-javascript codeql-all migrate
+        quality quality-frontend check architecture pre-push codeql codeql-python codeql-javascript codeql-all migrate \
+        fix format lint-python lint-frontend lint-rust lint-shell lint-ci lint-docker lint-docs lint-config \
+        lint-repo hooks dev-clean dev-clean-apply _disk-hint
 
 # ── Configuration ─────────────────────────────────────────────────────────────
 
@@ -66,7 +69,8 @@ E2E_TEMP_ROOT ?= /tmp/lemma-desktop-e2e
 UNIT_MARKERS  ?= not e2e and not local_guest and not local_host and not desktop_e2e and not provider
 
 BACKEND_DIR   := lemma-backend
-FRONTEND_DIR  := lemma-frontend
+FRONTEND_DIR  := lemma-harness
+WORKSPACE_DIR := lemma-frontend
 CLI_DIR       := lemma-cli
 PYTHON_DIR    := lemma-python
 TS_DIR        := lemma-typescript
@@ -119,13 +123,15 @@ PUBLIC_TUNNEL_READY_TIMEOUT  ?= 30
 
 DEV_BACKEND_PORT      ?= 8710
 DEV_FRONTEND_PORT     ?= 3710
+DEV_WORKSPACE_PORT    ?= 3000
 DEV_POSTGRES_PORT     ?= 5432
 DEV_REDIS_PORT        ?= 6379
 DEV_SUPERTOKENS_PORT  ?= 3567
 
 DEV_BACKEND_URL       := http://localhost:$(DEV_BACKEND_PORT)
 DEV_FRONTEND_URL      := http://localhost:$(DEV_FRONTEND_PORT)
-DEV_AUTH_FRONTEND_URL := $(DEV_FRONTEND_URL)
+DEV_WORKSPACE_URL     := http://localhost:$(DEV_WORKSPACE_PORT)
+DEV_AUTH_FRONTEND_URL := $(DEV_WORKSPACE_URL)
 DEV_APP_BASE_DOMAIN   := apps.lemma.localhost:$(DEV_BACKEND_PORT)
 # A sandbox browser needs an origin, not a path: the dashboard is a Next.js
 # app whose assets are all absolute. `*.localhost` resolves without any DNS
@@ -139,7 +145,7 @@ DEV_SUPERTOKENS_URL   := http://localhost:$(DEV_SUPERTOKENS_PORT)
 DEV_SANDBOX_BACKEND_URL := http://host.lemma.internal:$(DEV_BACKEND_PORT)
 DEV_SANDBOX_FRONTEND_URL := http://host.lemma.internal:$(DEV_FRONTEND_PORT)
 DEV_WORKSPACE_RUNTIME_CREDENTIAL_KEY ?= dev-workspace-runtime-credential-key-0001
-DEV_CORS_ORIGIN_REGEX := https?://(localhost|127\.0\.0\.\d+|127\.\d+\.\d+\.\d+|127-0-0-\d+\.sslip\.io|[\w-]+\.nip\.io)(:\d+)?
+DEV_CORS_ORIGIN_REGEX := https?://(localhost|127\.0\.0\.\d+|127\.\d+\.\d+\.\d+)(:\d+)?
 DEV_LOG_LEVEL         ?= DEBUG
 DEV_JSON_LOGS_ENABLED ?= true
 # DEV_LOG_LEVEL is DEBUG so you can read the application's own story. SQLAlchemy
@@ -221,11 +227,16 @@ COMMON_DEV_ENV := \
 	DEV_SUPERTOKENS_PORT=$(DEV_SUPERTOKENS_PORT)
 
 BACKEND_API_URL                 ?= $(DEV_BACKEND_URL)
-BACKEND_FRONTEND_URL            ?= $(DEV_FRONTEND_URL)
+BACKEND_FRONTEND_URL            ?= $(DEV_WORKSPACE_URL)
 BACKEND_AUTH_FRONTEND_URL       ?= $(DEV_AUTH_FRONTEND_URL)
 BACKEND_CLI_API_URL             ?= $(DEV_BACKEND_URL)
 BACKEND_CLI_AUTH_FRONTEND_URL   ?= $(DEV_AUTH_FRONTEND_URL)
 BACKEND_WORKSPACE_CALLBACK_API_URL ?= $(DEV_SANDBOX_BACKEND_URL)
+# Where a function sandbox fetches its code and reports back. Unset, the backend
+# falls back to API_URL -- localhost, which inside the function container is the
+# container itself -- and every function create, import and run fails with a
+# ConnectError. The desktop and compose stacks set it; this is the same value.
+BACKEND_FUNCTION_RUNTIME_GATEWAY_URL ?= $(DEV_SANDBOX_BACKEND_URL)
 BACKEND_WORKSPACE_CALLBACK_AUTH_URL ?= $(DEV_SANDBOX_FRONTEND_URL)
 BACKEND_WORKSPACE_CALLBACK_FRONTEND_URL ?= $(DEV_SANDBOX_FRONTEND_URL)
 BACKEND_APP_BASE_DOMAIN         ?= $(DEV_APP_BASE_DOMAIN)
@@ -295,6 +306,7 @@ BACKEND_DEV_ENV := \
 	CLI_API_URL=$(BACKEND_CLI_API_URL) \
 	CLI_AUTH_FRONTEND_URL=$(BACKEND_CLI_AUTH_FRONTEND_URL) \
 	WORKSPACE_CALLBACK_API_URL=$(BACKEND_WORKSPACE_CALLBACK_API_URL) \
+	FUNCTION_RUNTIME_GATEWAY_URL=$(BACKEND_FUNCTION_RUNTIME_GATEWAY_URL) \
 	WORKSPACE_CALLBACK_AUTH_URL=$(BACKEND_WORKSPACE_CALLBACK_AUTH_URL) \
 	WORKSPACE_CALLBACK_FRONTEND_URL=$(BACKEND_WORKSPACE_CALLBACK_FRONTEND_URL) \
 	AUTH_WEBSITE_BASE_PATH=/auth \
@@ -366,7 +378,8 @@ help:
 	@echo "    make init               create .env files with local defaults (idempotent)"
 	@echo ""
 	@echo "  Dev stack"
-	@echo "    make dev                start infra + backend + frontend"
+	@echo "    make dev                start infra + backend + harness"
+	@echo "    make dev-frontend       start the user-facing workspace on port 3000"
 	@echo "    make dev-public         start with an ephemeral public API tunnel"
 	@echo "    make dev RELOAD=1       same, with uvicorn --reload on the backend"
 	@echo "    make stop               stop app and tunnel processes"
@@ -402,11 +415,12 @@ help:
 	@echo "    make test-backend       backend unit + fast e2e"
 	@echo "    make test-backend-unit  backend unit tests only"
 	@echo "    make test-backend-e2e   backend fast e2e (E2E_WORKERS=$(E2E_WORKERS))"
-	@echo "    make test-frontend      frontend vitest suite"
+	@echo "    make test-frontend      harness vitest suite"
 	@echo "    make test-cli           lemma-cli unit + e2e tests"
 	@echo "    make test-cli-unit      lemma-cli unit tests only (no docker)"
 	@echo "    make test-cli-e2e       lemma-cli e2e (real backend + docker; needs docker)"
 	@echo "    make scenarios          product scenarios over real HTTP (needs docker)"
+	@echo "    make scenarios-all      all local scenarios, including sandboxes and clients, with a report"
 	@echo "    make scenarios-guards   scenario suite guards only (fast, no docker)"
 	@echo "    SCENARIOS_STANDING_STACK=1 make scenarios   keep the database between runs"
 	@echo "    make scenarios-standing-down   and remove it again"
@@ -415,6 +429,8 @@ help:
 	@echo "    make scenarios-live     scenarios against real Google, GitHub, Telegram"
 	@echo "    make scenarios-provision  build the standing tenant on a deployment"
 	@echo "    make scenarios-deployment run the suite against a deployment"
+	@echo "    make scenarios-compose  the suite on a disposable stack from released images"
+	@echo "    make scenarios-split TARGET=…  sign-up scenarios on a disposable stack, the rest on TARGET"
 	@echo "    make scenario-coverage  regenerate docs/product/coverage.md"
 	@echo "    make test-python        lemma-python SDK tests (non-integration)"
 	@echo ""
@@ -429,16 +445,34 @@ help:
 	@echo "    make coverage-cli-e2e         lemma-cli e2e coverage (needs docker)"
 	@echo "    make coverage-frontend        frontend vitest coverage"
 	@echo ""
+	@echo "  Fast loop (on what this branch changed; ALL=1 for everything, STAGED=1 for the index)"
+	@echo "    make fix                run every safe auto-fixer: ruff, eslint --fix, cargo fmt"
+	@echo "    make lint               every fast linter; the loop is fix, lint, then quality"
+	@echo "    make lint-python        ruff check + format check, per project"
+	@echo "    make lint-frontend      eslint + tsc (FAST=1 skips tsc and clippy)"
+	@echo "    make lint-rust          cargo fmt + clippy on the changed crates"
+	@echo "    make lint-shell         shellcheck"
+	@echo "    make lint-ci            actionlint + the CI aggregator check"
+	@echo "    make lint-docker        hadolint"
+	@echo "    make lint-docs          typos, over every changed file"
+	@echo "    make lint-config        yamllint + TOML/JSON parse"
+	@echo "    make hooks              opt in to the git hooks: lint on commit, quality on push"
+	@echo ""
 	@echo "  Gates (what CI blocks on)"
-	@echo "    make pre-push           alias for quality — run this on every push"
-	@echo "    make quality            every gate the 'quality gates' CI job runs"
+	@echo "    make quality            every gate the 'quality gates' CI job runs — before a PR"
+	@echo "    make quality-frontend   eslint, tsc, design audit, education anchors (CI's frontend jobs)"
+	@echo "    make check              quality + quality-frontend"
+	@echo "    make pre-push           alias for quality"
 	@echo "    make architecture       backend architecture ratchet + route inventory"
 	@echo "    make measure-clients    ADVISORY: size/complexity/typing in lemma-cli + lemma-python"
-	@echo "    make check              quality + frontend gates + CodeQL on this branch's changes"
-	@echo "    make lint               ruff + eslint across all components"
+	@echo "    make codeql             opt-in: CodeQL on this branch's changes (CI runs it and comments on the PR)"
 	@echo "    make version-check      every Lemma component declares the same version"
 	@echo "    make local-domain-check the shell, capability and SDK know every base domain"
 	@echo "    make local-auth-gate-check  make dev and the local stack relax the same auth gates"
+	@echo ""
+	@echo "  Disk"
+	@echo "    make dev-clean          dry run: what stale build output, worktrees and branches would go"
+	@echo "    make dev-clean-apply    remove them (GIT=1 also runs git gc)"
 	@echo ""
 	@echo "  Other"
 	@echo "    make migrate            apply backend database migrations"
@@ -463,6 +497,7 @@ init:
 	@cd $(PYTHON_DIR) && uv sync --quiet
 	@cd $(TS_DIR) && npm install --silent
 	@cd $(FRONTEND_DIR) && npm install --silent
+	@cd $(WORKSPACE_DIR) && npm install --silent
 	@echo "  ✓ Dependencies installed"
 	@echo ""
 	@echo "→ Building lemma-sdk (lemma-typescript)…"
@@ -476,6 +511,7 @@ init:
 	@echo "→ Creating .env files (skipped if already present)…"
 	@$(MAKE) --no-print-directory _init-backend-env
 	@$(MAKE) --no-print-directory _init-frontend-env
+	@$(MAKE) --no-print-directory _init-workspace-env
 	@echo ""
 	@$(MAKE) --no-print-directory _ensure-sandbox-images
 	@echo ""
@@ -521,7 +557,7 @@ _init-backend-env:
 			echo "LOG_LEVEL=$(DEV_LOG_LEVEL)"; \
 			echo "JSON_LOGS_ENABLED=$(DEV_JSON_LOGS_ENABLED)"; \
 			echo "API_URL=$(DEV_BACKEND_URL)"; \
-			echo "FRONTEND_URL=$(DEV_FRONTEND_URL)"; \
+			echo "FRONTEND_URL=$(DEV_WORKSPACE_URL)"; \
 			echo "AUTH_FRONTEND_URL=$(DEV_AUTH_FRONTEND_URL)"; \
 			echo "CLI_API_URL=$(DEV_BACKEND_URL)"; \
 			echo "CLI_AUTH_FRONTEND_URL=$(DEV_AUTH_FRONTEND_URL)"; \
@@ -580,7 +616,7 @@ _ensure-backend-env-keys:
 		append LOG_LEVEL $(DEV_LOG_LEVEL); \
 		append JSON_LOGS_ENABLED $(DEV_JSON_LOGS_ENABLED); \
 		append API_URL '$(DEV_BACKEND_URL)'; \
-		append FRONTEND_URL '$(DEV_FRONTEND_URL)'; \
+		append FRONTEND_URL '$(DEV_WORKSPACE_URL)'; \
 		append AUTH_FRONTEND_URL '$(DEV_AUTH_FRONTEND_URL)'; \
 		append CLI_API_URL '$(DEV_BACKEND_URL)'; \
 		append CLI_AUTH_FRONTEND_URL '$(DEV_AUTH_FRONTEND_URL)'; \
@@ -648,6 +684,7 @@ _ensure-frontend-env-keys:
 # ── Dev stack ─────────────────────────────────────────────────────────────────
 
 dev:
+	@$(MAKE) --no-print-directory _disk-hint
 	@echo "→ Starting Lemma dev stack…"
 	@$(MAKE) --no-print-directory _prepare-dev
 	@echo ""
@@ -673,6 +710,7 @@ dev:
 		wait
 
 dev-public:
+	@$(MAKE) --no-print-directory _disk-hint
 	@echo "→ Starting Lemma dev stack with a public Cloudflare API URL…"
 	@$(MAKE) --no-print-directory _prepare-dev
 	@$(MAKE) --no-print-directory _start-public-api-tunnel || { $(MAKE) --no-print-directory stop; exit 1; }
@@ -992,6 +1030,14 @@ desktop-dev:
 		(echo "  ✗ cargo not found — install Rust from https://rustup.rs"; exit 1)
 	@command -v node >/dev/null 2>&1 || \
 		(echo "  ✗ node not found — install Node.js $(NODE_VERSION) from https://nodejs.org"; exit 1)
+	@$(MAKE) --no-print-directory _disk-hint
+	@# locald runs $(WORKSPACE_DIR)'s server.mjs straight from the checkout, with
+	@# no npm in between -- so a missing install or an unbuilt SDK is not an
+	@# error message, it is a frontend health check that times out two minutes
+	@# into startup. Say so here instead.
+	@test -d $(WORKSPACE_DIR)/node_modules && test -d $(TS_DIR)/node_modules || ( \
+		echo "  ✗ run 'npm ci' in $(TS_DIR) and $(WORKSPACE_DIR) first"; exit 1)
+	@test -f $(TS_DIR)/dist/index.js || (cd $(TS_DIR) && npm run build --silent)
 	@$(DESKTOP_DIR)/scripts/dev-local.sh --source $(if $(filter 1,$(CONTROL)),--control,)
 
 # Four binaries from one cargo invocation. Asking for them separately would
@@ -1153,6 +1199,12 @@ desktop-entitlements:
 	@python3 desktop/scripts/check_entitlements.py
 
 .PHONY: desktop-test-browser
+.PHONY: desktop-app-alias-proof
+# WKWebView proof that a pod app framed through its locald alias is signed in,
+# and that the same app framed on its own address is not. macOS only.
+desktop-app-alias-proof:
+	@desktop/e2e/app_alias_proof/run.sh
+
 desktop-test-browser:
 	@npm ci --prefix desktop/ui-tests --ignore-scripts --no-audit --no-fund
 	@if [ -z "$${LEMMA_TEST_BROWSER_CHANNEL:-}" ]; then cd desktop/ui-tests && npx --no-install playwright install chromium; fi
@@ -1321,15 +1373,22 @@ desktop-exe:
 # The real backend and Rust host share the same HTTP path as a browser chat.
 # A scripted ACP provider makes streaming and disconnects deterministic without
 # using installed agent accounts. Testcontainers owns the disposable services.
+# Host execution rides along: the same built binary runs a paired user's commands
+# under Seatbelt (macOS only; the module skips elsewhere). So does chaos: the
+# backend, the host and the link each fail mid-answer, and every run must still
+# end exactly once with every event delivered once.
 desktop-agent-host-e2e:
 	@cd $(DESKTOP_DIR) && cargo build -p lemma-agent-host --locked
 	@cd lemma-backend && uv run pytest \
-		app/modules/agent/tests/e2e/test_agent_host_process_e2e.py -m 'not agent_host_browser' --no-showlocals
+		app/modules/agent/tests/e2e/test_agent_host_process_e2e.py \
+		app/modules/agent/tests/e2e/test_agent_host_steer_e2e.py \
+		app/modules/agent/tests/e2e/test_host_execution_binary_e2e.py \
+		app/modules/agent/tests/e2e/test_agent_host_chaos_e2e.py \
+		-m 'not agent_host_browser' --no-showlocals
 
 desktop-agent-host-browser-e2e:
 	@cd $(DESKTOP_DIR) && cargo build -p lemma-agent-host --locked
 	@npm --prefix lemma-typescript run build
-	@node --test desktop/ui-tests/drivers/setup-layout.mjs
 	@cd lemma-backend && CORS_ORIGIN_REGEX='^http://127[.]0[.]0[.]1:[0-9]+$$' \
 		uv run pytest app/modules/agent/tests/e2e/test_agent_host_process_e2e.py \
 		-m agent_host_browser --no-showlocals
@@ -1530,7 +1589,7 @@ script-portability-check:
 
 # ── Tests ─────────────────────────────────────────────────────────────────────
 
-test: test-dev-workflow test-backend-unit test-backend-e2e test-cli test-python test-frontend
+test: test-dev-workflow test-backend-unit test-backend-e2e test-cli test-python test-frontend test-workspace
 	@echo ""
 	@echo "✓ All test suites complete."
 
@@ -1589,6 +1648,27 @@ test-python:
 scenarios:
 	@echo "→ Product scenarios (real HTTP, needs docker)…"
 	@cd $(SCENARIOS_DIR) && uv run pytest -q
+
+# The complete local, credential-free suite. CI splits these steps to keep
+# feedback attributable; locally one stack and one JUnit report make reruns and
+# Slack reporting straightforward. Live provider scenarios remain opt-in.
+scenarios-all:
+	@set +e; \
+	rm -f $(SCENARIOS_DIR)/artifacts/all-results.xml; \
+	make scenarios-images; result=$$?; \
+	if [ $$result -eq 0 ]; then uv sync --project lemma-backend && uv sync --project lemma-cli && uv sync --project lemma-python; result=$$?; fi; \
+	if [ $$result -eq 0 ]; then cd lemma-typescript && npm ci && npm run build; result=$$?; cd ..; fi; \
+	if [ $$result -eq 0 ]; then cd lemma-frontend && npm ci; result=$$?; cd ..; fi; \
+	if [ $$result -eq 0 ]; then \
+	  mkdir -p $(SCENARIOS_DIR)/artifacts; \
+	  (cd $(SCENARIOS_DIR) && SCENARIOS_WORKERS=$${SCENARIOS_WORKERS:-1} uv run pytest journeys/*/ -q -m 'not live' --junitxml=artifacts/all-results.xml); \
+	  result=$$?; \
+	fi; \
+	if [ -f $(SCENARIOS_DIR)/artifacts/all-results.xml ]; then \
+	  python3 scripts/report_scenarios_to_slack.py $(SCENARIOS_DIR)/artifacts/all-results.xml --lane local --markdown-out $(SCENARIOS_DIR)/artifacts/report.md; \
+	  python3 scripts/report_scenarios_to_slack.py $(SCENARIOS_DIR)/artifacts/all-results.xml --lane local; \
+	fi; \
+	exit $$result
 
 # Build the sandbox images the `sandbox` lane needs. Local tags rather than the
 # content-addressed names the backend's own e2e uses: those rebuild whenever
@@ -1684,6 +1764,40 @@ scenarios-deployment:
 	@echo "→ Product scenarios against $(TARGET)…"
 	@test -n "$(TARGET)" || { echo "set TARGET=https://your-lemma (or SCENARIOS_BASE_URL)"; exit 1; }
 	@cd $(SCENARIOS_DIR) && uv run pytest -q --base-url "$(TARGET)" --timeout=900
+
+# The suite on a disposable Lemma built from released images: deploy/compose
+# brought up with its sign-up gates off, driven, and removed with its volumes.
+# SCENARIOS_COMPOSE_VERSION or SCENARIOS_COMPOSE_MANIFEST choose the images;
+# SCENARIOS_BACKEND_IMAGE replaces just the backend. See
+# tests/scenarios/harness/compose_stack.py.
+scenarios-compose:
+	@echo "→ Product scenarios on a disposable Compose stack…"
+	@cd $(SCENARIOS_DIR) && uv run pytest -q --stack compose $(SCENARIOS_ARGS)
+
+# One release, two targets. A deployment keeps its sign-up gates on, so the
+# scenarios that sign somebody up (`open_signup`) run on a disposable Compose
+# stack instead, and everything else runs on TARGET. The `-m` repeats `not
+# sandbox and not live` because an explicit `-m` replaces the default one.
+# Both reports are kept, and read together.
+SPLIT_LANES := not sandbox and not live
+scenarios-split:
+	@test -n "$(TARGET)" || { echo "set TARGET=https://your-lemma (or SCENARIOS_BASE_URL)"; exit 1; }
+	@set +e; mkdir -p $(SCENARIOS_DIR)/artifacts; \
+	rm -f $(SCENARIOS_DIR)/artifacts/disposable-results.xml $(SCENARIOS_DIR)/artifacts/deployment-results.xml; \
+	echo "→ Sign-up scenarios on a disposable Compose stack…"; \
+	(cd $(SCENARIOS_DIR) && uv run pytest -q --stack compose -m "open_signup and $(SPLIT_LANES)" \
+	  --junitxml=artifacts/disposable-results.xml $(SCENARIOS_ARGS)); disposable=$$?; \
+	echo "→ Everything else against $(TARGET)…"; \
+	(cd $(SCENARIOS_DIR) && uv run pytest -q --base-url "$(TARGET)" -m "not open_signup and $(SPLIT_LANES)" \
+	  --junitxml=artifacts/deployment-results.xml $(SCENARIOS_ARGS)); deployment=$$?; \
+	for report in disposable-results.xml deployment-results.xml; do \
+	  test -f $(SCENARIOS_DIR)/artifacts/$$report || { echo "no $$report was written"; exit 1; }; \
+	done; \
+	python3 scripts/report_scenarios_to_slack.py $(SCENARIOS_DIR)/artifacts/disposable-results.xml \
+	  $(SCENARIOS_DIR)/artifacts/deployment-results.xml --lane split \
+	  --markdown-out $(SCENARIOS_DIR)/artifacts/report.md; \
+	echo "disposable stack exit=$$disposable, $(TARGET) exit=$$deployment"; \
+	test $$disposable -eq 0 -a $$deployment -eq 0
 
 # The suite against the Lemma Desktop install running on this machine.
 #
@@ -1836,27 +1950,40 @@ coverage-frontend:
 # has to move together: this line and that bound in each pyproject.
 RUFF := uvx ruff@0.15.22
 
-# ── Lint ──────────────────────────────────────────────────────────────────────
+# ── Lint and fix: the fast loop ──────────────────────────────────────────────
+#
+#   make fix     every safe auto-fixer, on what this branch changed
+#   make lint    every fast linter, on what this branch changed
+#   make quality the full pre-PR gate, over everything (what CI runs)
+#
+# `lint` and `fix` default to the files that differ from the merge base with
+# origin/main -- committed, staged, unstaged and untracked. ALL=1 widens them
+# to the whole repository, STAGED=1 narrows them to the index (the pre-commit
+# hook), FAST=1 skips tsc and clippy, and BASE=<ref> changes the base. Each
+# language runs the tool and config CI runs for it; scripts/dev_lint.py has
+# the list. `lint-<group>` runs one group.
+#
+# The old `lint` walked every component in full and knew nothing of Rust,
+# shell, workflows or Dockerfiles; ALL=1 is that and more.
+LINT_SCOPE = $(if $(filter 1,$(ALL)),--all) $(if $(filter 1,$(STAGED)),--staged) \
+	$(if $(filter 1,$(FAST)),--fast) $(if $(BASE),--base $(BASE))
+DEV_LINT = RUFF="$(RUFF)" uv run --quiet --no-project python scripts/dev_lint.py $(LINT_SCOPE)
+LINT_GROUPS = python frontend rust shell ci docker docs config
 
-# Every component's linter, and all four can fail. Three of them used to end
-# in `2>/dev/null || true`, so `make lint` printed four arrows and could only
-# ever report the backend -- a green run here meant nothing for the other
-# three. Components whose toolchain is not installed are skipped out loud
-# rather than silently passed.
 lint:
-	@echo "→ Backend (ruff)…"
-	@# Delegates rather than running `ruff check .`, which walked into
-	@# generated code. That is why this target had been red for a while without
-	@# anyone noticing: the backend line was the one line here that could fail, and
-	@# `make quality` -- the documented gate -- calls the scoped target below.
-	@cd $(BACKEND_DIR) && $(MAKE) --no-print-directory lint
-	@$(MAKE) --no-print-directory lint-clients
-	@echo "→ Frontend (eslint)…"
-	@if [ -d $(FRONTEND_DIR)/node_modules ]; then \
-		cd $(FRONTEND_DIR) && npm run lint --silent; \
-	else \
-		echo "  skipped: run 'npm ci' in $(FRONTEND_DIR) first"; \
-	fi
+	@$(DEV_LINT)
+
+fix:
+	@$(DEV_LINT) --fix
+
+$(addprefix lint-,$(LINT_GROUPS)):
+	@$(DEV_LINT) $(patsubst lint-%,%,$@)
+
+# The whole-repository half of the groups no other `quality` step covers:
+# shell, workflows, Dockerfiles, spelling, YAML/TOML/JSON. Seconds, and part
+# of `quality`, so CI holds the line the local loop draws.
+lint-repo:
+	@RUFF="$(RUFF)" uv run --quiet --no-project python scripts/dev_lint.py --all shell ci docker docs config
 
 # Every first-party Python package except the backend, which has its own gates.
 # Extracted from `lint` so that `quality` -- the documented pre-PR command and
@@ -1877,6 +2004,12 @@ lint-clients:
 	@cd $(BUNDLE_DIR) && $(RUFF) check . --quiet
 	@echo "→ Scenarios (ruff)…"
 	@cd $(SCENARIOS_DIR) && $(RUFF) check . --quiet
+	@# Everything with no project of its own: the repository's scripts and
+	@# their tests, and the desktop tooling. Ruff's default rules, minus E402,
+	@# because a script that imports a sibling puts its directory on sys.path
+	@# first. Not format-checked; most of it predates `ruff format`.
+	@echo "→ Repo tooling (ruff)…"
+	@$(RUFF) check --isolated --ignore E402 --exclude $(SCENARIOS_DIR) --quiet scripts tests desktop
 
 # Every project whose uv.lock can go stale, which is every one that depends on a
 # sibling by path: change a dependency in `lemma-python` and eight other locks
@@ -1918,22 +2051,9 @@ SDK_FORMAT_EXCLUDE = --exclude lemma_sdk/openapi_client
 
 
 
+# Every fixer over the whole repository: `make fix ALL=1` under its old name.
 format:
-	@echo "→ Backend…"
-	@cd $(BACKEND_DIR) && $(MAKE) --no-print-directory format
-	@echo "→ CLI…"
-	@cd $(CLI_DIR) && $(RUFF) format .
-	@echo "→ Python SDK…"
-	@cd $(PYTHON_DIR) && $(RUFF) format $(SDK_FORMAT_EXCLUDE) .
-	@echo "→ Stack…"
-	@cd $(STACK_DIR) && $(RUFF) format .
-	@echo "→ Pod bundle…"
-	@cd $(BUNDLE_DIR) && $(RUFF) format .
-	@# Scenarios was in `lint` but in neither of these, so `ruff check` held
-	@# while formatting drifted across 51 files. A directory that is checked
-	@# but never formatted is the one that drifts, because nothing says so.
-	@echo "→ Scenarios…"
-	@cd $(SCENARIOS_DIR) && $(RUFF) format .
+	@$(MAKE) --no-print-directory fix ALL=1
 
 format-check:
 	@echo "→ Backend…"
@@ -1990,6 +2110,8 @@ quality:
 	@cd $(BACKEND_DIR) && $(MAKE) --no-print-directory lint-controller-types
 	@echo "→ Swallowed errors…"
 	@cd $(BACKEND_DIR) && $(MAKE) --no-print-directory lint-swallowed-errors
+	@echo "→ Memory hazards…"
+	@cd $(BACKEND_DIR) && $(MAKE) --no-print-directory lint-memory-hazards
 	@echo "→ Public prose…"
 	@cd $(BACKEND_DIR) && $(MAKE) --no-print-directory lint-public-prose
 	@echo "→ Migration order…"
@@ -2029,6 +2151,8 @@ quality:
 	@cd $(BACKEND_DIR) && uv run python ../scripts/plan_e2e_shards.py --verify
 	@echo "→ Product scenario traceability…"
 	@python3 scripts/check_scenario_coverage.py
+	@echo "→ Shell, workflows, Dockerfiles, spelling, config…"
+	@$(MAKE) --no-print-directory lint-repo
 	@echo "✓ quality gates pass"
 
 # The backend's architecture ratchet, from the repo root. AGENTS.md and
@@ -2081,8 +2205,12 @@ client-typecheck-record:
 # costing a category of surprise. One list.
 pre-push: quality
 
-# CodeQL, the same suites CI runs. Reports only what this branch changed;
-# `codeql-all` reports the repository's full backlog.
+# CodeQL, the same suites CI runs, on this machine. Opt-in and never part of
+# `check`: an analysis holds several cores and gigabytes of memory for
+# minutes, and CI already runs it on every pull request and posts what it
+# finds on the lines you changed as a PR comment. Use these to reproduce a
+# finding locally. Reports only what this branch changed; `codeql-all` reports
+# the repository's full backlog.
 codeql:
 	@./scripts/run_codeql.sh
 
@@ -2112,22 +2240,71 @@ codeql-all:
 # frontend plus CodeQL" -- reported success on a machine where not one frontend
 # gate had run, and said so in a line that scrolled past.
 quality-frontend:
-	@if [ ! -d "$(FRONTEND_DIR)/node_modules" ] || [ ! -d "$(TS_DIR)/node_modules" ]; then \
+	@if [ ! -d "$(FRONTEND_DIR)/node_modules" ] || [ ! -d "$(WORKSPACE_DIR)/node_modules" ] || [ ! -d "$(TS_DIR)/node_modules" ]; then \
 		echo "make: *** cannot run the frontend gates: node_modules is missing."; \
-		echo "    run 'npm ci' in $(TS_DIR) and $(FRONTEND_DIR),"; \
+		echo "    run 'npm ci' in $(TS_DIR), $(FRONTEND_DIR) and $(WORKSPACE_DIR),"; \
 		echo "    or run 'make quality' if your change is Python-only."; \
 		exit 1; \
 	fi
+	@cd $(WORKSPACE_DIR) && npm run check
 	@echo "→ TypeScript SDK test types…"
 	@cd $(TS_DIR) && npx tsc --noEmit -p tsconfig.test.json
 	@echo "→ Frontend lint, types, design audit, education anchors…"
 	@cd $(FRONTEND_DIR) && npm run --silent check
 
-# Everything a PR is judged on, short of the test suites themselves.
-check: quality quality-frontend codeql
+# Everything a PR is judged on locally, short of the test suites themselves.
+# CodeQL is not in it: it runs in CI and reports on the pull request.
+check: quality quality-frontend
+
+# ── Local disk and hooks ──────────────────────────────────────────────────────
+#
+# Every worktree carries its own build output -- a Rust dev target directory,
+# node_modules, a backend virtualenv -- and with many worktrees open, several
+# of them an agent's, that fills a laptop. `dev-clean` is a dry run that lists
+# what would go and why; `dev-clean-apply` does it. GIT=1 adds a git gc, which
+# is slow on a large repository. scripts/dev_disk_hygiene.py has the rules and
+# every threshold as a flag: DEV_CLEAN_FLAGS="--rust-idle-days 1" and so on.
+DEV_CLEAN = uv run --quiet --no-project python scripts/dev_disk_hygiene.py $(DEV_CLEAN_FLAGS)
+
+dev-clean:
+	@$(DEV_CLEAN)
+
+dev-clean-apply:
+	@$(DEV_CLEAN) --apply $(if $(filter 1,$(GIT)),--git)
+
+# A one-line nudge from the commands that are about to need disk. Below this,
+# a single Rust build plus an image pull can fail a dev session halfway in.
+DISK_HINT_GB ?= 30
+_disk-hint:
+	@free_kb=$$(df -Pk . 2>/dev/null | awk 'NR == 2 { print $$4 }'); \
+	if [ -n "$$free_kb" ] && [ "$$free_kb" -lt $$(( $(DISK_HINT_GB) * 1024 * 1024 )) ]; then \
+		echo "  ! $$(( free_kb / 1024 / 1024 )) GB free on this disk; run \`make dev-clean\` to see what can go"; \
+	fi
+
+# Opt-in git hooks, shared by every worktree of this clone: `pre-commit` runs
+# `make lint` on the staged files, `pre-push` runs `make quality`. SKIP_HOOKS=1
+# skips both for one command; `git config --unset core.hooksPath` removes them.
+hooks:
+	@git config core.hooksPath .githooks
+	@echo "  ✓ hooks installed from .githooks/ (pre-commit: make lint on staged files; pre-push: make quality)"
 
 # ── Migrations ────────────────────────────────────────────────────────────────
 
 migrate:
 	@echo "→ Applying database migrations…"
 	@cd $(BACKEND_DIR) && uv run alembic upgrade head
+
+.PHONY: dev-frontend test-workspace _init-workspace-env
+
+dev-frontend: _init-workspace-env
+	@cd $(WORKSPACE_DIR) && npm run dev -- --port $(DEV_WORKSPACE_PORT)
+
+test-workspace:
+	@cd $(WORKSPACE_DIR) && npm test
+
+_init-workspace-env:
+	@mkdir -p $(WORKSPACE_DIR)
+	@if [ ! -f $(WORKSPACE_DIR)/.env.local ]; then \
+		printf 'NEXT_PUBLIC_DATA=live\nNEXT_PUBLIC_API_URL=%s\nNEXT_PUBLIC_AUTH_EMAIL_VERIFICATION_REQUIRED=%s\n' \
+			'$(DEV_BACKEND_URL)' '$(DEV_FRONTEND_EMAIL_VERIFICATION)' > $(WORKSPACE_DIR)/.env.local; \
+	fi

@@ -27,15 +27,61 @@ _embedding_capability = EmbeddingCapability()
 _embedding_init_task: asyncio.Task[None] | None = None
 
 
+_PRELOAD_RETRY_INITIAL_SECONDS = 30.0
+_PRELOAD_RETRY_MAX_SECONDS = 600.0
+
+
 def embedding_capability() -> EmbeddingCapability:
-    """Return a copy of process-local embedding initialization state."""
-    return EmbeddingCapability(
-        status=_embedding_capability.status,
-        detail=_embedding_capability.detail,
+    """Return a copy of process-local embedding initialization state.
+
+    The startup preload is one source; the embedder itself is the other. A
+    model the preload could not download but a later search or document did
+    is ready, and one being fetched right now is preparing, whatever the
+    preload last recorded -- so the live state wins once the model was asked
+    for at all.
+    """
+    status, detail = _embedding_capability.status, _embedding_capability.detail
+    if status != "disabled":
+        live = _live_model_status()
+        if live == "ready":
+            status, detail = "ready", "Local semantic search is ready"
+        elif live == "loading":
+            status, detail = "preparing", "Downloading the local search model"
+        elif live == "failed":
+            status, detail = "degraded", _DEGRADED_DETAIL
+    return EmbeddingCapability(status=status, detail=detail)
+
+
+_DEGRADED_DETAIL = "Could not download the local search model; it retries automatically"
+
+
+def _live_model_status() -> str | None:
+    from app.modules.datastore.composition import get_datastore_composition
+
+    readiness = getattr(
+        get_datastore_composition().embedder_provider(), "readiness", None
     )
+    if readiness is None:
+        return None
+    live = readiness().status
+    return None if live == "idle" else live
 
 
 async def _initialize_local_embeddings(composition, timeout: float) -> None:
+    """Prepare the model in the background, retrying until it succeeds.
+
+    The first run downloads the model, and a Mac that is offline at that
+    moment must not be left without search until the next restart: the
+    attempt repeats with a growing pause, so it recovers on its own once the
+    machine is online again.
+    """
+    delay = _PRELOAD_RETRY_INITIAL_SECONDS
+    while not await _try_local_embeddings(composition, timeout):
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, _PRELOAD_RETRY_MAX_SECONDS)
+
+
+async def _try_local_embeddings(composition, timeout: float) -> bool:
     _embedding_capability.status = "preparing"
     _embedding_capability.detail = "Preparing the local search model"
     logger.debug("datastore.module.preloading_local_embedding_model.observed")
@@ -54,18 +100,17 @@ async def _initialize_local_embeddings(composition, timeout: float) -> None:
         raise
     except Exception as exc:  # noqa: BLE001 - capability degrades without core failure
         _embedding_capability.status = "degraded"
-        _embedding_capability.detail = (
-            "Local semantic search is unavailable; it will retry when used"
-        )
+        _embedding_capability.detail = _DEGRADED_DETAIL
         logger.warning(
             "datastore.module.local_embedding_model_degraded.degraded",
             error_type=type(exc).__name__,
             exc_info=True,
         )
-        return
+        return False
     _embedding_capability.status = "ready"
     _embedding_capability.detail = "Local semantic search is ready"
     logger.debug("datastore.module.local_embedding_model_ready.observed")
+    return True
 
 
 @asynccontextmanager
@@ -151,11 +196,24 @@ def _routers():
     from app.modules.datastore.api.controllers.changes_controller import (
         router as changes,
     )
+    from app.modules.datastore.api.controllers.processing_controller import (
+        router as processing,
+    )
 
     # `signed_link` before `file`, and the order is load-bearing: routes match
     # in registration order, and `file` owns `/files/{file_id}` — which happily
     # matches `/files/signed-urls` and then fails parsing it as a UUID.
-    return [record, query, table, signed_link, file, public_file, signed_file, changes]
+    return [
+        record,
+        query,
+        table,
+        signed_link,
+        processing,
+        file,
+        public_file,
+        signed_file,
+        changes,
+    ]
 
 
 def _event_routers():
@@ -167,34 +225,8 @@ def _event_routers():
     return [router, pod_schema_router]
 
 
-@asynccontextmanager
-async def _backfill_query_role(app):
-    """Ensure the RLS-subject role can read every existing pod schema, so ad-hoc
-    datastore queries (run under that role) are scoped. Non-fatal: schemas and
-    tables also grant on creation, and queries fail closed. This is the repair
-    path for schemas that predate those grants — not the primary one."""
-    from app.modules.datastore.infrastructure.transactional_events import (
-        ensure_datastore_event_outbox,
-    )
-
-    # Fail startup when the durable event table cannot be established. Record
-    # mutation must never degrade to post-commit best-effort publication.
-    await ensure_datastore_event_outbox()
-
-    try:
-        from app.modules.datastore.api.dependencies import get_schema_manager
-
-        await get_schema_manager().backfill_query_role_grants()
-        logger.debug("datastore.module.datastore_query_role_grants_ensured.observed")
-    except Exception:  # noqa: BLE001
-        # Warning, not debug: when this fails, every pod schema whose grant was
-        # never established stays unqueryable, and this is the only line that
-        # says so.
-        logger.warning(
-            "datastore.module.query_role_grant_backfill.degraded",
-            exc_info=True,
-        )
-    yield
+def _register_streaq() -> None:
+    import app.modules.datastore.events.orphan_schema_tasks  # noqa: F401
 
 
 @asynccontextmanager
@@ -303,7 +335,11 @@ module = LemmaModule(
     resource_names=_resource_names,
     routers=_routers,
     event_routers=_event_routers,
-    api_lifespans=(_preload_local_embeddings, _backfill_query_role),
+    register_streaq=_register_streaq,
+    # Nothing here may scale with data: see `test_boot_hooks.py`. The query
+    # role and its grants are ensured lazily, and the datastore outbox table is
+    # created by the first record write or the worker's dispatcher.
+    api_lifespans=(_preload_local_embeddings,),
     worker_lifespans=(
         _close_datastore_engine,
         _preload_local_embeddings,

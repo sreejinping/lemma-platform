@@ -23,6 +23,14 @@ pub struct GuestService<E: Engine> {
     pub(crate) capability: Option<String>,
     pub(crate) kernel_taint_path: Option<PathBuf>,
     pub(crate) image_warmups: Arc<Mutex<HashMap<SandboxImageSet, ImageWarmupState>>>,
+    /// The last answer `running_sandbox_count` gave, and when.
+    ///
+    /// Counting running sandboxes forks `nerdctl ps`. The host polls guest
+    /// health every five seconds forever, so an idle machine spawned a
+    /// containerd CLI process 17,280 times a day to be told the same number.
+    /// Admission does not read this -- deciding whether another sandbox may
+    /// start has to see the present, not a cached past.
+    pub(crate) sandbox_count_cache: Arc<Mutex<Option<(Instant, usize)>>>,
     /// Held for the duration of every mutating operation. See `handle`.
     pub(crate) mutations: Arc<Mutex<()>>,
     /// Whether this process exits as soon as it has answered.
@@ -41,6 +49,20 @@ pub struct GuestService<E: Engine> {
     /// read, and answered "still downloading" for ever however the transfer
     /// had actually gone.
     pub(crate) per_request_process: bool,
+    /// Whether a new sandbox first ensures the guest's firewall keeps it away
+    /// from PostgreSQL, Redis and SuperTokens (see `sandbox_firewall`).
+    ///
+    /// On for the real guest and off for a service built in a test, which has
+    /// no kernel to program -- the rule set and the installer are tested
+    /// directly instead.
+    pub(crate) sandbox_isolation: bool,
+    /// This boot of the guest, when known: an image that passed its unpack
+    /// check is not checked again until the guest boots again (see
+    /// `images::ImageCheck`). `None` checks every time.
+    pub(crate) boot_id: Option<String>,
+    /// Whether an image's registry answers, asked before an image is removed
+    /// to be fetched again: removed while offline, it cannot come back.
+    pub(crate) registry_reachable: fn(&str) -> bool,
 }
 
 impl<E: Engine> Clone for GuestService<E> {
@@ -55,7 +77,11 @@ impl<E: Engine> Clone for GuestService<E> {
             kernel_taint_path: self.kernel_taint_path.clone(),
             mutations: Arc::clone(&self.mutations),
             image_warmups: Arc::clone(&self.image_warmups),
+            sandbox_count_cache: Arc::clone(&self.sandbox_count_cache),
             per_request_process: self.per_request_process,
+            sandbox_isolation: self.sandbox_isolation,
+            boot_id: self.boot_id.clone(),
+            registry_reachable: self.registry_reachable,
         }
     }
 }
@@ -99,6 +125,12 @@ impl GuestService<NerdctlEngine> {
         // to the guest, rather than the address observed when guestd started.
         service.dynamic_endpoint_host = dynamic_endpoint_host;
         service.kernel_taint_path = Some(PathBuf::from("/proc/sys/kernel/tainted"));
+        service.sandbox_isolation = true;
+        service.boot_id = fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        service.registry_reachable = image_registry_reachable;
         Ok(service)
     }
 }
@@ -130,9 +162,19 @@ impl<E: Engine + 'static> GuestService<E> {
             capability,
             kernel_taint_path: None,
             image_warmups: Arc::new(Mutex::new(HashMap::new())),
+            sandbox_count_cache: Arc::new(Mutex::new(None)),
             mutations: Arc::new(Mutex::new(())),
             per_request_process: false,
+            sandbox_isolation: false,
+            boot_id: None,
+            registry_reachable: |_| true,
         })
+    }
+
+    /// The directory holding the loopback relay's socket, which `sandbox.ensure`
+    /// mounts into the one sandbox granted `host_loopback`.
+    pub(crate) fn host_loopback_directory(&self) -> PathBuf {
+        host_loopback_directory(&self.state_root)
     }
 
     /// Say that this process ends with the request it is answering.
@@ -174,6 +216,34 @@ impl<E: Engine + 'static> GuestService<E> {
         })
     }
 
+    /// Where mutations take their cross-process lock.
+    pub(crate) fn mutation_lock_path(&self) -> PathBuf {
+        self.state_root.join("run/mutations.lock")
+    }
+
+    /// An exclusive `flock` held for one mutation, waiting for any other
+    /// process's. Released by the kernel when the file is dropped or its
+    /// holder dies, so a guestd killed mid-request never leaves it held.
+    pub(crate) fn lock_mutations_across_processes(&self) -> Result<fs::File, GuestError> {
+        use std::os::fd::AsRawFd;
+        let file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(self.mutation_lock_path())
+            .map_err(|error| GuestError::engine(format!("mutation lock: {error}")))?;
+        loop {
+            // SAFETY: a descriptor this scope owns, for the call's duration.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == 0 {
+                return Ok(file);
+            }
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(GuestError::engine(format!("mutation lock: {error}")));
+            }
+        }
+    }
+
     pub fn handle(&self, request: GuestRequest) -> GuestResponse {
         match self.try_handle(request) {
             Ok(result) => GuestResponse::success(result),
@@ -210,14 +280,21 @@ impl<E: Engine + 'static> GuestService<E> {
         // guest for far longer. When one queue served both, that wait timed
         // the probe out, the host concluded the runtime was gone, and it tore
         // down the database forwarders under a running backend.
+        //
+        // And across processes. On Windows each request is its own guestd
+        // (`wsl.exe --exec lemma-guestd request`), so the in-process mutex
+        // above serialised nothing there: two `sandbox.ensure`s for the same
+        // sandbox, or an ensure beside a `core.stop`, ran side by side. The
+        // file lock is what does it on that transport, and is harmless on the
+        // resident one.
         let _serialised = if is_observation(&request.operation) {
             None
         } else {
-            Some(
-                self.mutations
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner),
-            )
+            let in_process = self
+                .mutations
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            Some((in_process, self.lock_mutations_across_processes()?))
         };
         if !is_observation(&request.operation) {
             refuse_unbound_data()?;
@@ -237,7 +314,15 @@ impl<E: Engine + 'static> GuestService<E> {
             "core.sandbox_images_status" => {
                 let parameters = self.parse_core_parameters(request.parameters)?;
                 let ready = self.poll_sandbox_images(&parameters)?;
-                Ok(json!({"ready": ready}))
+                let mut answer = json!({"ready": ready});
+                if let Some(progress) = (!ready)
+                    .then(|| sandbox_images_progress(&parameters))
+                    .flatten()
+                {
+                    answer["done_mb"] = json!(progress.done_mb());
+                    answer["total_mb"] = json!(progress.total_mb());
+                }
+                Ok(answer)
             }
             "core.postgres" => self.ensure_core_stage(request.parameters, CoreStage::Postgres),
             "core.redis" => self.ensure_core_stage(request.parameters, CoreStage::Redis),
@@ -247,6 +332,8 @@ impl<E: Engine + 'static> GuestService<E> {
             "core.status" => self.core_status(),
             "core.stop" => self.stop_core(),
             "core.reset_data" => self.reset_data(request.parameters),
+            "core.prune_images" => self.prune_images(request.parameters),
+            "core.trim" => self.trim_data_disk(),
             "sandbox.ensure" => self.ensure(request.parameters),
             "sandbox.status" => self.status(request.parameters),
             "sandbox.list" => self.list(),

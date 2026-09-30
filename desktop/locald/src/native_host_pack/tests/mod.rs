@@ -1,6 +1,7 @@
 //! The host pack's guards, grouped the way the code they cover is grouped.
 
 mod domain;
+mod host_cli;
 mod layout;
 mod manifest;
 mod paths;
@@ -37,7 +38,7 @@ pub(super) fn fixture(root: &Path) {
         "backend/python/bin/python3",
         "frontend/node/bin/node",
         "frontend/frontend-launcher.mjs",
-        "frontend/app/server.js",
+        "frontend/lemma-frontend/server.mjs",
         "backend/assets/browser-sdk/lemma-client.js",
         "backend/assets/browser-sdk/lemma-ui.js",
     ] {

@@ -56,8 +56,7 @@ async fn run_scripted(
         "Delete the build directory.",
         json!({
             "server_name": "lemma_tools",
-            "url": "http://127.0.0.1:1/agent-runtime/conversations/unused/mcp",
-            "authorization": "Bearer unused-permission-e2e-token",
+            "token": "unused-permission-e2e-token",
         }),
         answer,
     )
@@ -244,8 +243,7 @@ async fn blank_tool_call_ids_keep_parallel_requests_independent() {
         "Delete the build directory.",
         json!({
             "server_name": "lemma_tools",
-            "url": "http://127.0.0.1:1/agent-runtime/conversations/unused/mcp",
-            "authorization": "Bearer unused-permission-e2e-token",
+            "token": "unused-permission-e2e-token",
         }),
         PermissionAnswer::AllowThenDeny,
     )
@@ -322,6 +320,7 @@ fn scripted_adapter(log: &std::path::Path) -> ResolvedAdapter {
             upstream_command: "python3".into(),
             upstream_version_args: vec!["--version".into()],
             upstream_path_env: None,
+            environment: std::collections::BTreeMap::default(),
             omit_optional_dependencies: false,
             minimum_upstream_version: None,
             distribution: "native".into(),
@@ -350,6 +349,8 @@ async fn an_unanswered_request_is_denied_when_the_timeout_elapses() {
     let outcome = AcpDriver
         .run(
             AcpRunRequest {
+                agent_environment: std::collections::BTreeMap::default(),
+                own_settings: false,
                 adapter,
                 run_spec: RunSpec {
                     agent_run_id: Uuid::new_v4(),
@@ -375,6 +376,7 @@ async fn an_unanswered_request_is_denied_when_the_timeout_elapses() {
                 permission_timeout: Duration::from_millis(300),
                 cancel: lemma_agent_host::acp::never_cancelled(),
                 cancel_grace: Duration::from_secs(5),
+                steer: lemma_agent_host::acp::SteerInbox::default(),
             },
             callbacks.clone(),
         )

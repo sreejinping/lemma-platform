@@ -27,6 +27,7 @@ from uuid import UUID
 
 from opentelemetry import trace
 
+from app.core.bounded import BoundedDict
 from app.core.log.log import get_logger
 from app.core.request_context import create_inherited_task
 from sandbox_runtime.errors import (
@@ -35,6 +36,7 @@ from sandbox_runtime.errors import (
     SandboxRejected,
     SandboxUnavailable,
 )
+from app.modules.workspace.services.sandbox_progress import clear_phase, record_phase
 from app.modules.workspace.domain.sandbox import (
     DEFAULT_SLUG,
     Sandbox,
@@ -48,17 +50,20 @@ from app.modules.workspace.infrastructure.sandbox_repository import SandboxRepos
 from app.modules.workspace.providers import naming
 from app.modules.workspace.providers.base import (
     ProviderCreateAmbiguous,
-    ProviderCreateSpec,
     ProviderFailed,
     ProviderInstance,
     ProviderNotReady,
     ProviderRejected,
+    provider_name_for,
     resumes_stopped_instances,
 )
 from app.modules.workspace.providers.profiles import profile_for, profile_is_stale
 from app.modules.workspace.services.sandbox_addressing import (
     SandboxAddressingMixin,
 )
+from app.modules.workspace.services.host_loopback_policy import no_host_loopback
+from app.modules.workspace.services.sandbox_create_spec import provider_create_spec
+from app.modules.workspace.services.sandbox_sizing import plan_size_for
 from app.modules.workspace.services.sandbox_volumes import SandboxVolumeMixin
 
 logger = get_logger(__name__)
@@ -69,8 +74,7 @@ _ENSURE_TIMEOUT_SECONDS = 300.0
 # pulling an image and booting a sandbox, short enough that a provisioner that
 # died does not strand the sandbox.
 _CLAIM_TIMEOUT_SECONDS = 180.0
-# Spans one tool call's sequential operations. Not a warmth mechanism: that is
-# the idle release window, two orders of magnitude longer.
+# Spans one tool call's sequential operations; not the (far longer) idle window.
 _ENSURE_REUSE_SECONDS = 5.0
 
 
@@ -81,14 +85,19 @@ class SandboxService(SandboxAddressingMixin, SandboxVolumeMixin):
     # must produce one provisioning attempt, not one per caller.
     _inflight: dict[tuple[int, UUID], asyncio.Task[SandboxHandle]] = {}
 
-    # A just-ensured sandbox, so sequential callers skip re-verifying it. The
-    # singleflight above only collapses concurrent ones, and a single shell tool
-    # call ensures three times: session, start_process, read_process_output.
-    _recent: dict[tuple[int, UUID], tuple[float, SandboxHandle]] = {}
+    # A just-ensured sandbox, so sequential callers skip re-verifying: the
+    # singleflight above only collapses concurrent ones, and one shell tool call
+    # ensures three times. Bounded; entries drop on an expired read or a forget.
+    _recent = BoundedDict[tuple[int, UUID], tuple[float, SandboxHandle]](
+        4096, name="workspace.recent_sandbox_handles"
+    )
 
-    def __init__(self, *, provider, uow_factory) -> None:
+    def __init__(
+        self, *, provider, uow_factory, host_loopback=no_host_loopback
+    ) -> None:
         self._provider = provider
         self._uow_factory = uow_factory
+        self._host_loopback = host_loopback  # See `host_loopback_policy`.
 
     # ------------------------------------------------------------------
     # Identity
@@ -209,9 +218,6 @@ class SandboxService(SandboxAddressingMixin, SandboxVolumeMixin):
         for key in [key for key in self._recent if key[1] == sandbox_id]:
             self._recent.pop(key, None)
 
-    #: Kept as the private spelling used by release/destroy inside this class.
-    _forget_recent = forget
-
     async def _ensure_once(self, sandbox_id: UUID) -> SandboxHandle:
         """Provision, waiting out transient provider unavailability.
 
@@ -227,11 +233,15 @@ class SandboxService(SandboxAddressingMixin, SandboxVolumeMixin):
         attempt = 0
         while True:
             try:
-                return await self._attempt_ensure(sandbox_id, deadline_at=deadline_at)
+                handle = await self._attempt_ensure(sandbox_id, deadline_at=deadline_at)
+                if attempt:
+                    await clear_phase(sandbox_id)
+                return handle
             except SandboxUnavailable as exc:
                 remaining = (deadline_at - datetime.now(timezone.utc)).total_seconds()
                 if remaining <= 0:
-                    raise
+                    raise  # The phase expires by itself.
+                await record_phase(sandbox_id, str(exc))
                 # The provider's hint is a floor, not the whole answer: backing
                 # off further stops a herd of waiting callers from retrying in
                 # lockstep and re-triggering the same limit.
@@ -241,11 +251,8 @@ class SandboxService(SandboxAddressingMixin, SandboxVolumeMixin):
                     "workspace.sandbox_service.ensure_retrying",
                     sandbox_id=str(sandbox_id),
                     attempt=attempt,
-                    # Why, not just how many times. Without this a sandbox that
-                    # never comes up produces dozens of identical lines and no
-                    # indication of the cause -- the caller sees only "endpoint
-                    # was not ready before the deadline", and the one process
-                    # that knew the reason threw it away.
+                    # Why, not just how many times: the caller only ever sees
+                    # "not ready before the deadline".
                     reason=str(exc) or type(exc).__name__,
                     retry_after_ms=exc.retry_after_ms,
                 )
@@ -395,6 +402,7 @@ class SandboxService(SandboxAddressingMixin, SandboxVolumeMixin):
                 else sandbox.epoch
             )
             profile = profile_for(sandbox.kind)
+            size = await plan_size_for(uow, sandbox)
             # Record what this sandbox is actually being built from, every
             # time. Writing it only once would freeze the row at whatever was
             # configured on first provision, and the staleness check above
@@ -409,27 +417,22 @@ class SandboxService(SandboxAddressingMixin, SandboxVolumeMixin):
             name = naming.container_name(sandbox.id, sandbox.kind, epoch)
             instance = await repository.begin_instance(
                 sandbox_id=sandbox.id,
-                provider=self._provider.name,
+                provider=provider_name_for(self._provider, sandbox.id),
                 provider_id=name,
                 provider_volume_id=volume_name,
                 epoch=epoch,
             )
             await uow.commit()
 
-        spec = ProviderCreateSpec(
-            sandbox_id=sandbox.id,
-            kind=sandbox.kind,
+        spec = provider_create_spec(
+            sandbox,
+            profile,
             epoch=epoch,
             name=name,
-            image=profile.image,
-            # The configured profile, not the row's: the row was just brought
-            # up to date, and the container is stamped with this so the next
-            # ensure can tell whether it is still current.
-            profile_name=profile.name,
-            profile_digest=profile.digest,
             deadline_at=deadline_at,
             volume_name=volume_name,
-            mounts=sandbox.mounts,
+            size=size,
+            host_loopback=await self._host_loopback(sandbox),
         )
         try:
             created = await self._provider.create(spec)
@@ -501,7 +504,7 @@ class SandboxService(SandboxAddressingMixin, SandboxVolumeMixin):
 
     async def release(self, sandbox_id: UUID) -> None:
         """Stop compute, keep the disk. The next ensure resumes the sandbox."""
-        self._forget_recent(sandbox_id)
+        self.forget(sandbox_id)
         deadline_at = datetime.now(timezone.utc) + timedelta(seconds=60)
         async with self._uow_factory() as uow:
             repository = SandboxRepository(uow)
@@ -525,7 +528,7 @@ class SandboxService(SandboxAddressingMixin, SandboxVolumeMixin):
             await uow.commit()
 
     async def destroy(self, sandbox_id: UUID, *, delete_storage: bool = False) -> None:
-        self._forget_recent(sandbox_id)
+        self.forget(sandbox_id)
         deadline_at = datetime.now(timezone.utc) + timedelta(seconds=60)
         async with self._uow_factory() as uow:
             repository = SandboxRepository(uow)

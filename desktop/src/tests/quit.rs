@@ -243,6 +243,257 @@ mod locald_events {
             ui.url
         );
     }
+
+    const APP: &str = "http://app.lemma.localhost:52501";
+    const API: &str = "http://app.lemma.localhost:52502";
+
+    /// `ready` is the one arm that makes a launch usable. It clears a stale
+    /// error, takes the origin the daemon names -- only a trusted one -- and
+    /// asks for the resume target and time-to-ready to be recorded, without
+    /// recording either itself: that disk work must not run under `shell.ui`.
+    #[test]
+    fn ready_makes_the_launch_usable_and_asks_for_its_side_effects() {
+        let mut ui = UiState {
+            error: true,
+            error_code: "backend-exited".into(),
+            installed_this_launch: true,
+            ..UiState::default()
+        };
+
+        let outcome = apply_locald_event(
+            &mut ui,
+            "ready",
+            &json!({"url": APP, "api_url": API, "runtime_generation": "gen-7"}),
+        );
+
+        assert!(ui.ready && ui.running);
+        assert!(
+            !ui.error && ui.error_code.is_empty(),
+            "a stale error survived ready"
+        );
+        assert_eq!((ui.url.as_str(), ui.api_url.as_str()), (APP, API));
+        let write = outcome
+            .resume_write
+            .expect("a ready origin is recorded for resume");
+        assert_eq!(write.generation, "gen-7");
+        let reached = outcome
+            .became_ready
+            .expect("time-to-ready is recorded once");
+        assert!(
+            !reached.cached,
+            "this launch installed, so it was not a cached start"
+        );
+    }
+
+    /// Only the first `ready` of a launch is its time-to-ready.
+    #[test]
+    fn a_second_ready_does_not_record_time_to_ready_again() {
+        let mut ui = UiState::default();
+        let first = apply_locald_event(&mut ui, "ready", &json!({"url": APP, "api_url": API}));
+        assert!(first.became_ready.is_some());
+        let outcome = apply_locald_event(&mut ui, "ready", &json!({"url": APP, "api_url": API}));
+        assert!(outcome.became_ready.is_none());
+    }
+
+    /// A ready event naming an untrusted origin records nothing to resume.
+    #[test]
+    fn ready_with_an_untrusted_origin_resumes_nothing() {
+        let mut ui = UiState::default();
+        let outcome = apply_locald_event(
+            &mut ui,
+            "ready",
+            &json!({"url": "https://evil.example", "api_url": "https://evil.example/api"}),
+        );
+        assert!(outcome.resume_write.is_none());
+        assert!(ui.url.is_empty());
+    }
+
+    /// A repeated Start is information, not failure: the in-flight operation
+    /// is already broadcasting its progress to every client.
+    #[test]
+    fn a_busy_refusal_is_not_shown_as_an_error() {
+        let mut ui = UiState {
+            phase: "Starting".into(),
+            active_operation_id: "op-1".into(),
+            ..UiState::default()
+        };
+
+        apply_locald_event(
+            &mut ui,
+            "error",
+            &json!({"event": "error", "code": "busy", "id": "op-1"}),
+        );
+
+        assert!(!ui.error);
+        assert_eq!(ui.status, "Starting is still in progress…");
+        assert!(
+            ui.active_operation_id.is_empty(),
+            "the refused operation is no longer active"
+        );
+    }
+
+    /// Sharing failures belong in Local settings, not on the startup error
+    /// screen in front of a workspace that is working.
+    #[test]
+    fn a_sharing_failure_does_not_replace_a_healthy_workspace() {
+        let mut ui = UiState {
+            ready: true,
+            ..UiState::default()
+        };
+        apply_locald_event(&mut ui, "error", &json!({"code": "sharing-tunnel-failed"}));
+        assert!(!ui.error);
+        assert!(ui.ready);
+    }
+
+    /// Any other error is shown, with the component and log it came from.
+    #[test]
+    fn a_real_error_carries_its_code_message_and_source() {
+        let mut ui = UiState::default();
+        apply_locald_event(
+            &mut ui,
+            "error",
+            &json!({
+                "code": "backend-exited",
+                "message": "the backend exited during startup",
+                "component": "backend",
+                "log_source": "backend",
+            }),
+        );
+        assert!(ui.error);
+        assert_eq!(ui.error_code, "backend-exited");
+        assert_eq!(ui.status, "the backend exited during startup");
+        assert_eq!(
+            (ui.component.as_str(), ui.log_source.as_str()),
+            ("backend", "backend")
+        );
+    }
+
+    /// Sandbox images finish after the workspace is up, so this must touch
+    /// nothing else -- writing phase or readiness would send an app the user
+    /// is already in back to the splash.
+    #[test]
+    fn sandbox_image_progress_leaves_the_workspace_alone() {
+        let mut ui = UiState {
+            ready: true,
+            running: true,
+            phase: "Lemma is ready".into(),
+            progress: 100,
+            ..UiState::default()
+        };
+
+        apply_locald_event(
+            &mut ui,
+            "sandbox-images",
+            &json!({"state": "downloading", "detail": "Downloading the workspace image"}),
+        );
+
+        assert_eq!(ui.sandbox_images, "downloading");
+        assert_eq!(ui.sandbox_images_detail, "Downloading the workspace image");
+        assert_eq!(ui.sandbox_images_done_mb, None);
+        assert!(ui.ready && ui.running);
+        assert_eq!((ui.phase.as_str(), ui.progress), ("Lemma is ready", 100));
+
+        // How far it has got rides along, and does not survive into a state
+        // that says nothing about it.
+        apply_locald_event(
+            &mut ui,
+            "sandbox-images",
+            &json!({"state": "downloading", "detail": "", "done_mb": 120, "total_mb": 700}),
+        );
+        assert_eq!(
+            (ui.sandbox_images_done_mb, ui.sandbox_images_total_mb),
+            (Some(120), Some(700))
+        );
+        apply_locald_event(
+            &mut ui,
+            "sandbox-images",
+            &json!({"state": "ready", "detail": "", "done_mb": null, "total_mb": null}),
+        );
+        assert_eq!(ui.sandbox_images_done_mb, None);
+        assert!(ui.ready && ui.running);
+    }
+
+    /// A Windows runtime that is prepared starts the stack, in local mode.
+    #[test]
+    fn a_prepared_runtime_starts_lemma_in_local_mode() {
+        let mut ui = UiState {
+            mode: "local".into(),
+            ..UiState::default()
+        };
+        let outcome = apply_locald_event(&mut ui, "runtime.prepared", &json!({"ready": true}));
+        assert!(outcome.start_after_prepare);
+        assert!(!ui.error);
+    }
+
+    /// One that needs a reboot says so, and does not try to start.
+    #[test]
+    fn a_runtime_that_needs_a_reboot_asks_for_one() {
+        let mut ui = UiState {
+            mode: "local".into(),
+            ..UiState::default()
+        };
+        let outcome = apply_locald_event(&mut ui, "runtime.prepared", &json!({"ready": false}));
+        assert!(!outcome.start_after_prepare);
+        assert!(ui.error);
+        assert_eq!(ui.error_code, "wsl-reboot-required");
+    }
+
+    /// `done` retires the active operation, and only the active one.
+    #[test]
+    fn done_retires_only_the_operation_it_names() {
+        let mut ui = UiState {
+            active_operation_id: "op-1".into(),
+            ..UiState::default()
+        };
+
+        apply_locald_event(&mut ui, "done", &json!({"event": "done", "id": "op-other"}));
+        assert_eq!(
+            ui.active_operation_id, "op-1",
+            "another operation's done retired this one"
+        );
+
+        apply_locald_event(&mut ui, "done", &json!({"event": "done", "id": "op-1"}));
+        assert!(ui.active_operation_id.is_empty());
+        assert_eq!(ui.completed_operation_ids, vec!["op-1".to_owned()]);
+    }
+
+    /// The completed list is bounded, so a long session does not grow it.
+    #[test]
+    fn completed_operations_are_bounded() {
+        let mut ui = UiState::default();
+        for index in 0..20 {
+            ui.active_operation_id = format!("op-{index}");
+            apply_locald_event(
+                &mut ui,
+                "done",
+                &json!({"event": "done", "id": format!("op-{index}")}),
+            );
+        }
+        assert_eq!(ui.completed_operation_ids.len(), 16);
+        assert_eq!(
+            ui.completed_operation_ids.first().map(String::as_str),
+            Some("op-4")
+        );
+    }
+
+    /// A sharing change moves the workspace origin, and only to a trusted one.
+    #[test]
+    fn a_sharing_change_moves_the_origin_only_to_a_trusted_one() {
+        let mut ui = UiState::default();
+        apply_locald_event(
+            &mut ui,
+            "sharing.changed",
+            &json!({"url": APP, "api_url": API}),
+        );
+        assert_eq!(ui.url, APP);
+
+        apply_locald_event(
+            &mut ui,
+            "sharing.changed",
+            &json!({"url": "https://evil.example", "api_url": "https://evil.example/api"}),
+        );
+        assert_eq!(ui.url, APP, "an untrusted origin replaced a trusted one");
+    }
 }
 
 /// The other exit: the stop lands, and nobody is asked anything.
@@ -294,25 +545,37 @@ fn periodic_stopped_status_keeps_an_active_startup_phase_visible() {
 #[test]
 fn an_exit_is_allowed_held_or_turned_into_a_quit() {
     // The shutdown worker has finished. This is the exit it earned.
-    assert_eq!(exit_disposition(false, true, false), ExitDisposition::Allow);
+    assert_eq!(
+        exit_disposition(false, false, true, false),
+        ExitDisposition::Allow
+    );
 
     // A server switch closes one window before opening the next, and no
     // windows looks exactly like the last one closing.
-    assert_eq!(exit_disposition(true, false, false), ExitDisposition::Hold);
     assert_eq!(
-        exit_disposition(true, false, true),
+        exit_disposition(false, true, false, false),
+        ExitDisposition::Hold
+    );
+    assert_eq!(
+        exit_disposition(false, true, false, true),
         ExitDisposition::Hold,
         "a swap outranks everything: there is nothing to quit about"
     );
 
     // Already quitting. Starting a second one is how a confirmed quit gets a
     // second dialog put in front of it.
-    assert_eq!(exit_disposition(false, false, true), ExitDisposition::Hold);
+    assert_eq!(
+        exit_disposition(false, false, false, true),
+        ExitDisposition::Hold
+    );
 
     // Nothing else is true, so this is the gesture that starts the quit --
     // whether or not there is anything to warn about, because the daemon
     // outlives the app and has to be stopped either way.
-    assert_eq!(exit_disposition(false, false, false), ExitDisposition::Quit);
+    assert_eq!(
+        exit_disposition(false, false, false, false),
+        ExitDisposition::Quit
+    );
 }
 
 /// A swap must never be mistaken for an exit that may proceed.
@@ -323,5 +586,8 @@ fn an_exit_is_allowed_held_or_turned_into_a_quit() {
 /// there quits the app in the middle of changing servers.
 #[test]
 fn a_window_swap_outranks_a_finished_shutdown() {
-    assert_eq!(exit_disposition(true, true, false), ExitDisposition::Hold);
+    assert_eq!(
+        exit_disposition(false, true, true, false),
+        ExitDisposition::Hold
+    );
 }

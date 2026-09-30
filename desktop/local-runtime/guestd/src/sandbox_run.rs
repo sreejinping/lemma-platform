@@ -11,12 +11,42 @@ use super::*;
 const SANDBOX_LOG_FILE_MIB: u32 = 16;
 const SANDBOX_LOG_FILES: u32 = 3;
 
+/// The most processes and threads one sandbox may hold at once.
+///
+/// Without one, a fork loop in any sandbox -- an agent's runaway script, a
+/// dependency's build -- exhausted the guest's pid space, and the guest is
+/// where PostgreSQL has to fork a backend for every connection. Docker's
+/// provider has run the workspace image under 512 for as long as it has
+/// existed, Chrome included; this leaves a dev server twice that.
+pub(crate) const SANDBOX_PIDS_LIMIT: u32 = 1024;
+
+/// How much more a sandbox's processes are preferred by the OOM killer.
+///
+/// Admission counts memory in use rather than ceilings (see
+/// `admit_sandbox_memory`), so sandboxes together can outgrow the guest. When
+/// they do, the kernel should take a sandbox process -- which costs somebody
+/// one command -- and not the database every account lives in. The core
+/// containers are started at `CORE_OOM_SCORE_ADJ` for the same reason.
+pub(crate) const SANDBOX_OOM_SCORE_ADJ: i32 = 500;
+
+/// Where the backend installs the runtime overlay inside a workspace sandbox:
+/// Lemma's own code, newer than the copy the image bakes.
+///
+/// Mounted from the guest's disk rather than left in the container layer, so
+/// it outlives the container. A sandbox is replaced whenever its image, its
+/// grants or its hardening change, and the overlay used to go with it: the
+/// next session reinstalled it, and until then the sandbox ran the image's
+/// older copy.
+pub(crate) const RUNTIME_OVERLAY_MOUNT: &str = "/opt/lemma-runtime";
+
 pub(crate) fn build_run_arguments(
     parameters: &EnsureParameters,
     workspace: Option<&Path>,
     runtime_token: Option<&Path>,
+    runtime_overlay: Option<&Path>,
     env_file: &Path,
     host_gateway: &str,
+    host_loopback_directory: &Path,
 ) -> Vec<String> {
     let metadata = serde_json::to_string(&parameters.metadata)
         .expect("validated sandbox metadata must serialize");
@@ -58,10 +88,29 @@ pub(crate) fn build_run_arguments(
         format!("lemma.work/metadata={metadata}"),
         "--label".into(),
         format!("lemma.work/apps={apps}"),
+        "--label".into(),
+        format!("lemma.work/host-access={}", parameters.host_access),
+        "--label".into(),
+        format!("lemma.work/host-loopback={}", parameters.host_loopback),
+        "--label".into(),
+        format!("lemma.work/hardening={SANDBOX_HARDENING_VERSION}"),
         "--env-file".into(),
         env_file.display().to_string(),
-        "--add-host".into(),
-        format!("host.lemma.internal:{host_gateway}"),
+        // No capabilities, and no way to gain any.
+        //
+        // Both images run as uid 10001 and nothing in them needs one: the
+        // runtime and the browser relay listen above 1024, and Chrome runs
+        // `--no-sandbox` because this container *is* its sandbox. What the
+        // default set bought was for a root process -- `CAP_NET_RAW` to forge
+        // packets on the bridge, `CAP_SETUID` behind any setuid binary an
+        // agent installs -- so dropping all of them costs nothing a sandbox
+        // does and removes what an escape would start from.
+        // `no-new-privileges` closes the setuid route even for a binary that
+        // brings its own file capabilities.
+        "--cap-drop".into(),
+        "ALL".into(),
+        "--security-opt".into(),
+        "no-new-privileges".into(),
         // Bounded, because these write to the guest's data disk and that disk
         // is a fixed size. A sandbox with a chatty loop in it -- an agent
         // retrying, a dependency printing a warning per file -- had nothing
@@ -76,7 +125,40 @@ pub(crate) fn build_run_arguments(
         format!("max-size={SANDBOX_LOG_FILE_MIB}m"),
         "--log-opt".into(),
         format!("max-file={SANDBOX_LOG_FILES}"),
+        "--pids-limit".into(),
+        SANDBOX_PIDS_LIMIT.to_string(),
+        "--oom-score-adj".into(),
+        SANDBOX_OOM_SCORE_ADJ.to_string(),
+        // The sandbox's own name rather than the engine's default, which is
+        // the container id and so changes every time a sandbox is made again.
+        // Chrome records the host name in its profile lock, and a profile
+        // locked by "another computer" is one it will not open -- so a
+        // workspace rebuilt after idle release came back without the browser
+        // sign-ins its profile still held.
+        "--hostname".into(),
+        parameters.sandbox_id.clone(),
     ];
+    if parameters.host_access {
+        arguments.extend([
+            "--add-host".into(),
+            format!("host.lemma.internal:{host_gateway}"),
+        ]);
+    }
+    // The loopback relay, for the one sandbox the backend granted it to.
+    //
+    // The directory, not the socket inside it: guestd rebinds the socket when
+    // it restarts, and a bind mount of the old socket file would go on naming
+    // an inode nobody listens on. The directory is root's and not writable
+    // here, so the sandbox can use the socket but not replace it.
+    if parameters.host_loopback {
+        arguments.extend([
+            "--mount".into(),
+            format!(
+                "type=bind,src={},dst={HOST_LOOPBACK_MOUNT}",
+                host_loopback_directory.display()
+            ),
+        ]);
+    }
     match parameters.workload_kind {
         WorkloadKind::Workspace => {
             let workspace = workspace.expect("workspace workload must have storage");
@@ -85,9 +167,16 @@ pub(crate) fn build_run_arguments(
             let runtime_token_mount = runtime_token
                 .parent()
                 .expect("workspace runtime token must have a private directory");
+            let runtime_overlay =
+                runtime_overlay.expect("workspace workload must have a runtime overlay");
             arguments.extend([
                 "--mount".into(),
                 format!("type=bind,src={},dst=/home/user", workspace.display()),
+                "--mount".into(),
+                format!(
+                    "type=bind,src={},dst={RUNTIME_OVERLAY_MOUNT}",
+                    runtime_overlay.display()
+                ),
                 "--mount".into(),
                 format!(
                     "type=bind,src={},dst=/run/lemma-bootstrap",
@@ -155,9 +244,35 @@ pub(crate) fn container_name(sandbox_id: &str) -> String {
     format!("{CONTAINER_PREFIX}{sandbox_id}")
 }
 
+fn remove_sandbox_directory(root: &Path, sandbox_id: &str) -> Result<bool, GuestError> {
+    let path = root.join(sandbox_id);
+    if path.parent() != Some(root) {
+        return Err(GuestError::invalid("workspace escaped managed root"));
+    }
+    if !path.exists() {
+        return Ok(false);
+    }
+    fs::remove_dir_all(path).map_err(|error| GuestError::engine(error.to_string()))?;
+    Ok(true)
+}
+
 impl<E: Engine + 'static> GuestService<E> {
     pub(crate) fn workspace(&self, sandbox_id: &str) -> Result<PathBuf, GuestError> {
-        let root = self.state_root.join("workspaces");
+        self.sandbox_owned_directory("workspaces", sandbox_id)
+    }
+
+    /// The sandbox's runtime overlay, kept beside its home and removed with it.
+    ///
+    /// Not inside the home: that is the user's file tree, and the overlay is
+    /// platform code that has no business in their listings, exports or
+    /// reach of an agent's `rm`.
+    pub(crate) fn runtime_overlay(&self, sandbox_id: &str) -> Result<PathBuf, GuestError> {
+        self.sandbox_owned_directory("runtime", sandbox_id)
+    }
+
+    /// A private directory under `state_root/<root>`, owned by the sandbox user.
+    fn sandbox_owned_directory(&self, root: &str, sandbox_id: &str) -> Result<PathBuf, GuestError> {
+        let root = self.state_root.join(root);
         let path = root.join(sandbox_id);
         if path.parent() != Some(root.as_path()) {
             return Err(GuestError::invalid("workspace escaped managed root"));
@@ -176,17 +291,14 @@ impl<E: Engine + 'static> GuestService<E> {
         Ok(path)
     }
 
+    /// Remove the sandbox's home and its runtime overlay; report whether it
+    /// had a home.
+    ///
+    /// The overlay goes too. It is only worth keeping for the next container
+    /// of the same sandbox, and a purged sandbox has none.
     pub(crate) fn purge_workspace(&self, sandbox_id: &str) -> Result<bool, GuestError> {
-        let root = self.state_root.join("workspaces");
-        let path = root.join(sandbox_id);
-        if path.parent() != Some(root.as_path()) {
-            return Err(GuestError::invalid("workspace escaped managed root"));
-        }
-        if !path.exists() {
-            return Ok(false);
-        }
-        fs::remove_dir_all(path).map_err(|error| GuestError::engine(error.to_string()))?;
-        Ok(true)
+        remove_sandbox_directory(&self.state_root.join("runtime"), sandbox_id)?;
+        remove_sandbox_directory(&self.state_root.join("workspaces"), sandbox_id)
     }
 
     pub(crate) fn write_env_file(
@@ -263,6 +375,7 @@ impl<E: Engine + 'static> GuestService<E> {
         let mut file = OpenOptions::new()
             .write(true)
             .create_new(true)
+            .custom_flags(libc::O_NOFOLLOW)
             .mode(0o600)
             .open(&path)
             .map_err(|error| GuestError::engine(error.to_string()))?;
@@ -270,9 +383,14 @@ impl<E: Engine + 'static> GuestService<E> {
             .map_err(|error| GuestError::engine(error.to_string()))?;
         file.sync_all()
             .map_err(|error| GuestError::engine(error.to_string()))?;
-        let path_bytes = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())
-            .map_err(|_| GuestError::invalid("runtime token path contains NUL"))?;
-        let result = unsafe { libc::chown(path_bytes.as_ptr(), 10_001, 10_001) };
+        // The descriptor, never the path. The directory is the sandbox's (it
+        // is mounted into the container, owned by its user), so between this
+        // open and a `chown(path)` the sandbox could swap `token` for a
+        // symlink -- and `chown` follows symlinks, handing a guest file of its
+        // choosing to uid 10001.
+        use std::os::fd::AsRawFd;
+        // SAFETY: a descriptor this scope owns, for the duration of the call.
+        let result = unsafe { libc::fchown(file.as_raw_fd(), 10_001, 10_001) };
         if result != 0 {
             return Err(GuestError::engine(io::Error::last_os_error().to_string()));
         }

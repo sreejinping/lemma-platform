@@ -33,6 +33,7 @@ from app.modules.connectors.domain.auth_config import (
     COMPOSIO_ORG_CUSTOM_REASON,
     COMPOSIO_SYSTEM_CREDENTIALS_ONLY,
     COMPOSIO_SYSTEM_DEFAULT_REASON,
+    SYSTEM_DEFAULT_OAUTH_NOT_CONFIGURED_REASON,
 )
 from app.modules.connectors.domain.errors import (
     ConnectorValidationError,
@@ -98,6 +99,7 @@ def _auth_install(
     auth_scheme: AuthScheme,
     oauth2: OAuth2Config | None = None,
     composio_toolkit_slug: str | None = None,
+    composio_managed_auth: bool = True,
 ) -> ResolvedAuthInstall:
     return ResolvedAuthInstall(
         connector_id=connector.id,
@@ -109,6 +111,7 @@ def _auth_install(
         config=auth_config.config or {},
         oauth2=oauth2,
         composio_toolkit_slug=composio_toolkit_slug,
+        composio_managed_auth=composio_managed_auth,
     )
 
 
@@ -141,6 +144,7 @@ def resolve_auth_install(
         )
     oauth2_config: OAuth2Config | None = None
     toolkit_slug: str | None = None
+    managed_auth = True
     auth_scheme = AuthScheme.OAUTH2
 
     if provider == AuthProvider.LEMMA.value:
@@ -175,6 +179,7 @@ def resolve_auth_install(
         spec = composio_capability(connector)
         auth_scheme = spec.auth_scheme
         toolkit_slug = spec.toolkit_slug
+        managed_auth = spec.system_default_available
 
     return _auth_install(
         connector,
@@ -182,6 +187,7 @@ def resolve_auth_install(
         auth_scheme=auth_scheme,
         oauth2=oauth2_config,
         composio_toolkit_slug=toolkit_slug,
+        composio_managed_auth=managed_auth,
     )
 
 
@@ -235,6 +241,11 @@ def install_auth_schemes(
             continue
         schemes[auth_config.id] = install.auth_scheme.value
     return schemes
+
+
+def _display_name(connector: ConnectorEntity) -> str:
+    """What a person calls the connector: its title, else its slug."""
+    return connector.title or connector.id
 
 
 def validate_auth_config_request(
@@ -307,9 +318,13 @@ def validate_auth_config_request(
         )
     if config_source == AuthConfigSource.SYSTEM_DEFAULT:
         if not system_oauth_config.has_default_oauth_config(connector):
+            # Read by the person who clicked Connect, so it names what is
+            # missing and the two ways to supply it, not the config sources.
             raise ConnectorValidationError(
-                "System default OAuth credentials are not configured for this app. "
-                "Create an org custom auth config with OAuth credentials instead."
+                f"{_display_name(connector)} needs an OAuth app before "
+                "anyone can sign in to it. Register your organization's own app, "
+                "or ask whoever runs this server to add one.",
+                details={"reason": SYSTEM_DEFAULT_OAUTH_NOT_CONFIGURED_REASON},
             )
         return
 

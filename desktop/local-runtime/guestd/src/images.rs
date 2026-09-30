@@ -56,6 +56,8 @@ pub(crate) fn pull_with(
     let Some(_claim) = claimed else {
         return Err(PullFailure::Busy);
     };
+    // Dropped with the pull, taking its figures with it.
+    let _progress = crate::pull_progress::Sampler::start(image);
     let output = engine
         .run(&[
             "pull".into(),
@@ -75,12 +77,52 @@ pub(crate) fn pull_with(
 }
 
 pub(crate) fn pull_in_progress(image: &str) -> GuestError {
+    // "(412 MB of 980 MB)" once the manifest is in: read by a person as it
+    // stands, and by the backend to show a progress bar.
+    let progress = crate::pull_progress::progress_for(image)
+        .filter(|progress| progress.total > 0)
+        .map(|progress| format!(" ({})", progress.sentence()))
+        .unwrap_or_default();
     GuestError {
         code: "image_pulling".into(),
-        message: format!("still downloading {image}"),
+        message: format!("still downloading {image}{progress}"),
         retryable: true,
         status_code: 503,
     }
+}
+
+/// How far the sandbox images' download has got, summed over both.
+///
+/// For `core.sandbox_images_status`, so the app can say "412 MB of 980 MB"
+/// rather than only that something is downloading. `None` until every image
+/// being downloaded has its manifest in: a sum over only the measured ones
+/// would read "700 of 700 MB" while another is still starting. An image
+/// nobody is downloading -- already here -- adds nothing.
+pub(crate) fn sandbox_images_progress(
+    parameters: &CoreParameters,
+) -> Option<crate::pull_progress::PullProgress> {
+    let mut sum: Option<crate::pull_progress::PullProgress> = None;
+    for image in [
+        parameters.images.workspace.as_deref(),
+        parameters.images.function.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        match crate::pull_progress::progress_for(image) {
+            Some(one) => {
+                let so_far =
+                    sum.unwrap_or(crate::pull_progress::PullProgress { done: 0, total: 0 });
+                sum = Some(crate::pull_progress::PullProgress {
+                    done: so_far.done + one.done,
+                    total: so_far.total + one.total,
+                });
+            }
+            None if crate::pull_progress::is_sampling(image) => return None,
+            None => {}
+        }
+    }
+    sum.filter(|sum| sum.total > 0)
 }
 
 pub(crate) fn validate_image(image: &str) -> Result<(), GuestError> {
@@ -342,19 +384,60 @@ impl<E: Engine + 'static> GuestService<E> {
         } else {
             self.ensure_image_available(image)?;
         }
-        if self.sandbox_image_marker_is_ready(image, workload_kind) {
+        if self.image_checked_this_boot(image, workload_kind) {
             return Ok(());
+        }
+        match self.sandbox_image_check(image, workload_kind) {
+            ImageCheck::Ready => {
+                self.record_image_checked(image, workload_kind);
+                return Ok(());
+            }
+            // Not evidence about the image at all -- the engine could not run
+            // the check. Removing the image on that basis is how an engine
+            // hiccup, or a machine short of memory, used to delete an image
+            // running sandboxes were made from.
+            ImageCheck::Unknown(detail) => {
+                return Err(GuestError {
+                    code: "image_check_failed".into(),
+                    message: format!("could not check the sandbox image: {detail}"),
+                    retryable: true,
+                    status_code: 503,
+                });
+            }
+            ImageCheck::Incomplete => {}
         }
         // An interrupted VM shutdown can leave containerd's image metadata
         // present while its unpacked snapshot is incomplete. `image inspect`
         // still succeeds in that state. Stopped sandbox containers are
         // disposable compute; pruning them preserves bind-mounted workspaces
         // while releasing the broken snapshot. Never remove a running
-        // container as part of automatic repair.
+        // container as part of automatic repair -- nor the image one runs
+        // from, nor an image that could not be fetched again.
+        if !self.running_containers_from(image)?.is_empty() {
+            return Err(GuestError {
+                code: "image_check_failed".into(),
+                message: "the sandbox image looks incomplete, but running sandboxes \
+                          use it, so it was not replaced; it will be once they stop"
+                    .into(),
+                retryable: true,
+                status_code: 503,
+            });
+        }
+        if !(self.registry_reachable)(image) {
+            return Err(GuestError {
+                code: "image_check_failed".into(),
+                message: "the sandbox image looks incomplete, and its registry cannot \
+                          be reached to fetch it again, so it was kept as it is"
+                    .into(),
+                retryable: true,
+                status_code: 503,
+            });
+        }
         self.run_checked(&["container".into(), "prune".into(), "--force".into()])?;
         self.run_checked(&["rmi".into(), "--force".into(), image.into()])?;
         self.pull_image(image)?;
-        if self.sandbox_image_marker_is_ready(image, workload_kind) {
+        if self.sandbox_image_check(image, workload_kind) == ImageCheck::Ready {
+            self.record_image_checked(image, workload_kind);
             Ok(())
         } else {
             self.schedule_cache_reset()?;
@@ -386,31 +469,6 @@ impl<E: Engine + 'static> GuestService<E> {
             .map_err(|error| GuestError::engine(error.to_string()))
     }
 
-    pub(crate) fn sandbox_image_marker_is_ready(
-        &self,
-        image: &str,
-        workload_kind: WorkloadKind,
-    ) -> bool {
-        let marker = match workload_kind {
-            WorkloadKind::Workspace => "/usr/local/bin/start-workspace-runtime",
-            WorkloadKind::Function => "/usr/local/bin/lemma-function-runtime",
-        };
-        self.engine
-            .run(&[
-                "run".into(),
-                "--rm".into(),
-                "--network".into(),
-                "none".into(),
-                "--platform".into(),
-                guest_platform().into(),
-                image.into(),
-                "/usr/bin/test".into(),
-                "-s".into(),
-                marker.into(),
-            ])
-            .is_ok_and(|output| output.status.success())
-    }
-
     /// Where this guest records which images are being fetched right now.
     ///
     /// Under the state root, so it is shared by every guestd process on this
@@ -429,9 +487,13 @@ impl<E: Engine + 'static> GuestService<E> {
         let dns_ok = diagnostic["dns_ok"].as_bool().unwrap_or(false);
         let registry_reachable = diagnostic["registry_reachable"].as_bool().unwrap_or(false);
         let hint = match (dns_ok, registry_reachable) {
-            (false, _) => "registry DNS lookup failed",
-            (true, false) => "registry HTTPS endpoint is unreachable",
-            (true, true) => "registry is reachable; retry the immutable image download",
+            (false, _) => {
+                let servers: Vec<String> =
+                    serde_json::from_value(diagnostic["name_servers"].clone()).unwrap_or_default();
+                dns_failure_hint(&servers, diagnostic["host_dns_relay"].as_bool())
+            }
+            (true, false) => "registry HTTPS endpoint is unreachable".to_owned(),
+            (true, true) => "registry is reachable; retry the immutable image download".to_owned(),
         };
         Err(GuestError::engine(format!("{error}; {hint}")))
     }

@@ -107,6 +107,14 @@ if [[ -z "$URL" && "$OPEN_PAGE" == "1" ]]; then
   exit 2
 fi
 
+# The converter that shipped with this script: `../lib` beside the overlay's
+# `bin`, and `/usr/local/lib` beside the image's own copy. The image's is the
+# floor for an overlay that predates the converter travelling with it.
+MARKDOWN_CONVERTER="$(dirname "$0")/../lib/webpage-to-markdown.mjs"
+if [[ ! -f "$MARKDOWN_CONVERTER" ]]; then
+  MARKDOWN_CONVERTER=/usr/local/lib/webpage-to-markdown.mjs
+fi
+
 mkdir -p "$OUT_DIR"
 # Absolute from here on, and this is load-bearing rather than tidy.
 #
@@ -200,7 +208,12 @@ if [[ "$OPEN_PAGE" == "1" ]]; then
   # the same question `live_port` asks: a recorded port, and something
   # answering on it.
   if ! browser_is_live; then
-    lemma-ensure-display >/dev/null
+    # `9>&-`: what this starts -- Xvfb, the window manager, the browser relay
+    # -- outlives the capture, and a child inherits every open descriptor. With
+    # the lock's fd among them, the first capture that brought the display up
+    # left three daemons holding the lock for the life of the sandbox, and
+    # every capture after it waited out CAPTURE_LOCK_WAIT and failed.
+    lemma-ensure-display >/dev/null 9>&-
   fi
   CAPTURE_TAB="lemma-capture-$$"
   agent-browser tab new --label "$CAPTURE_TAB" "$URL" >/dev/null
@@ -262,7 +275,7 @@ for raw_format in "${FORMAT_LIST[@]}"; do
     markdown|md)
       html_file="$(mktemp)"
       agent-browser --max-output 50000000 get html html > "$html_file"
-      node /usr/local/lib/webpage-to-markdown.mjs "$html_file" \
+      node "$MARKDOWN_CONVERTER" "$html_file" \
         --url "$PAGE_URL" \
         --title "$PAGE_TITLE" \
         > "$OUT_DIR/$NAME.md"

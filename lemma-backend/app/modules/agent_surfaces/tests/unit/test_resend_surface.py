@@ -159,7 +159,7 @@ async def test_minting_without_a_domain_says_so_instead_of_inventing_one(monkeyp
 
     monkeypatch.setattr(surface_settings, "resend_inbound_domain", None)
 
-    with pytest.raises(AgentSurfaceValidationError, match="RESEND_INBOUND_DOMAIN"):
+    with pytest.raises(AgentSurfaceValidationError, match="needs an inbound domain"):
         await email_surface_provisioning.create_surface_on_minted_address(
             AsyncMock(),
             AsyncMock(),
@@ -808,7 +808,7 @@ def _starter_reading(monkeypatch, *, surface=None, repository=None, resolver):
 
     monkeypatch.setattr(
         "app.modules.agent_surfaces.services.turn_starter.SurfaceCredentialResolver",
-        lambda *, uow: resolver,
+        lambda *, uow, pooled_numbers=None: resolver,
     )
     monkeypatch.setattr(
         "app.modules.agent_surfaces.services.turn_starter.SurfaceRepository",
@@ -857,6 +857,7 @@ async def test_an_email_reply_resolves_credentials_from_its_surface(monkeypatch)
         platform=SurfacePlatform.RESEND.value,
         surface_id=surface.id,
         surface_account_id=None,
+        event=None,
     )
 
     credentials = await starter._credentials_for(context)
@@ -879,6 +880,7 @@ async def test_chat_platforms_do_not_pay_for_an_extra_surface_read(monkeypatch):
         platform=SurfacePlatform.SLACK.value,
         surface_id=uuid4(),
         surface_account_id=None,
+        event=None,
     )
 
     await starter._credentials_for(context)

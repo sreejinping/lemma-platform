@@ -58,10 +58,12 @@ pub fn probe_http(url: &str) -> io::Result<()> {
         Duration::from_secs(1),
     )?;
     stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-    write!(
-        stream,
-        "GET /{} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n\r\n",
-        path, authority
+    // One write: `write!` on an unbuffered stream issues one system call per
+    // formatted piece, and a server that reads once and closes then resets
+    // the connection over the bytes it never read.
+    stream.write_all(
+        format!("GET /{path} HTTP/1.1\r\nHost: {authority}\r\nConnection: close\r\n\r\n")
+            .as_bytes(),
     )?;
     let mut response = [0_u8; 64];
     let count = stream.read(&mut response)?;
@@ -90,8 +92,8 @@ pub(crate) fn callback_failure_message(last_error: Option<&str>, guest_egress_ok
     let egress = if guest_egress_ok {
         "the guest's own network is working, so this is the route back to this computer"
     } else {
-        "the guest cannot resolve names either, so its network is unavailable rather than \
-         just this route"
+        "the guest cannot look up names (DNS) either, so its network is unavailable rather \
+         than just this route; a VPN or DNS filter on this computer is a common cause"
     };
     format!("sandbox cannot reach the Lemma API callback: {cause}. {egress}.")
 }

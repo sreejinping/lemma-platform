@@ -1,295 +1,250 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
 import test from 'node:test';
-import vm from 'node:vm';
 
-const source = readFileSync(new URL('../../ui/control.js', import.meta.url), 'utf8');
+import {
+  fakeElement,
+  fresh,
+  installDom,
+  resetShared,
+  shared,
+} from '../drivers/control-dom.mjs';
 
-function fixture() {
-  const elements = new Map();
-  const classes = () => {
-    const values = new Set();
-    return { add: (v) => values.add(v), remove: (v) => values.delete(v), contains: (v) => values.has(v) };
+// Installed before the first import: `core` reads the platform and the
+// connection mode once, when it loads.
+let dom = installDom();
+
+/** A fresh DOM and shared state, as a newly opened Local settings has them. */
+async function page() {
+  dom = installDom();
+  const core = await resetShared();
+  return { core };
+}
+
+/** `setTimeout`, captured rather than run, for the duration of one test. */
+function captureTimers(t) {
+  const timers = [];
+  const real = { set: globalThis.setTimeout, clear: globalThis.clearTimeout };
+  globalThis.setTimeout = (callback, delay) => {
+    timers.push({ callback, delay });
+    return timers.length;
   };
-  const pages = ['ai', 'integrations', 'channels'].map((page) => ({ dataset: { page }, classList: classes() }));
-  const element = (id) => {
-    if (!elements.has(id)) elements.set(id, {
-      value: '', dataset: {}, classList: classes(), checked: false,
-      closest: () => pages[0],
-    });
-    return elements.get(id);
-  };
-  const config = {
-    revision: 1,
-    ai: { protocol: 'openai_compat', base_url: 'https://saved.example/v1', models: ['saved'], default_model: 'saved', vision_models: [] },
-    integrations: {}, surfaces: {},
-  };
-  const context = vm.createContext({
-    snapshot: { operator: { config, secrets: { 'ai.api_key': true } } },
-    filling: false, $: element, sectionRevisions: new Map(), pendingSaves: new Map(), draftVersions: new Map(),
-    structuredClone, discoveredModels: [], csv: (value) => value.split(',').map((item) => item.trim()).filter(Boolean),
-    renderDiscoveredModels() {}, clearDiscoveredModels() {}, secretInputs: () => [], paintConfigStates() {},
-    document: {
-      querySelectorAll: () => pages,
-      querySelector: (selector) => pages.find((page) => selector.includes(`"${page.dataset.page}"`)),
-    },
-    toast() {}, friendlyError: String,
-    providerDraftIdentity: () => element('ai-base').value,
+  globalThis.clearTimeout = () => {};
+  t.after(() => {
+    globalThis.setTimeout = real.set;
+    globalThis.clearTimeout = real.clear;
   });
-  return { context, element, pages };
+  return timers;
 }
 
-function load(context, start, end) {
-  vm.runInContext(source.slice(source.indexOf(start), source.indexOf(end)), context);
-}
+// Provider drafts, model discovery, saving one section at a time and keeping
+// or removing a stored secret moved with their forms to the workspace's own
+// Settings, under This Mac; lemma-frontend/tests/this-mac.test.ts covers them.
 
-test('a health snapshot preserves an unsaved provider draft', () => {
-  const { context, element, pages } = fixture();
-  pages[0].classList.add('dirty');
-  element('ai-base').value = 'https://unsaved.example/v1';
-  load(context, 'function fillConfiguration(', 'function collectConfiguration(');
-  vm.runInContext('fillConfiguration()', context);
-  assert.equal(element('ai-base').value, 'https://unsaved.example/v1');
-  assert.equal(pages[0].classList.contains('dirty'), true);
+test('an existing snapshot does not prevent reconnect or hide an outage', async (t) => {
+  await page();
+  const events = await fresh('events');
+  const timers = captureTimers(t);
+
+  events.showSnapshotUnavailable('disconnected');
+  events.scheduleSnapshotRetry();
+
+  assert.equal(dom.element('snapshot-unavailable').hidden, false);
+  // Said in words a person can act on, not the daemon's own error text.
+  assert.match(dom.element('snapshot-unavailable-detail').textContent, /background service isn't running/);
+  // The retry fires, which asks for a snapshot, which asks the shell.
+  timers.shift().callback();
+  timers.shift().callback();
+  assert.ok(dom.commands.some(({ command }) => command === 'control_snapshot'));
 });
 
-test('model discovery leaves an unchanged saved key absent on the wire', async () => {
-  const { context, element } = fixture();
-  let payload;
-  context.invoke = async (_command, args) => { payload = args.payload; return []; };
-  context.applyDiscoveredModels = () => {};
-  load(context, 'async function discoverModels(', 'function applyDiscoveredModels(');
-  element('ai-base').value = 'https://saved.example/v1';
-  element('ai-protocol').value = 'openai_compat';
-  await vm.runInContext('discoverModels()', context);
-  assert.equal(Object.hasOwn(payload, 'api_key'), false);
+test('an update that changes the Postgres major never reaches the installer', async () => {
+  const { core } = await page();
+  const actions = await shared('actions');
+  core.store.appUpdate = {
+    dataCompatibility: 'postgres-major-change',
+    installedPostgresMajor: 18,
+    candidatePostgresMajor: 19,
+  };
+
+  await actions.runDesktopAction(fakeElement({ dataset: { action: 'install-app-update' } }));
+
+  assert.deepEqual(dom.commands.map(({ command }) => command), []);
+  assert.match(dom.element('toast').textContent, /from Postgres 18 to Postgres 19/);
 });
 
-test('a discovery response cannot populate a different provider draft', async () => {
-  const { context, element } = fixture();
-  let resolve;
-  let applied = false;
-  context.invoke = () => new Promise((done) => { resolve = done; });
-  context.applyDiscoveredModels = () => { applied = true; };
-  load(context, 'async function discoverModels(', 'function applyDiscoveredModels(');
-  element('ai-base').value = 'https://first.example/v1';
-  const pending = vm.runInContext('discoverModels()', context);
-  element('ai-base').value = 'https://second.example/v1';
-  resolve(['old-provider-model']);
-  await pending;
-  assert.equal(applied, false);
+test('a refused update names the change it refuses', async () => {
+  const updates = await shared('updates');
+  const named = updates.postgresMajorChangeMessage({ installedPostgresMajor: 18, candidatePostgresMajor: 19 });
+  assert.match(named, /from Postgres 18 to Postgres 19/);
+  assert.match(named, /Nothing was changed/);
+  assert.match(updates.postgresMajorChangeMessage({}), /a different Postgres version/);
 });
 
-test('saving integrations excludes provider and channel drafts and their secrets', () => {
-  const { context, element, pages } = fixture();
-  const secret = { value: 'replacement', dataset: { secret: 'integrations.deepgram_api_key' }, closest: () => pages[1] };
-  context.secretInputs = () => [secret, { value: 'unsaved-api-key', dataset: { secret: 'ai.api_key' }, closest: () => pages[0] }];
-  context.sectionRevisions.set('integrations', 7);
-  element('google-id').value = 'draft-google';
-  element('ai-base').value = 'https://unsaved.example';
-  load(context, 'function collectConfiguration(', 'async function saveConfiguration(');
-  const patch = vm.runInContext('collectConfiguration("integrations")', context);
-  assert.equal(patch.expected_revision, 7);
-  assert.equal(patch.section.name, 'integrations');
-  assert.equal(patch.section.value.google_client_id, 'draft-google');
-  assert.deepEqual(Object.keys(patch.secrets), ['integrations.deepgram_api_key']);
-  assert.equal(patch.secrets['integrations.deepgram_api_key'].action, 'replace');
-  assert.equal(Object.hasOwn(patch, 'config'), false);
-});
-
-test('secret keep and remove are distinct from replacement', () => {
-  const { context, pages } = fixture();
-  const secret = { value: '', dataset: { secret: 'ai.api_key', clear: 'false' }, closest: () => pages[0] };
-  context.secretInputs = () => [secret];
-  load(context, 'function collectConfiguration(', 'async function saveConfiguration(');
-  assert.equal(vm.runInContext('collectConfiguration("ai")', context).secrets['ai.api_key'].action, 'keep');
-  secret.dataset.clear = 'true';
-  assert.equal(vm.runInContext('collectConfiguration("ai")', context).secrets['ai.api_key'].action, 'remove');
-});
-
-test('typing a replacement cancels a previously armed credential removal', () => {
-  const { context, element } = fixture();
-  const key = element('ai-key');
-  key.dataset = { secret: 'ai.api_key', clear: 'true' };
-  key.value = 'replacement';
-  key.parentElement = { querySelector: () => null };
-  context.key = key;
-  load(context, 'function markDirty(', 'function secretInputs(');
-  vm.runInContext('markDirty(key)', context);
-  assert.equal(key.dataset.clear, 'false');
-});
-
-test('an existing snapshot does not prevent reconnect or hide an outage', () => {
-  const { context, element } = fixture();
-  let retry;
-  let requested = false;
-  context.snapshotRetryTimer = null;
-  context.SNAPSHOT_RETRY_FLOOR_MS = 1000;
-  context.SNAPSHOT_RETRY_CEILING_MS = 30000;
-  context.snapshotRetryDelay = 1000;
-  context.setTimeout = (callback) => { retry = callback; return 1; };
-  context.requestSnapshot = () => { requested = true; };
-  load(context, 'function scheduleSnapshotRetry(', '/* Daemon errors,');
-  load(context, 'function showSnapshotUnavailable(', 'function clearSnapshotUnavailable(');
-  vm.runInContext('showSnapshotUnavailable("disconnected"); scheduleSnapshotRetry()', context);
-  assert.equal(element('snapshot-unavailable').hidden, false);
-  assert.equal(element('snapshot-unavailable-detail').textContent, 'disconnected');
-  retry();
-  assert.equal(requested, true);
-});
-
-
-test('unsupported updates never invoke the installer or request a reset', async () => {
-  const { context } = fixture();
-  const commands = [];
-  context.invoke = async (command) => { commands.push(command); };
-  context.appUpdate = { dataCompatibility: 'requires-reset' };
-  context.runtimeInfo = null;
-  context.button = { dataset: { action: 'install-app-update' } };
-  context.document.querySelectorAll = () => [];
-  load(context, 'async function runDesktopAction(', 'function render()');
-  await vm.runInContext('runDesktopAction(button)', context);
-  assert.deepEqual(commands, []);
-});
-
-function eventFixture() {
-  const fixtureState = fixture();
-  const { context } = fixtureState;
-  Object.assign(context, {
-    state: null, sharingChoice: null, sharingBusy: false,
-    clearSnapshotUnavailable() {}, fillConfiguration() {}, render() {}, requestSnapshot() {}, scheduleSnapshotRetry() {},
-    resetSnapshotRetry() {},
-    setSectionError(page, message) { page.error = message; },
-  });
-  // From the shape guard, not from the handler: the handler now refuses an
-  // event that does not carry what its branch dereferences, and that check
-  // and its table live just above it.
-  load(context, '// What each event has to carry', '\nconfigureInteractionHandlers();');
-  Object.assign(context, { showSnapshotUnavailable() {} });
-  return fixtureState;
-}
-
-test('save completion preserves edits made while the save was running', () => {
-  const { context, pages } = eventFixture();
-  pages[0].classList.add('dirty');
-  context.draftVersions.set('ai', 2);
-  let completed;
-  context.pendingSaves.set('save', { page: pages[0], button: {}, original: 'Save', version: 1, complete: (value) => { completed = value; } });
-  vm.runInContext('handleLocaldEvent({ event: "config.applied", id: "save", operator: {config: {revision: 2}} })', context);
-  assert.equal(pages[0].classList.contains('dirty'), true);
-  assert.equal(completed, true);
-});
-
-test('a conflict preserves the draft and leaves a persistent section error', () => {
-  const { context, pages } = eventFixture();
-  pages[0].classList.add('dirty');
-  let completed;
-  context.pendingSaves.set('save', { page: pages[0], button: {}, original: 'Save', complete: (value) => { completed = value; } });
-  vm.runInContext('handleLocaldEvent({ event: "error", id: "save", code: "config-conflict", message: "Settings changed elsewhere" })', context);
-  assert.equal(pages[0].classList.contains('dirty'), true);
-  assert.equal(pages[0].error, 'Settings changed elsewhere');
-  assert.equal(completed, false);
-});
-
-test('reconnecting recovers a save whose completion event was lost', () => {
-  const { context, pages } = eventFixture();
-  pages[0].classList.add('dirty');
-  let completed;
-  context.pendingSaves.set('save', { page: pages[0], button: {}, original: 'Save', version: 0, complete: (value) => { completed = value; } });
-  // `state` because the daemon always sends it and the page now requires it:
-  // a snapshot without one cannot be rendered, and rendering the previous one
-  // as though it were current is worse than saying so.
-  vm.runInContext('handleLocaldEvent({ event: "control.snapshot", state: {ready: true}, operator: {config: {revision: 2}}, config_operations: {save: {status: "succeeded", operator: {config: {revision: 2}}}} })', context);
-  assert.equal(pages[0].classList.contains('dirty'), false);
-  assert.equal(completed, true);
-});
-
-test('saving one section cannot silently rebase another draft past an unseen change', () => {
-  const { context, pages } = eventFixture();
-  context.sectionRevisions.set('ai', 1);
-  context.sectionRevisions.set('integrations', 2);
-  context.pendingSaves.set('save', { page: pages[1], button: {}, original: 'Save', version: 0, expectedRevision: 2, complete() {} });
-  vm.runInContext('handleLocaldEvent({ event: "config.applied", id: "save", operator: {config: {revision: 3}} })', context);
-  assert.equal(context.sectionRevisions.get('ai'), 1);
-  assert.equal(context.sectionRevisions.get('integrations'), 3);
-});
+// How a save completes -- edits made while it ran, a conflict with a change
+// made elsewhere, a completion event lost to a reconnect -- went with the forms
+// that saved; lemma-frontend/tests/this-mac.test.ts covers it there.
 
 test('the install-health switch is hidden unless this build can send anything', async () => {
-  const { context, element } = fixture();
+  await page();
+  const overview = await fresh('overview');
   // A build with no ingestion key sends nothing at all, so a switch would be a
   // control over nothing. The whole panel stays hidden rather than offering a
   // toggle that does not toggle anything.
-  context.invoke = async () => ({ available: false, enabled: false, host: 'https://eu.i.posthog.com' });
-  element('telemetry-panel').hidden = true;
-  load(context, 'let telemetryLoaded = false;', '\n// Matches `formatUptime`');
-  await context.loadTelemetry();
-  assert.equal(element('telemetry-panel').hidden, true);
+  dom.answer(async () => ({ available: false, enabled: false, host: 'https://eu.i.posthog.com' }));
+  dom.element('telemetry-panel').hidden = true;
+
+  await overview.loadTelemetry();
+
+  assert.equal(dom.element('telemetry-panel').hidden, true);
 });
 
 test('turning the install-health switch off is sent once and kept on failure', async () => {
-  const { context, element } = fixture();
-  const listeners = [];
-  const box = element('telemetry-enabled');
-  box.addEventListener = (_event, handler) => listeners.push(handler);
-  element('telemetry-panel').hidden = true;
-  const sent = [];
-  context.invoke = async (command, args) => {
+  await page();
+  const overview = await fresh('overview');
+  const box = dom.element('telemetry-enabled');
+  dom.element('telemetry-panel').hidden = true;
+  dom.answer(async (command) => {
     if (command === 'telemetry_status') {
       return { available: true, enabled: true, host: 'https://eu.i.posthog.com', install_id: 'abcdef0123456789' };
     }
-    sent.push(args);
     throw new Error('the daemon said no');
-  };
-  load(context, 'let telemetryLoaded = false;', '\n// Matches `formatUptime`');
-  await context.loadTelemetry();
+  });
 
-  assert.equal(element('telemetry-panel').hidden, false);
+  await overview.loadTelemetry();
+
+  assert.equal(dom.element('telemetry-panel').hidden, false);
   assert.equal(box.checked, true, 'the stored choice is what the switch shows');
-  assert.match(element('telemetry-detail').textContent, /eu\.i\.posthog\.com/);
-  assert.match(element('telemetry-detail').textContent, /abcdef01/, 'the install id is shown, abbreviated');
+  assert.match(dom.element('telemetry-detail').textContent, /eu\.i\.posthog\.com/);
+  assert.match(dom.element('telemetry-detail').textContent, /abcdef01/, 'the install id is shown, abbreviated');
 
   box.checked = false;
-  await listeners[0]();
+  await box.listeners.change[0]();
+  const sent = dom.commands.filter(({ command }) => command === 'set_telemetry_enabled');
   assert.equal(sent.length, 1);
-  assert.equal(sent[0].enabled, false);
+  assert.equal(sent[0].args.enabled, false);
   assert.equal(box.checked, true, 'a refused save puts the switch back rather than lying');
 });
 
-test('a daemon that does not come back is asked less and less often', () => {
-  const { context } = fixture();
-  const delays = [];
-  context.snapshotRetryTimer = null;
-  context.SNAPSHOT_RETRY_FLOOR_MS = 1000;
-  context.SNAPSHOT_RETRY_CEILING_MS = 30000;
-  context.snapshotRetryDelay = 1000;
-  context.requestSnapshot = () => {};
-  // Captured rather than run inline: the callback is what clears the timer, and
-  // firing it from inside `setTimeout` would clear it before the assignment
-  // that sets it — so every later call would schedule afresh and the guard
-  // against double-scheduling would never be exercised.
-  let fire = null;
-  context.setTimeout = (callback, delay) => { delays.push(delay); fire = callback; return 1; };
-  context.clearTimeout = () => {};
-  load(context, 'function scheduleSnapshotRetry(', '/* Daemon errors,');
+test('a daemon that does not come back is asked less and less often', async (t) => {
+  await page();
+  const events = await fresh('events');
+  const timers = captureTimers(t);
 
+  const retries = [];
   for (let attempt = 0; attempt < 8; attempt += 1) {
-    vm.runInContext('scheduleSnapshotRetry()', context);
+    events.scheduleSnapshotRetry();
     // A second call while one is pending must not stack another timer.
-    vm.runInContext('scheduleSnapshotRetry()', context);
-    fire();
+    events.scheduleSnapshotRetry();
+    const retry = timers.shift();
+    retries.push(retry.delay);
+    assert.equal(timers.length, 0, 'one retry at a time');
+    // Firing it asks for a snapshot, which is its own short timer.
+    retry.callback();
+    timers.length = 0;
   }
 
   // It starts sooner than the flat five seconds it replaced, so the ordinary
-  // case — a daemon restarting — is noticed faster, and it stops growing at
+  // case -- a daemon restarting -- is noticed faster, and it stops growing at
   // the ceiling rather than drifting to minutes.
-  assert.equal(delays[0], 1000);
-  assert.deepEqual(delays.slice(0, 6), [1000, 2000, 4000, 8000, 16000, 30000]);
-  assert.ok(delays.every((delay) => delay <= 30000), `${delays}`);
+  assert.deepEqual(retries.slice(0, 6), [1000, 2000, 4000, 8000, 16000, 30000]);
+  assert.ok(retries.every((delay) => delay <= 30000), `${retries}`);
 
   // And a snapshot arriving puts it back, so the next outage is noticed
   // quickly rather than inheriting the interval the last one reached.
-  vm.runInContext('resetSnapshotRetry()', context);
-  delays.length = 0;
-  vm.runInContext('scheduleSnapshotRetry()', context);
-  assert.deepEqual(delays, [1000]);
+  events.resetSnapshotRetry();
+  events.scheduleSnapshotRetry();
+  assert.equal(timers[0].delay, 1000);
+});
+
+test('stopping sharing is offered only while this computer is shared', async () => {
+  await page();
+  const sharing = await shared('sharing');
+  const button = dom.element('sharing-disable');
+
+  sharing.renderSharingControls({ mode: 'this_computer', phase: 'ready' });
+  assert.equal(button.hidden, true, 'nothing to stop on a private installation');
+
+  sharing.renderSharingControls({ mode: 'public', phase: 'ready' });
+  assert.equal(button.hidden, false);
+  assert.equal(button.disabled, false);
+});
+
+test('stopping sharing asks the shell to disable it, and says so', async () => {
+  const { core } = await page();
+  const sharing = await shared('sharing');
+  core.store.snapshot = { sharing: { mode: 'local_network', phase: 'ready' } };
+
+  await sharing.disableSharing();
+
+  const sent = dom.commands.filter(({ command }) => command === 'sharing_action');
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].args.action, 'disable');
+  // Held busy until the daemon reports the change, so a second press cannot
+  // start a second transition while the first is running.
+  assert.equal(dom.element('sharing-disable').disabled, true);
+  assert.match(dom.element('toast').textContent, /This computer/);
+});
+
+test('a refused stop puts the button back and says why', async () => {
+  const { core } = await page();
+  const sharing = await shared('sharing');
+  core.store.snapshot = { sharing: { mode: 'public', phase: 'ready' } };
+  dom.answer(async () => { throw new Error('control endpoint unavailable'); });
+
+  await sharing.disableSharing();
+
+  assert.equal(dom.element('sharing-disable').disabled, false);
+  assert.match(dom.element('toast').textContent, /background service isn't running/);
+});
+
+// The coding-agents card names only controls that exist on this page or in
+// the workspace, in the workspace card's own words.
+test('the coding-agents card says what stopped and never names a missing switch', async () => {
+  await page();
+  const overview = await shared('overview');
+  let said = '';
+  const describe = (state) => {
+    const { status, detail } = overview.describeAgentHost(state);
+    said = `${status}: ${detail}`;
+  };
+
+  describe({ available: true, running: false, restart_circuit_open: true, targets: [] });
+  assert.match(said, /^not running/);
+  assert.match(said, /Press Restart/);
+
+  describe({ available: true, running: false, targets: [] });
+  assert.match(said, /^starting/);
+
+  describe({ available: true, running: true, paired: false, targets: [] });
+  assert.match(said, /^not connected/);
+  assert.match(said, /connects itself/);
+
+  describe({
+    available: true, running: true, paired: true,
+    targets: [{ connection_state: 'OFFLINE', last_error: 'this Lemma needs a newer Agent Host' }],
+  });
+  assert.match(said, /^update needed/);
+
+  describe({ available: false });
+  assert.match(said, /Update Lemma/);
+
+  for (const state of [
+    { available: true, running: false, targets: [] },
+    { available: true, running: true, paired: false, targets: [] },
+    { available: true, running: true, paired: true, targets: [{ connection_state: 'OFFLINE', last_error: 'x' }] },
+  ]) {
+    describe(state);
+    assert.doesNotMatch(said, /Turn it on|Connect this computer from Lemma|Agent Host/);
+  }
+});
+
+test('opening the coding agents in Lemma lands on the settings that manage them', async () => {
+  await page();
+  const actions = await shared('actions');
+  await actions.runDesktopAction(fakeElement({ dataset: { action: 'agent-host-open' } }));
+  const sent = dom.commands.filter(({ command }) => command === 'close_local_settings');
+  assert.equal(sent.length, 1);
+  // This DOM is a local install's, where they are under This Mac.
+  assert.deepEqual(sent[0].args, { section: 'this-mac-agents' });
+  assert.equal(dom.commands.some(({ command }) => command === 'open_app'), false);
 });

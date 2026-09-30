@@ -46,7 +46,7 @@ default-members = ["."]
 [workspace.package]
 # One version for six crates. Release used to rewrite desktop/Cargo.toml alone,
 # so the moment the other five moved in here they would have drifted silently.
-version = "0.8.0"
+version = "0.9.0"
 
 [workspace.dependencies]
 # Hoisted because feature unification makes the *emergent* feature set of a
@@ -121,6 +121,24 @@ base64 = "0.22"
 # is what serves those sources. Only a test puts the two vocabularies in the
 # same process; the shipped app talks to locald over a socket, as before.
 lemma-locald = { path = "locald" }
+
+# Development builds, which `cargo test` inherits through [profile.test].
+#
+# Full debug info is most of what a dev target directory holds: DWARF for every
+# dependency, then again for every test binary that links them. Line tables are
+# what a backtrace and a panic location need, so the workspace's own crates
+# keep those, and dependencies keep nothing. A debugger that has to step into a
+# dependency is the case this gives up; set `debug = true` locally for that.
+#
+# Left at their defaults on purpose: `incremental` (on, and the fast rebuild is
+# worth its disk; `make dev-clean` sweeps stale incremental state) and
+# `split-debuginfo`, which on macOS is already `unpacked` — debug info stays
+# in the object files and no dSYM is produced.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
 
 # A workspace ignores [profile] in anything but the root manifest — with a
 # warning that is easy to miss — so every member's release profile lives here.

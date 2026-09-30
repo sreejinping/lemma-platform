@@ -19,6 +19,8 @@ async fn authenticated_harnesses_stream_real_answers_over_acp() {
             let outcome = run_with_deadline(
                 AcpRunRequest {
                     adapter: manifest.resolve(&agent).unwrap(),
+                    agent_environment: std::collections::BTreeMap::default(),
+                    own_settings: false,
                     run_spec: RunSpec {
                         agent_run_id: run_id,
                         conversation_id: Uuid::new_v4(),
@@ -50,6 +52,7 @@ async fn authenticated_harnesses_stream_real_answers_over_acp() {
                     permission_timeout: Duration::ZERO,
                     cancel: lemma_agent_host::acp::never_cancelled(),
                     cancel_grace: Duration::from_secs(5),
+                    steer: lemma_agent_host::acp::SteerInbox::default(),
                 },
                 callbacks.clone(),
             )

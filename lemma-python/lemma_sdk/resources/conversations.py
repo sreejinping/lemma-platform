@@ -11,6 +11,7 @@ from ..openapi_client.api.agent_conversations import (
     agent_conversation_message_append,
     agent_conversation_message_list,
     agent_conversation_message_send,
+    agent_conversation_message_withdraw,
     agent_conversation_retry,
     agent_conversation_stream,
     agent_conversation_stop,
@@ -49,12 +50,13 @@ class PodConversations(BoundResource):
         parent_id: str | None = None,
         type: ConversationType | str | None = None,
         status: ConversationStatus | str | None = None,
+        search: str | None = None,
         limit: int = 20,
     ) -> ConversationListResponse:
         # Root conversations only by default; pass parent_id to fetch a
         # conversation's children (sub-agents or conversations pinned under a
         # PROJECT). `type` filters by CHAT / TASK / PROJECT and composes with
-        # parent_id.
+        # parent_id. `search` keeps titles containing it, case-insensitively.
         return self._call(
             agent_conversation_list,
             self._pod_uuid(),
@@ -62,6 +64,7 @@ class PodConversations(BoundResource):
             parent_id=as_uuid(parent_id) if parent_id is not None else UNSET,
             type_=type if type is not None else UNSET,
             status=status if status is not None else UNSET,
+            search=search if search is not None else UNSET,
             limit=limit,
         )
 
@@ -71,6 +74,7 @@ class PodConversations(BoundResource):
         parent_id: str | None = None,
         type: ConversationType | str | None = None,
         status: ConversationStatus | str | None = None,
+        search: str | None = None,
         limit: int = 20,
     ) -> ConversationListResponse:
         return self.list(
@@ -78,6 +82,7 @@ class PodConversations(BoundResource):
             parent_id=parent_id,
             type=type,
             status=status,
+            search=search,
             limit=limit,
         )
 
@@ -86,7 +91,7 @@ class PodConversations(BoundResource):
 
     def create_for_agent(
         self,
-        agent_name: str,
+        agent_name: str | None = None,
         *,
         title: str | None = None,
         metadata: Metadata | None = None,
@@ -97,7 +102,8 @@ class PodConversations(BoundResource):
             self._pod_uuid(),
             body=compact(
                 {
-                    "agent_name": agent_name,
+                    # None or blank: the pod's own assistant, by leaving it out.
+                    "agent_name": (agent_name or "").strip() or None,
                     "title": title,
                     "metadata": metadata,
                     "parent_id": parent_id,
@@ -172,6 +178,19 @@ class PodConversations(BoundResource):
             as_uuid(conversation_id),
             body=compact({"content": content, "metadata": metadata}),
             body_model=SendMessageRequest,
+        )
+
+    def withdraw(self, conversation_id: str, message_id: str) -> None:
+        """Take back a message the agent has not seen yet.
+
+        Only a message sent while a run was working, and only until something
+        delivers it; the API answers 409 once a run has read it.
+        """
+        self._call(
+            agent_conversation_message_withdraw,
+            self._pod_uuid(),
+            as_uuid(conversation_id),
+            as_uuid(message_id),
         )
 
     def send_stream(

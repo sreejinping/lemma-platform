@@ -1,0 +1,329 @@
+;; Lemma host execution: the Seatbelt profile every command an agent runs on
+;; this Mac is confined by. See docs/architecture/desktop-host-execution.md §6.
+;;
+;; Modelled on Claude Code's and Codex's macOS profiles: deny by default, then
+;; broad reads, narrow writes and an open network. Deny-by-default rather than
+;; allow-by-default because an allowed default also allows the ways out of a
+;; sandbox that are not files at all -- `launchctl submit`, `open -a Terminal`,
+;; Apple Events to another app -- each of which runs a command unconfined.
+;;
+;; Parameters, all canonical absolute paths (the kernel matches real paths, so
+;; /var and /tmp must already be spelled /private/var and /private/tmp):
+;;   ROOT                  the workspace root; writable
+;;   HOME                  the owner's home; what the credential denials hang off
+;;   TMP                   this exec-server's own $TMPDIR; writable
+;;   USER_TMP              the owner's per-user temporary folder
+;;                         (/private/var/folders/../T); writable
+;;   CACHE                 the package caches host commands use; writable
+;;   GRANT_0..GRANT_7      optional further folders the owner granted; writable
+;;   GIT_0..GIT_8          the `.git` folders of ROOT and the grants that
+;;                         existed when the exec-server started; kept as they are
+;;   RESOLVED_0..RESOLVED_15  where a credential path below really is, when it
+;;                         is a symbolic link; denied like the path itself
+;;
+;; This file is data and is tested as data: tests/seatbelt.rs runs real
+;; processes under it and checks each denial and allowance below.
+
+(version 1)
+(deny default)
+
+(define (home-path relative) (string-append (param "HOME") relative))
+
+;; ---------------------------------------------------------------- processes
+
+;; Children inherit this profile and cannot drop it, so fork and exec are safe
+;; to allow wholesale.
+(allow process-fork)
+(allow process-exec)
+(allow process-info* (target same-sandbox))
+(allow process-info-pidinfo)
+(allow process-info-setcontrol (target same-sandbox))
+(allow signal (target same-sandbox))
+(allow mach-priv-task-port (target same-sandbox))
+
+;; What the runtimes underneath every CLI reach for: the kernel's sysctls,
+;; shared memory and semaphores (Node, Python multiprocessing), preferences.
+(allow sysctl-read)
+(allow sysctl-write (sysctl-name "kern.tcsm_enable"))
+(allow ipc-posix-shm)
+(allow ipc-posix-sem)
+(allow user-preference-read)
+(allow iokit-open
+  (iokit-registry-entry-class "RootDomainUserClient")
+  (iokit-registry-entry-class "IOSurfaceRootUserClient"))
+
+;; The system services a command-line tool needs. Named one by one: this list
+;; is what keeps `launchctl`, LaunchServices-driven `open`, and Apple Events
+;; (the unconfined ways out) unreachable.
+(allow mach-lookup
+  ;; Logging, notifications, user and group lookups (getpwuid, id).
+  (global-name "com.apple.logd")
+  (global-name "com.apple.system.logger")
+  (global-name "com.apple.system.notification_center")
+  (global-name "com.apple.distributed_notifications@Uv3")
+  (global-name "com.apple.system.opendirectoryd.libinfo")
+  (global-name "com.apple.system.opendirectoryd.membership")
+  (global-name "com.apple.system.DirectoryService.libinfo_v1")
+  (global-name "com.apple.system.DirectoryService.membership_v1")
+  (global-name "com.apple.bsd.dirhelper")
+  (global-name "com.apple.cfprefsd.daemon")
+  (global-name "com.apple.cfprefsd.agent")
+  (global-name "com.apple.lsd.mapdb")
+  (global-name "com.apple.CoreServices.coreservicesd")
+  (global-name "com.apple.analyticsd")
+  (global-name "com.apple.diagnosticd")
+  (global-name "com.apple.PowerManagement.control")
+  (global-name "com.apple.fonts")
+  (global-name "com.apple.FontObjectsServer")
+  ;; DNS and network configuration.
+  (global-name "com.apple.dnssd.service")
+  (global-name "com.apple.SystemConfiguration.configd")
+  (global-name "com.apple.SystemConfiguration.DNSConfiguration")
+  (global-name "com.apple.networkd")
+  (global-name "com.apple.nsurlsessiond")
+  (global-name "com.apple.nesessionmanager.content-filter")
+  (global-name "com.apple.usymptomsd")
+  ;; TLS trust evaluation, and the Keychain. `gh` keeps its token in the
+  ;; login keychain and reads it through these services; git's credential
+  ;; helper does the same.
+  (global-name "com.apple.SecurityServer")
+  (global-name "com.apple.securityd.xpc")
+  (global-name "com.apple.security.agent")
+  (global-name "com.apple.security.authhost")
+  (global-name "com.apple.trustd")
+  (global-name "com.apple.trustd.agent")
+  (global-name "com.apple.ocspd")
+  ;; File watching, for `npm run dev` and every other dev server that reloads.
+  (global-name "com.apple.FSEvents"))
+
+;; ---------------------------------------------------------------- network
+
+;; Open, outbound and loopback: `npm install` needs the registry and `npm run
+;; dev` needs to listen.
+(allow network*)
+(allow system-socket)
+
+;; But not Unix-domain sockets. Each one is a service that acts for the owner
+;; outside this sandbox -- the Docker daemon, ssh-agent, a password manager's
+;; agent, tmux -- and connecting to it runs whatever it is asked to, unconfined.
+;; DNS is the exception every lookup needs: getaddrinfo asks mDNSResponder
+;; through its socket.
+(deny network-outbound (remote unix-socket))
+(allow network-outbound
+  (remote unix-socket (path-literal "/private/var/run/mDNSResponder")))
+
+;; ---------------------------------------------------------------- reads
+
+;; Broad: a tool has to see the owner's toolchain, their repositories and the
+;; system to be of any use.
+(allow file-read*)
+
+;; ---------------------------------------------------------------- writes
+
+;; Nothing the owner's own, unconfined tools later run from. The package
+;; managers' shared caches (~/.npm with npx's `_npx`, ~/Library/pnpm, which is
+;; on PATH, ~/.cargo, ~/Library/Caches, all of /tmp) are exactly that: a
+;; command that could write them could plant code the owner's terminal runs
+;; next. The exec-server points every package manager at CACHE instead,
+;; through its environment, and gives each exec-server a TMP of its own.
+;;
+;; USER_TMP is the one shared folder left, because it cannot be moved: macOS's
+;; `mktemp` and the system frameworks take it from confstr, not from $TMPDIR,
+;; and a shell script without `mktemp` is rare. Programs create their own
+;; unpredictable names in it; the rest of /private/var/folders (the per-user
+;; cache folder among it) stays read-only.
+(allow file-write*
+  (subpath (param "ROOT"))
+  (subpath (param "TMP"))
+  (subpath (param "USER_TMP"))
+  (subpath (param "CACHE")))
+
+(if (param "GRANT_0") (allow file-write* (subpath (param "GRANT_0"))))
+(if (param "GRANT_1") (allow file-write* (subpath (param "GRANT_1"))))
+(if (param "GRANT_2") (allow file-write* (subpath (param "GRANT_2"))))
+(if (param "GRANT_3") (allow file-write* (subpath (param "GRANT_3"))))
+(if (param "GRANT_4") (allow file-write* (subpath (param "GRANT_4"))))
+(if (param "GRANT_5") (allow file-write* (subpath (param "GRANT_5"))))
+(if (param "GRANT_6") (allow file-write* (subpath (param "GRANT_6"))))
+(if (param "GRANT_7") (allow file-write* (subpath (param "GRANT_7"))))
+
+;; ---------------------------------------------------------------- what runs later
+
+;; Files in a writable folder that something outside this sandbox executes
+;; without being asked: git's hooks, a coding agent's settings (its hooks and
+;; MCP servers -- the Agent Host starts those agents unconfined), direnv's
+;; `.envrc`, an editor's tasks. Kept read-only in the root and every grant.
+(define (keep-as-is folder)
+  (deny file-write*
+    (subpath (string-append folder "/.git/hooks"))
+    (subpath (string-append folder "/.claude"))
+    (subpath (string-append folder "/.codex"))
+    (subpath (string-append folder "/.gemini"))
+    (subpath (string-append folder "/.opencode"))
+    (literal (string-append folder "/opencode.json"))
+    (literal (string-append folder "/.mcp.json"))
+    (literal (string-append folder "/.envrc"))
+    (subpath (string-append folder "/.vscode"))
+    (subpath (string-append folder "/.idea"))))
+(keep-as-is (param "ROOT"))
+(if (param "GRANT_0") (keep-as-is (param "GRANT_0")))
+(if (param "GRANT_1") (keep-as-is (param "GRANT_1")))
+(if (param "GRANT_2") (keep-as-is (param "GRANT_2")))
+(if (param "GRANT_3") (keep-as-is (param "GRANT_3")))
+(if (param "GRANT_4") (keep-as-is (param "GRANT_4")))
+(if (param "GRANT_5") (keep-as-is (param "GRANT_5")))
+(if (param "GRANT_6") (keep-as-is (param "GRANT_6")))
+(if (param "GRANT_7") (keep-as-is (param "GRANT_7")))
+
+;; A repository that was already there is the owner's: its config (where
+;; `core.fsmonitor` or `core.hooksPath` names a program the owner's shell
+;; prompt runs on every `cd`) and the `.git` entry itself (a gitdir pointer, or
+;; a folder to swap out) stay as they are. A repository a command makes is its
+;; own, and `git init` has to be able to write its config.
+(define (keep-repository git)
+  (deny file-write*
+    (literal git)
+    (literal (string-append git "/config"))
+    (subpath (string-append git "/hooks"))))
+(if (param "GIT_0") (keep-repository (param "GIT_0")))
+(if (param "GIT_1") (keep-repository (param "GIT_1")))
+(if (param "GIT_2") (keep-repository (param "GIT_2")))
+(if (param "GIT_3") (keep-repository (param "GIT_3")))
+(if (param "GIT_4") (keep-repository (param "GIT_4")))
+(if (param "GIT_5") (keep-repository (param "GIT_5")))
+(if (param "GIT_6") (keep-repository (param "GIT_6")))
+(if (param "GIT_7") (keep-repository (param "GIT_7")))
+(if (param "GIT_8") (keep-repository (param "GIT_8")))
+
+;; ---------------------------------------------------------------- credentials
+
+;; Credentials and private data, neither readable nor writable. After every
+;; allow above on purpose: the last matching rule wins, so a granted folder or
+;; a root that happens to contain one of these still cannot reach it.
+(deny file-read* file-write*
+  (subpath (home-path "/.ssh"))
+  (subpath (home-path "/.aws"))
+  (subpath (home-path "/.gnupg"))
+  (subpath (home-path "/.config/gcloud"))
+  (subpath (home-path "/.azure"))
+  (subpath (home-path "/.kube"))
+  (literal (home-path "/.docker/config.json"))
+  (literal (home-path "/.netrc"))
+  (literal (home-path "/.npmrc"))
+  (literal (home-path "/.pypirc"))
+  (literal (home-path "/.git-credentials"))
+  (literal (home-path "/.config/git/credentials"))
+  (literal (home-path "/.pgpass"))
+  (literal (home-path "/.my.cnf"))
+  (literal (home-path "/.vault-token"))
+  (literal (home-path "/.cargo/credentials"))
+  (literal (home-path "/.cargo/credentials.toml"))
+  (literal (home-path "/.gem/credentials"))
+  (subpath (home-path "/.terraform.d"))
+  (subpath (home-path "/.config/op"))
+  (subpath (home-path "/.password-store"))
+  (literal (home-path "/.codex/auth.json"))
+  (literal (home-path "/.claude/.credentials.json"))
+  ;; What the owner typed into a shell or a REPL, passwords pasted by
+  ;; mistake included.
+  (literal (home-path "/.zsh_history"))
+  (subpath (home-path "/.zsh_sessions"))
+  (literal (home-path "/.bash_history"))
+  (subpath (home-path "/.bash_sessions"))
+  (literal (home-path "/.local/share/fish/fish_history"))
+  (literal (home-path "/.python_history"))
+  (literal (home-path "/.node_repl_history"))
+  (literal (home-path "/.psql_history"))
+  (literal (home-path "/.mysql_history"))
+  (literal (home-path "/.sqlite_history"))
+  (literal (home-path "/.irb_history"))
+  (subpath (home-path "/Library/Keychains"))
+  (subpath (home-path "/Library/Application Support/Google/Chrome"))
+  (subpath (home-path "/Library/Application Support/Chromium"))
+  (subpath (home-path "/Library/Application Support/Microsoft Edge"))
+  (subpath (home-path "/Library/Application Support/Vivaldi"))
+  (subpath (home-path "/Library/Application Support/com.operasoftware.Opera"))
+  (subpath (home-path "/Library/Application Support/Firefox"))
+  (subpath (home-path "/Library/Application Support/Arc"))
+  (subpath (home-path "/Library/Application Support/BraveSoftware"))
+  (subpath (home-path "/Library/Application Support/Slack"))
+  (subpath (home-path "/Library/Application Support/discord"))
+  (subpath (home-path "/Library/Safari"))
+  (subpath (home-path "/Library/Mail"))
+  (subpath (home-path "/Library/Messages"))
+  (subpath (home-path "/Library/Cookies"))
+  ;; Lemma's own data: the Agent Host's pairing secrets and journal, the
+  ;; desktop app's database and vault, the CLI's credentials, and every copy
+  ;; of the app's web storage -- its signed-in session among it -- whatever
+  ;; the bundle id (release, candidate and QA builds differ).
+  (subpath (home-path "/Library/Application Support/Lemma"))
+  (prefix (home-path "/Library/Application Support/work.lemma."))
+  (prefix (home-path "/Library/WebKit/work.lemma."))
+  (prefix (home-path "/Library/HTTPStorages/work.lemma."))
+  (prefix (home-path "/Library/Caches/work.lemma."))
+  (subpath (home-path "/Library/Caches/lemma-desktop"))
+  (prefix (home-path "/Library/Preferences/work.lemma."))
+  (literal (home-path "/Library/Preferences/lemma-desktop.plist"))
+  (subpath (home-path "/.lemma")))
+
+;; The same paths where they really are, when one of them is a symbolic link
+;; (a dotfiles repository, a synced folder): the kernel matches the resolved
+;; path, so a denial of the link alone denies nothing.
+(define (deny-resolved name)
+  (if (param name) (deny file-read* file-write* (subpath (param name)))))
+(deny-resolved "RESOLVED_0")
+(deny-resolved "RESOLVED_1")
+(deny-resolved "RESOLVED_2")
+(deny-resolved "RESOLVED_3")
+(deny-resolved "RESOLVED_4")
+(deny-resolved "RESOLVED_5")
+(deny-resolved "RESOLVED_6")
+(deny-resolved "RESOLVED_7")
+(deny-resolved "RESOLVED_8")
+(deny-resolved "RESOLVED_9")
+(deny-resolved "RESOLVED_10")
+(deny-resolved "RESOLVED_11")
+(deny-resolved "RESOLVED_12")
+(deny-resolved "RESOLVED_13")
+(deny-resolved "RESOLVED_14")
+(deny-resolved "RESOLVED_15")
+
+;; Except the login keychain file itself. `gh` and git's osxkeychain helper
+;; open it in-process to find their item, and securityd then decides whether
+;; to hand the secret over. The file is encrypted with the login password, so
+;; reading it yields nothing a command could not already ask securityd for;
+;; the rest of ~/Library/Keychains (the data-protection keychain, iCloud
+;; material) stays denied. Measured: with the whole directory denied,
+;; `gh auth token` answers "no oauth token found".
+;;
+;; What this admits, on purpose: a command can ask securityd for any item
+;; whose access list lets `gh`, git's helper or `/usr/bin/security` read it --
+;; `gh auth token` prints the GitHub token. Host execution exists so that `gh`
+;; and `git push` work as the owner; a token those tools can use is a token a
+;; command can read. ~/.config/gh stays readable for the same reason: without
+;; hosts.yml, gh refuses to start at all.
+(allow file-read*
+  (literal (home-path "/Library/Keychains"))
+  (literal (home-path "/Library/Keychains/login.keychain-db")))
+
+;; Lemma's own `lemma` CLI, which the host puts first on `PATH`. It is code,
+;; shipped in a host pack under Lemma's otherwise denied data, and nothing in
+;; it is secret; the host decides which folder it is (`lemma_cli_root`), never
+;; one holding pairing secrets or anything else denied above. Read only:
+;; nothing a command writes may be run later by another conversation's `lemma`.
+(if (param "LEMMA_CLI") (allow file-read* (subpath (param "LEMMA_CLI"))))
+
+;; Terminals and the null device. A PTY the exec-server opens is allocated
+;; inside the sandbox, so the pseudo-tty rules have to be here too.
+(allow pseudo-tty)
+(allow file-read* file-write* file-ioctl
+  (literal "/dev/null")
+  (literal "/dev/zero")
+  (literal "/dev/tty")
+  (literal "/dev/ptmx")
+  (literal "/dev/dtracehelper")
+  (regex #"^/dev/ttys[0-9]+$")
+  (regex #"^/dev/fd/[0-9]+$"))
+(allow file-read* file-ioctl
+  (literal "/dev/random")
+  (literal "/dev/urandom"))

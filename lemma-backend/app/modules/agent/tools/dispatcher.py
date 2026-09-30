@@ -143,6 +143,16 @@ class AgentToolDispatcher:
                 include_final_answer=include_final_answer,
                 # The whole reason a remote harness never saw `view_image`.
                 vision_mode=ctx.vision_mode,
+                # Only on the Agent Host bridge, which is what asks for
+                # `final_answer`; see `host_execution_selection`.
+                host_execution=(
+                    getattr(ctx, "host_execution_mode", None)
+                    if include_final_answer
+                    else None
+                ),
+                # The Agent Host bridge is the caller that asks for
+                # `final_answer`, and it has no capability to carry these.
+                include_notification_tools=include_final_answer,
             )
         run_ctx = self._run_context(ctx, agent_run_id)
         prepared: dict[str, PreparedTool] = {}

@@ -94,13 +94,13 @@ pub(crate) fn ensure_runtime_artifacts_inner(
     let install_operation_id = operation_id("runtime-install");
     {
         let shell: State<Shell> = app.state();
-        let mut ui = shell.ui.lock().unwrap();
+        let mut ui = shell.ui.lock_or_recover();
         ui.active_operation_id = install_operation_id.clone();
     }
     telemetry::note(telemetry::InstallEvent::RuntimeInstallStarted);
     {
         let shell: State<Shell> = app.state();
-        shell.ui.lock().unwrap().installed_this_launch = true;
+        shell.ui.lock_or_recover().installed_this_launch = true;
     }
     // Where the install got to, for the failure event. A install that dies is
     // only useful to hear about if we know which step died, and the progress
@@ -137,6 +137,7 @@ pub(crate) fn ensure_runtime_artifacts_inner(
                 .checked_div(progress.total)
                 .unwrap_or(0);
             let percent = match progress.stage {
+                "host-reuse" | "guest-reuse" => 2,
                 "download" => 2 + fraction.saturating_mul(44) / 1000,
                 "verify" => 47,
                 "host-extract" | "guest-extract" => 49 + fraction.saturating_mul(39) / 1000,
@@ -207,7 +208,7 @@ pub(crate) fn ensure_runtime_artifacts_inner(
     );
     {
         let shell: State<Shell> = app.state();
-        let mut ui = shell.ui.lock().unwrap();
+        let mut ui = shell.ui.lock_or_recover();
         if ui.active_operation_id == install_operation_id {
             ui.active_operation_id.clear();
         }
@@ -223,6 +224,7 @@ pub(crate) fn ensure_runtime_artifacts_inner(
 /// database.
 fn install_step(stage: &str) -> Option<&'static str> {
     match stage {
+        "host-reuse" | "guest-reuse" => Some("reuse"),
         "download" => Some("download"),
         "verify" => Some("verify"),
         "host-extract" => Some("host-extract"),
@@ -390,7 +392,7 @@ pub(crate) fn emit_runtime_install_progress(
     emit_log(app, &detail);
     let shell: State<Shell> = app.state();
     let snapshot = {
-        let mut ui = shell.ui.lock().unwrap();
+        let mut ui = shell.ui.lock_or_recover();
         ui.setup = true;
         ui.phase = label.to_owned();
         ui.phase_key = stage.to_owned();
@@ -409,7 +411,7 @@ pub(crate) fn emit_runtime_install_progress(
 pub(crate) fn emit_runtime_install_error(app: &AppHandle, message: &str) {
     let shell: State<Shell> = app.state();
     let snapshot = {
-        let mut ui = shell.ui.lock().unwrap();
+        let mut ui = shell.ui.lock_or_recover();
         ui.setup = true;
         ui.phase = "Local runtime setup".into();
         ui.phase_key = "runtime-install".into();
@@ -461,16 +463,31 @@ pub(crate) fn has_local_runtime_data() -> bool {
 pub(crate) fn ensure_update_preserves_data(
     reset_requested: bool,
     has_runtime: bool,
-    compatibility: &str,
-    windows: bool,
+    installed_postgres_major: Option<u64>,
+    candidate_postgres_major: Option<u64>,
 ) -> Result<(), String> {
     if reset_requested {
         return Err("Updates never reset local data. Factory reset is a separate destructive action in recovery.".into());
     }
-    if has_runtime && (windows || compatibility != "compatible") {
-        return Err("This update has no supported data-preserving migration for this installation. Your current version and data have been kept. Wait for a compatible update.".into());
+    match (
+        has_runtime,
+        installed_postgres_major,
+        candidate_postgres_major,
+    ) {
+        (true, Some(installed), Some(candidate)) if installed != candidate => {
+            Err(postgres_major_change_message(installed, candidate))
+        }
+        _ => Ok(()),
     }
-    Ok(())
+}
+
+/// Why an update was refused, in the terms of the one change that refuses it.
+pub(crate) fn postgres_major_change_message(installed: u64, candidate: u64) -> String {
+    format!(
+        "This update moves Lemma's database from Postgres {installed} to Postgres \
+         {candidate}, which Lemma can't migrate automatically yet. Nothing was \
+         changed: your current version, pods, files and accounts are as they were."
+    )
 }
 
 pub(crate) fn repair_runtime_impl(app: AppHandle) -> Result<(), String> {
@@ -478,7 +495,7 @@ pub(crate) fn repair_runtime_impl(app: AppHandle) -> Result<(), String> {
         return Err("runtime repair is available only for a local workspace".into());
     }
     let shell: State<Shell> = app.state();
-    let _install_guard = shell.runtime_install.lock().unwrap();
+    let _install_guard = shell.runtime_install.lock_or_recover();
     require_no_recovery(&shell)?;
     let config = read_config();
     if config
@@ -525,9 +542,29 @@ pub(crate) async fn prepare_runtime(window: Webview, app: AppHandle) -> Result<(
 /// child process freezes the window for its whole duration -- which is how a
 /// first launch showed a black, unresponsive app for minutes while the runtime
 /// installed and the daemon came up.
-pub(crate) async fn repair_runtime(window: Webview, app: AppHandle) -> Result<(), String> {
-    require_control_window(&window)?;
-    tauri::async_runtime::spawn_blocking(move || repair_runtime_impl(app))
-        .await
-        .map_err(|error| error.to_string())?
+pub(crate) async fn repair_runtime(window: Webview, app: AppHandle) -> Result<bool, String> {
+    require_settings_caller(&window, &app)?;
+    // Local settings asks before calling. The workspace does not get to: the
+    // repair stops the stack that is serving it, so the question is the
+    // shell's, asked natively, and a page cannot skip it.
+    let ask = !is_control_window_label(window.label());
+    tauri::async_runtime::spawn_blocking(move || {
+        if ask
+            && !confirm_destructive_action_impl(
+                app.clone(),
+                "Verify and repair Lemma?".into(),
+                format!(
+                    "Lemma downloads its signed runtime again (this needs internet), \
+                     replaces the copy on {THIS_COMPUTER}, and restarts. Running agents stop \
+                     while it does. Your pods, files and accounts are not touched."
+                ),
+                "Verify & repair".into(),
+            )?
+        {
+            return Ok(false);
+        }
+        repair_runtime_impl(app).map(|()| true)
+    })
+    .await
+    .map_err(|error| error.to_string())?
 }

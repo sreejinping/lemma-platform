@@ -13,7 +13,10 @@ where there is no history to send.
 
 from __future__ import annotations
 
-from uuid import uuid7
+import json
+from pathlib import Path
+from typing import cast
+from uuid import UUID, uuid7
 
 import pytest
 from pydantic_ai.tools import RunContext
@@ -101,14 +104,14 @@ def _ctx() -> BaseAgentContext:
 
 
 def _woke_up(sequence: int, tool_call_id: str) -> Message:
-    """The return the wake synthesizes for the snooze it resolved."""
+    """The return the wake synthesizes for the wait it resolved."""
     return Message(
         id=uuid7(),
         conversation_id=CONVERSATION_ID,
         sequence=sequence,
         role=MessageRole.TOOL,
         kind=MessageKind.TOOL_RETURN,
-        tool_name="snooze",
+        tool_name="wait_for",
         tool_call_id=tool_call_id,
         tool_result={"woke_because": "TIMER", "note_to_self": "check the build"},
     )
@@ -119,13 +122,14 @@ def _user_prompt(
     carries_history: bool,
     messages: list[Message] | None = None,
     resumed_tool_call_id: str | None = None,
+    agent_run_id: UUID | None = None,
 ) -> str:
     payload = run_start_payload(
         agent=_agent(),
         conversation=_conversation(),
         messages=_transcript() if messages is None else messages,
         ctx=_ctx(),
-        agent_run_id=uuid7(),
+        agent_run_id=agent_run_id or uuid7(),
         runtime_instructions="",
         carries_history=carries_history,
         resumed_tool_call_id=resumed_tool_call_id,
@@ -193,6 +197,72 @@ class TestWakingUp:
         assert "Friday." in prompt
 
 
+def _in_run(
+    sequence: int,
+    role: str,
+    text: str,
+    run_id: UUID,
+    metadata: dict[str, object] | None = None,
+) -> Message:
+    message = _message(sequence, role, text)
+    message.agent_run_id = run_id
+    message.metadata = metadata or {}
+    return message
+
+
+class TestQueuedMessages:
+    """A turn answers every message that is its own, not only the newest."""
+
+    async def test_a_followup_carries_everything_said_while_the_last_turn_worked(
+        self,
+    ):
+        """Three messages typed during a turn, and the follow-up answering them.
+
+        "The latest user message" answered the last of the three, and the agent
+        -- whose session never saw the other two -- had no idea they existed.
+        """
+        working, followup = uuid7(), uuid7()
+        queued = {"during_active_run": True, "steered_into_run": str(followup)}
+        messages = [
+            _in_run(1, MessageRole.USER, "Refactor the parser.", working),
+            _in_run(2, MessageRole.USER, "Keep the old API.", working, queued),
+            _in_run(3, MessageRole.USER, "And add tests.", working, queued),
+            _in_run(4, MessageRole.ASSISTANT, "Parser refactored.", working),
+        ]
+
+        prompt = _user_prompt(
+            carries_history=False, messages=messages, agent_run_id=followup
+        )
+
+        assert "Keep the old API." in prompt
+        assert "And add tests." in prompt
+        assert prompt.index("Keep the old API.") < prompt.index("And add tests.")
+        # The session already has the turn those were queued behind.
+        assert "Refactor the parser." not in prompt
+        assert "Parser refactored." not in prompt
+
+    async def test_a_message_that_joined_before_dispatch_goes_with_the_first(self):
+        """Two quick bubbles: the second joined the run before it went out."""
+        run = uuid7()
+        messages = [
+            _in_run(1, MessageRole.USER, "Here is the log:", run),
+            _in_run(
+                2,
+                MessageRole.USER,
+                "why does it fail?",
+                run,
+                {"during_active_run": True},
+            ),
+        ]
+
+        prompt = _user_prompt(
+            carries_history=False, messages=messages, agent_run_id=run
+        )
+
+        assert "Here is the log:" in prompt
+        assert "why does it fail?" in prompt
+
+
 class TestCredentials:
     async def test_the_payload_never_carries_runtime_credentials(self):
         """This payload's destination is somebody's laptop."""
@@ -207,6 +277,132 @@ class TestCredentials:
         )
 
         assert "runtime_credentials" not in payload
+
+    async def test_the_host_agent_is_given_the_users_lemma_identity(self):
+        """Distinct from the assertion above, and deliberately so.
+
+        `runtime_credentials` are the model provider's keys and have no
+        business on somebody's laptop. The Lemma environment is the opposite
+        case: it is the same run-scoped, pod-scoped delegated session the
+        sandbox agent already receives, and without it every `lemma` command
+        the skills instruct a host agent to run has no credential at all.
+        """
+        from app.modules.agent.infrastructure.harnesses.remote_payload import (
+            host_agent_environment,
+        )
+
+        # The real shape `get_env_vars` returns for a sandbox.
+        delivered = host_agent_environment(
+            {
+                "LEMMA_TOKEN": "a-delegated-session",
+                "LEMMA_BASE_URL": "http://app.lemma.localhost:53664",
+                "LEMMA_AUTH_URL": "http://app.lemma.localhost:53663/auth",
+                "LEMMA_HOST_ORIGIN": "http://app.lemma.localhost:53663",
+                "LEMMA_USER_ID": "user-1",
+                "LEMMA_POD_ID": "pod-1",
+                "LEMMA_ORG_ID": "org-1",
+                "LEMMA_WORKSPACE_URL": "http://sandbox.internal:8080",
+            }
+        )
+
+        assert delivered["LEMMA_TOKEN"] == "a-delegated-session"
+        assert delivered["LEMMA_USER_ID"] == "user-1"
+        assert delivered["LEMMA_POD_ID"] == "pod-1"
+        assert delivered["LEMMA_ORG_ID"] == "org-1"
+        # Addresses the cloud sandbox. A host agent that believed it would be
+        # pointed at a filesystem that is not the folder it was bound to.
+        assert "LEMMA_WORKSPACE_URL" not in delivered
+
+    async def test_a_new_sandbox_variable_does_not_leave_the_sandbox(self):
+        """The allowlist is why this is a decision rather than an accident."""
+        from app.modules.agent.infrastructure.harnesses.remote_payload import (
+            host_agent_environment,
+        )
+
+        delivered = host_agent_environment(
+            {"LEMMA_TOKEN": "t", "LEMMA_SOMETHING_ADDED_LATER": "leaked"}
+        )
+
+        assert delivered["LEMMA_TOKEN"] == "t"
+        assert "LEMMA_SOMETHING_ADDED_LATER" not in delivered
+
+    async def test_a_desktop_host_agent_is_given_addresses_this_machine_resolves(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """Against the URLs the Desktop host pack really emits.
+
+        A sandbox reaches the backend through `host.lemma.internal`, which only
+        guestd's containers resolve; the host agent runs on the Mac. The
+        earlier test above passes a sandbox environment that happens to work
+        from both, which is how the host agent came to be handed an address
+        its CLI could not resolve. This one reads the host pack's own output,
+        pinned by `desktop/contracts/host-pack-urls.json` and the Rust test
+        that keeps that file equal to the manifest.
+        """
+        from app.core.config import settings
+        from app.modules.agent.infrastructure.harnesses.remote_payload import (
+            host_agent_environment,
+        )
+        from app.modules.workspace.config import workspace_settings
+        from app.modules.workspace.services.workspace_sandbox_service import (
+            WorkspaceSandboxService,
+        )
+
+        emitted = {
+            name: template.replace("{base}", "lemma.localhost").replace(
+                "{port}", "52502"
+            )
+            for name, template in _host_pack_urls().items()
+        }
+        for name, value in emitted.items():
+            target = (
+                workspace_settings
+                if name.startswith("WORKSPACE_CALLBACK_")
+                else settings
+            )
+            monkeypatch.setattr(target, name.lower(), value)
+        monkeypatch.setattr(settings, "cli_api_url", None)
+        monkeypatch.setattr(settings, "cli_auth_frontend_url", None)
+
+        async def mint(**_: object) -> str:
+            return "a-delegated-session"
+
+        monkeypatch.setattr(
+            "app.modules.identity.contracts.delegated_tokens.mint_delegated_token",
+            mint,
+        )
+        service = WorkspaceSandboxService()
+        try:
+            sandbox_env = await service.get_env_vars(
+                user_id=uuid7(), pod_id=uuid7(), organization_id=uuid7()
+            )
+        finally:
+            await service.close()
+        # The premise: the sandbox is given the address only it can resolve.
+        assert "host.lemma.internal" in sandbox_env["LEMMA_BASE_URL"]
+
+        delivered = host_agent_environment(sandbox_env)
+
+        assert delivered["LEMMA_TOKEN"] == "a-delegated-session"
+        assert delivered["LEMMA_BASE_URL"] == emitted["API_URL"]
+        assert delivered["LEMMA_AUTH_URL"] == emitted["AUTH_FRONTEND_URL"]
+        assert delivered["LEMMA_HOST_ORIGIN"] == emitted["FRONTEND_URL"]
+        assert not [
+            name for name, value in delivered.items() if "host.lemma.internal" in value
+        ]
+
+
+def _host_pack_urls() -> dict[str, str]:
+    """The Desktop host pack's URL environment, from the contract Rust pins."""
+    for parent in Path(__file__).resolve().parents:
+        candidate = parent / "desktop" / "contracts" / "host-pack-urls.json"
+        if candidate.exists():
+            return json.loads(candidate.read_text())["backend_env"]
+    raise AssertionError(
+        "desktop/contracts/host-pack-urls.json was not found; the backend and "
+        "the desktop app must be checked out together to test the host agent's "
+        "addresses against what the host pack emits"
+    )
 
 
 def _system_prompt(*, toolsets: list[AgentToolset] | None = None) -> str:
@@ -427,3 +623,153 @@ class TestExportedToolNames:
         # "lemma_ping_tool" is not repeated: it is already in the list from the
         # toolset itself.
         assert names == ["lemma_ping_tool", "lemma_final_answer"]
+
+
+class TestReplayedHistory:
+    """What a non-resuming turn re-sends, and what it must not."""
+
+    def test_lemmas_own_instructions_are_not_replayed_as_the_users_words(self):
+        """The override paragraph is why agents echoed it back at the user.
+
+        Everything `_render_history` builds is concatenated into one user turn
+        -- the ACP layer merges system framing, history and the new message
+        into a single text block -- so a replayed tool result is not on a tool
+        channel by the time the model reads it. A paragraph of Lemma
+        instructions addressed to the reader, arriving inside a user turn on
+        every non-resuming turn, reads as something the user typed.
+        """
+        from app.modules.agent.infrastructure.harnesses.remote_payload import (
+            _history_tool_result,
+        )
+        from app.modules.agent.tools.skills.pydantic_adapter import (
+            LOCAL_WORKSPACE_SKILL_OVERRIDE,
+            LOCAL_WORKSPACE_SKILL_OVERRIDE_MARKER,
+        )
+
+        stored = {
+            "success": True,
+            "name": "lemma-user",
+            "content": "# Lemma User\n\nReal skill body."
+            + LOCAL_WORKSPACE_SKILL_OVERRIDE,
+        }
+
+        replayed = _history_tool_result(stored)
+
+        assert LOCAL_WORKSPACE_SKILL_OVERRIDE_MARKER not in replayed
+        assert "lemma_exec_command" not in replayed
+        # The skill itself still has to survive: the agent loaded it for a
+        # reason, and stripping the whole result would lose the reason.
+        assert "Real skill body." in replayed
+        assert "lemma-user" in replayed
+
+    def test_the_override_is_stripped_when_the_skill_stayed_encoded(self):
+        """A result `unwrap_mcp_content` could not unwrap is double-encoded.
+
+        More than one content block keeps the skill as JSON text inside a text
+        block, so the paragraph is escaped by the tool and again on replay. The
+        single-escaped needle missed it, on the path it most needed removing.
+        """
+        import json as _json
+
+        from app.modules.agent.infrastructure.harnesses.remote_payload import (
+            _history_tool_result,
+        )
+        from app.modules.agent.tools.skills.pydantic_adapter import (
+            LOCAL_WORKSPACE_SKILL_OVERRIDE,
+            LOCAL_WORKSPACE_SKILL_OVERRIDE_MARKER,
+        )
+
+        skill = {
+            "name": "lemma-user",
+            "content": "Body." + LOCAL_WORKSPACE_SKILL_OVERRIDE,
+        }
+        envelope = {
+            "content": [
+                {"type": "text", "text": _json.dumps(skill)},
+                {"type": "text", "text": "a second block"},
+            ]
+        }
+
+        replayed = _history_tool_result(envelope)
+
+        assert LOCAL_WORKSPACE_SKILL_OVERRIDE_MARKER not in replayed
+        assert "Body." in replayed
+
+    def test_an_ordinary_tool_result_is_untouched(self):
+        from app.modules.agent.infrastructure.harnesses.remote_payload import (
+            _history_tool_result,
+        )
+
+        stored = {"rows": [{"id": 1, "name": "a"}], "count": 1}
+        replayed = _history_tool_result(stored)
+
+        assert '"count": 1' in replayed
+        assert '"name": "a"' in replayed
+
+
+class TestTheAgentsOwnCli:
+    """What a coding agent on the Mac is told about `lemma`."""
+
+    async def _payload(self, cli: str | None):
+        from app.modules.agent.infrastructure.harnesses.remote_payload import (
+            mcp_payload,
+        )
+        from app.modules.workspace.contracts.tooling import WorkspaceSandboxService
+
+        class Workspace:
+            """The sandbox environment, without the pod row it is read from."""
+
+            async def get_env_vars(self, **kwargs: object) -> dict[str, str]:
+                return {
+                    "LEMMA_TOKEN": "a-delegated-session",
+                    "LEMMA_CONVERSATION_ID": str(kwargs["conversation_id"]),
+                }
+
+            async def close(self) -> None:
+                return None
+
+        conversation_id = uuid7()
+        return conversation_id, await mcp_payload(
+            agent_run_id=uuid7(),
+            conversation_id=conversation_id,
+            ctx=_ctx(),
+            options=HarnessOptions(model_name="gpt-5.1", toolsets=[]),
+            workspace_service=cast(WorkspaceSandboxService, Workspace()),
+            cli_root=lambda: cli,
+        )
+
+    async def test_the_cli_this_release_ships_is_named_and_the_conversation_given(
+        self,
+    ) -> None:
+        conversation_id, payload = await self._payload(
+            "/Lemma/runtime/releases/1/local-runtime/backend"
+        )
+
+        assert payload["lemma_cli"] == "/Lemma/runtime/releases/1/local-runtime/backend"
+        environment = payload["environment"]
+        assert isinstance(environment, dict)
+        assert environment["LEMMA_CONVERSATION_ID"] == str(conversation_id)
+
+    async def test_without_one_nothing_is_named(self) -> None:
+        _, payload = await self._payload(None)
+
+        assert "lemma_cli" not in payload
+
+
+def test_what_is_owed_rides_in_the_turn_not_the_system_prompt() -> None:
+    """Open notifications change the moment somebody answers, and the system
+    prompt is delivered once per provider session -- so they go with the turn,
+    ahead of its history."""
+    payload = run_start_payload(
+        agent=_agent(),
+        conversation=_conversation(),
+        messages=_transcript(),
+        ctx=_ctx(),
+        agent_run_id=uuid7(),
+        runtime_instructions="",
+        carries_history=True,
+        open_notifications="# Open notifications\nAnswer with `respond_to_notification`.",
+    )
+    prompt = payload["prompt"]
+    assert "respond_to_notification" in str(prompt["user_prompt"])
+    assert "respond_to_notification" not in str(prompt["system_prompt"])

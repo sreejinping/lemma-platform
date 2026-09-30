@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 from uuid import uuid4
 
+from harness.connector_credentials import credential_matching, credential_schema_of
 from harness.run import a_name_for
 from harness.drivers.api import items_of
 from harness.tenant import STANDING_CONNECTORS, standing_auth_config_name
@@ -335,7 +336,7 @@ class BuildingSteps:
 
     async def is_refused_running_function(
         self, name: str, *, with_input: JSON, in_pod: JSON
-    ) -> int:
+    ) -> str:
         response = await self.api.call(
             "POST",
             f"/pods/{in_pod['id']}/functions/{name}/runs",
@@ -346,7 +347,7 @@ class BuildingSteps:
                 f"{self.label} was expected to be refused running {name!r}, "
                 f"but it was accepted ({response.status_code})"
             )
-        return response.status_code
+        return response.text
 
     async def runs_of_function(self, name: str, *, in_pod: JSON) -> list[JSON]:
         return items_of(await self.api.get(f"/pods/{in_pod['id']}/functions/{name}/runs"))
@@ -589,6 +590,17 @@ class BuildingSteps:
             what=f"{self.label} connecting an account",
             json=body,
         )
+
+    async def credential_for(self, auth_config: JSON, *, holding: str) -> JSON:
+        """A credential this install's connector accepts, carrying ``holding``.
+
+        Asked of the catalogue, because the shape is the connector kind's: an
+        HTTP connector spends ``access_token``, Telegram requires ``bot_token``
+        and refuses anything else. See `harness.connector_credentials`.
+        """
+        connector = await self.opens_connector(str(auth_config["connector_id"]))
+        schema = credential_schema_of(connector, auth_config.get("kind"))
+        return credential_matching(schema, holding)
 
     async def accounts_in(self, organization: JSON) -> list[JSON]:
         return items_of(

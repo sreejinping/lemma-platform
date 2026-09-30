@@ -1,110 +1,6 @@
 use super::*;
-// The Agent Host's teardown, reused rather than rewritten: it already knows how
-// to stop a tree on both platforms, and there is only one right way to do it.
-use crate::agent_host::terminate_process_tree;
 
 impl Daemon {
-    pub(super) fn start_daemon_shutdown(
-        self: &Arc<Self>,
-        id: Option<Value>,
-        client: mpsc::SyncSender<String>,
-    ) {
-        if self.shutdown_running.swap(true, Ordering::AcqRel) {
-            self.send_direct(
-                &client,
-                error_event(
-                    "shutdown-in-progress",
-                    "the local daemon is already stopping",
-                    id.as_ref(),
-                ),
-            );
-            return;
-        }
-        self.lifecycle.request_shutdown();
-        self.agent_lifecycle.request_shutdown();
-        if let Some(manager) = self.host_processes.as_ref() {
-            manager.request_stop();
-        }
-        if let Some(runtime) = self.managed_runtime.as_ref() {
-            runtime.cancel_pending_requests();
-        }
-        self.send_direct(
-            &client,
-            json!({
-                "v": PROTOCOL_VERSION, "event": "ack",
-                "cmd": "shutdown-daemon", "id": id.as_ref(),
-            }),
-        );
-        let daemon = Arc::clone(self);
-        thread::spawn(move || {
-            daemon.broadcast(json!({
-                "v": PROTOCOL_VERSION, "event": "phase", "key": "stopping",
-                "label": "Stopping Lemma", "progress": 0,
-                "detail": "Waiting for the current operation to reach a safe stopping point",
-                "operation_id": id.as_ref(),
-            }));
-            daemon.lifecycle.wait_idle();
-            daemon.agent_lifecycle.wait_idle();
-            let mut failure = None;
-            if let Some(sharing) = daemon.sharing.as_ref() {
-                sharing.force_disable();
-            }
-            if let Some(manager) = daemon.host_processes.as_ref() {
-                if let Err(error) = manager.stop_all() {
-                    failure = Some(error.to_string());
-                }
-            }
-            if let Err(error) = daemon.agent_host.suspend() {
-                failure.get_or_insert_with(|| error.to_string());
-            }
-            if let Some(runtime) = daemon.managed_runtime.as_ref() {
-                if let Err(error) = runtime.shutdown() {
-                    failure.get_or_insert_with(|| error.to_string());
-                }
-            }
-            // Taken out under the lock; killed and reaped outside it. `wait`
-            // blocks until the process is gone, and every client thread that
-            // wants the supervisor takes this same lock.
-            let taken = daemon
-                .supervisor
-                .lock()
-                .expect("supervisor lock poisoned")
-                .take();
-            if let Some(mut supervisor) = taken {
-                // The tree, not the leader. `uv run ... lemma-stack supervise`
-                // is uv, then Python, then whatever the stack started; killing
-                // only the leader left the rest running with nothing to reap
-                // them. This is the same teardown the Agent Host uses, and the
-                // spawn puts the supervisor in its own group so it can be
-                // asked for.
-                let _ = terminate_process_tree(&mut supervisor.child);
-            }
-            if let Some(message) = failure {
-                daemon.shutdown_running.store(false, Ordering::Release);
-                daemon.send_direct(
-                    &client,
-                    error_event("shutdown-failed", message, id.as_ref()),
-                );
-                return;
-            }
-            daemon.broadcast(json!({
-                "v": PROTOCOL_VERSION, "event": "state", "status": "stopped",
-                "running": false, "ready": false, "operation_id": id.as_ref(),
-            }));
-            daemon.send_direct(
-                &client,
-                json!({
-                    "v": PROTOCOL_VERSION, "event": "done",
-                    "cmd": "shutdown-daemon", "id": id.as_ref(), "ok": true,
-                }),
-            );
-            // Give the authenticated client writer a moment to flush the
-            // acknowledgement before ending this dedicated daemon process.
-            thread::sleep(std::time::Duration::from_millis(100));
-            std::process::exit(0);
-        });
-    }
-
     pub(super) fn start_host_operation(
         self: &Arc<Self>,
         command: String,
@@ -130,10 +26,15 @@ impl Daemon {
 
         let daemon = Arc::clone(self);
         thread::spawn(move || {
+            // Released however this thread ends -- see `lifecycle::Finish`.
+            let _finish = daemon.lifecycle.finish_on_drop();
+            // Only reached from dispatch's `if let Some(manager)` arm, so the
+            // manager exists; and with the lifecycle guard above, a panic here
+            // would no longer leave admission held.
             let manager = daemon
                 .host_processes
                 .as_ref()
-                .expect("host operation requires manager");
+                .expect("dispatch routes host operations only when a manager exists");
             let result = match command.as_str() {
                 "start" => daemon.start_host_packs(manager, id.as_ref()),
                 "stop" => {
@@ -175,7 +76,7 @@ impl Daemon {
                     }));
                 }
                 Err(error) => {
-                    let message = error.to_string();
+                    let message = super::dispatch::explain_runtime_failure(error.to_string());
                     let mut event = error_event(
                         runtime_operation_error_code(&message, "host-operation-failed"),
                         message.clone(),
@@ -192,7 +93,6 @@ impl Daemon {
                     }));
                 }
             }
-            daemon.lifecycle.finish();
         });
     }
 
@@ -232,6 +132,8 @@ impl Daemon {
 
         let daemon = Arc::clone(self);
         thread::spawn(move || {
+            // Released however this thread ends -- see `lifecycle::Finish`.
+            let _finish = daemon.lifecycle.finish_on_drop();
             match runtime.prepare_host() {
                 Ok(result) => {
                     let mut prepared = json!({
@@ -254,7 +156,7 @@ impl Daemon {
                     }));
                 }
                 Err(error) => {
-                    let message = error.to_string();
+                    let message = super::dispatch::explain_runtime_failure(error.to_string());
                     daemon.broadcast(error_event(
                         runtime_operation_error_code(&message, "runtime-prepare-failed"),
                         message,
@@ -269,7 +171,6 @@ impl Daemon {
                     }));
                 }
             }
-            daemon.lifecycle.finish();
         });
     }
 
@@ -308,6 +209,7 @@ impl Daemon {
         self.lifecycle.checkpoint()?;
         manager.mark_dependency_ready();
         manager.set_backend_environment(self.backend_environment()?);
+        manager.set_frontend_environment(self.operator_config.frontend_environment()?);
         self.lifecycle.checkpoint()?;
         manager.start_all_cancellable(|component| {
             let (label, progress, detail, log_source) = match component {
@@ -394,27 +296,38 @@ impl Daemon {
             "runtime_generation": runtime_generation,
         }));
         self.announce_sandbox_images();
+        // Backup, unused images, trim: see `disk_ops`.
+        self.after_clean_start();
         Ok(())
     }
 
-    /// Say where the sandbox image stands, without fetching anything.
+    /// Fetch the sandbox images behind the workspace, or say where they stand.
     ///
-    /// After `ready`, never before it, and it no longer starts a download.
-    /// Fetching on every start spent several hundred megabytes of someone
-    /// else's connection on a capability they may never use: the coding agents
-    /// run natively on this computer, and a person using only those has no pod
-    /// workload to put in a sandbox. They still got the download, and a toast
-    /// announcing it, for something they had not asked for.
+    /// After `ready`, never before it: the workspace opens first and the
+    /// download runs behind it, with its progress in a notice.
     ///
-    /// So this reports and stops. `sandbox.prepare` is how a fetch starts now,
-    /// and Settings is where it is offered. A pod that runs something before
-    /// then still works -- `sandbox.ensure` pulls what it needs on first use,
-    /// exactly as it did before any of this existed; it is slower once.
+    /// It fetches on the first start of an install and on the first start of
+    /// a release whose images this computer does not have yet. Nearly every
+    /// conversation needs the sandbox -- the browser a coding agent drives
+    /// runs in it too -- so leaving the download to the first Wake up only
+    /// made someone wait on it at the moment they needed it. See
+    /// `claim_unasked_sandbox_image_fetch`: once per release, so a failure is
+    /// offered in Settings rather than retried on every start, and
+    /// `sandbox.ensure` still pulls what it needs on first use either way.
     ///
-    /// Both states here are terminal, because the workspace polls until it
-    /// hears an answer that cannot change; silence left it asking every two
-    /// seconds for the rest of the session.
+    /// Otherwise it reports and stops. Both states it reports are terminal,
+    /// because the workspace polls until it hears an answer that cannot
+    /// change; silence left it asking every two seconds for the rest of the
+    /// session.
     pub(super) fn announce_sandbox_images(self: &Arc<Self>) {
+        if self
+            .managed_runtime
+            .as_ref()
+            .is_some_and(|runtime| runtime.claim_unasked_sandbox_image_fetch())
+        {
+            self.warm_sandbox_images();
+            return;
+        }
         // Recorded as well as broadcast, so Settings -- which opens long after
         // this and reads the snapshot rather than the event -- is told the same
         // thing the workspace was.
@@ -449,6 +362,8 @@ impl Daemon {
                 "event": "sandbox-images",
                 "state": status.state,
                 "detail": status.detail,
+                "done_mb": status.done_mb,
+                "total_mb": status.total_mb,
             }));
         });
     }
@@ -464,6 +379,7 @@ impl Daemon {
             .ok_or_else(|| io::Error::other("host process manager is unavailable"))?;
         runtime.start()?;
         manager.set_backend_environment(self.backend_environment()?);
+        manager.set_frontend_environment(self.operator_config.frontend_environment()?);
         manager.restart_all()?;
         manager.mark_dependency_ready();
 
@@ -494,7 +410,11 @@ impl Daemon {
             .as_ref()
             .map(|runtime| runtime.backend_environment())
             .transpose()?;
-        Ok(compose_backend_environment(operator, infrastructure))
+        Ok(compose_backend_environment(
+            operator,
+            infrastructure,
+            &self.agent_host.config_path(),
+        ))
     }
 
     pub(super) fn prepare_private_infra(

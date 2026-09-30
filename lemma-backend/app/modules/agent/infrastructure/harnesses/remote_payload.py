@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+
 import base64
 import binascii
 import json
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from datetime import datetime, timezone
 from uuid import UUID
 
@@ -17,12 +19,16 @@ from sandbox_runtime.paths import WORKSPACE_ROOT
 from app.modules.agent.infrastructure.harnesses.pydantic_ai_history import (
     user_prompt_text,
 )
+from app.modules.workspace.contracts.host_execution import (
+    host_cli_root,
+    host_reachable_addresses,
+)
 from app.modules.workspace.contracts.tooling import WorkspaceSandboxService
-from app.core.config import settings
 from app.modules.agent.domain.context import AgentContext
 from app.modules.agent.services.runtime_model_factory import provider_model_settings
 from app.modules.agent.domain.entities import Agent, Conversation, Message
 from app.modules.agent.domain.prompts import build_agent_instructions
+from app.modules.agent.domain.queued_messages import STEERED_INTO_RUN
 from app.modules.agent.domain.runtime_notes import prepend_runtime_notes
 from app.modules.agent.domain.harness_options import HarnessOptions
 from app.modules.agent.domain.value_objects import (
@@ -41,6 +47,54 @@ from app.modules.agent.tools.final_answer.final_answer_toolset import (
 )
 
 
+from app.modules.agent.tools.skills.pydantic_adapter import (
+    LOCAL_WORKSPACE_SKILL_OVERRIDE_MARKER,
+    SKILL_RUNTIME_OVERRIDES,
+)
+
+#: What a host agent is given of the user's Lemma identity. An allowlist rather
+#: than "whatever `get_env_vars` returned", so a sandbox-only variable added
+#: later does not silently start leaving the sandbox.
+_HOST_AGENT_ENVIRONMENT = frozenset(
+    {
+        "LEMMA_TOKEN",
+        "LEMMA_BASE_URL",
+        "LEMMA_AUTH_URL",
+        "LEMMA_HOST_ORIGIN",
+        "LEMMA_USER_ID",
+        "LEMMA_POD_ID",
+        "LEMMA_ORG_ID",
+        "LEMMA_CONVERSATION_ID",
+    }
+)
+
+
+def host_agent_environment(workspace_env: Mapping[str, str]) -> dict[str, str]:
+    """The identity a host agent is given, out of a sandbox's environment.
+
+    The same delegated session the sandbox gets, for an agent that runs on the
+    user's own machine instead. `LEMMA_WORKSPACE_URL` is deliberately not among
+    them: it addresses the cloud sandbox, and a host agent that believed it
+    would be pointed at a filesystem that is not the folder it was bound to.
+
+    The addresses are replaced, not copied. A sandbox's are chosen for the
+    sandbox's network -- on Desktop `host.lemma.internal`, which only the
+    guest's containers can resolve -- and a host agent needs the ones this
+    machine can reach.
+    """
+    identity = {
+        name: value
+        for name, value in workspace_env.items()
+        if name in _HOST_AGENT_ENVIRONMENT
+    }
+    return identity | _host_addresses()
+
+
+def _host_addresses() -> dict[str, str]:
+    """Where the backend is reachable from the machine the host agent runs on."""
+    return host_reachable_addresses()
+
+
 def run_start_payload(
     *,
     agent: Agent,
@@ -51,8 +105,14 @@ def run_start_payload(
     runtime_instructions: str,
     carries_history: bool,
     resumed_tool_call_id: str | None = None,
+    open_notifications: str | None = None,
 ) -> JsonObject:
     """Everything one dispatched run needs, and nothing it does not.
+
+    ``open_notifications`` is what this person still owes an answer to, as the
+    in-process harness's capability renders it. It rides in the turn's prompt,
+    not the system prompt: it changes the moment somebody answers, and the
+    system prompt is delivered once per provider session.
 
     ``carries_history`` is set when the run is not even going to try to resume a
     provider session, so the prompt has to bring the conversation with it, and
@@ -74,9 +134,11 @@ def run_start_payload(
                 messages,
                 carries_history=carries_history,
                 resumed_tool_call_id=resumed_tool_call_id,
+                agent_run_id=agent_run_id,
             ),
             ctx=ctx,
             runtime_instructions=runtime_instructions,
+            open_notifications=open_notifications,
         ),
         "agent": agent.model_dump(mode="json"),
         "conversation": conversation.model_dump(
@@ -94,8 +156,16 @@ async def mcp_payload[DepsT: AgentContext](
     options: HarnessOptions[DepsT],
     prompt: str | None = None,
     extra_tool_names: Sequence[str] = (),
+    workspace_service: WorkspaceSandboxService | None = None,
+    cli_root: Callable[[], str | None] = host_cli_root,
 ) -> JsonObject:
-    """Build the MCP endpoint the host's bridge will call back on.
+    """Build what the host's MCP bridge needs to relay the agent's Lemma tools.
+
+    There is no URL in it. The bridge sends every tool call up the host's link
+    as an ``mcp`` frame carrying ``conversation_id`` and ``token``, and Lemma
+    re-authorizes that pair on every call; see ``agent_host_link_mcp``. A
+    conversation MCP mount used to be the other end of an HTTP URL here, and the
+    Agent Host was its only caller.
 
     ``token_expires_at`` is part of the payload because the credential inside it
     is minted once, encrypted into START_RUN once, and then used verbatim by a
@@ -104,7 +174,7 @@ async def mcp_payload[DepsT: AgentContext](
     returning 401, which the agent experiences as its tools quietly vanishing.
     Publishing the real expiry lets the dispatcher bound the run by it instead.
     """
-    workspace_service = WorkspaceSandboxService()
+    workspace_service = workspace_service or WorkspaceSandboxService()
     try:
         workspace_env = await workspace_service.get_env_vars(
             user_id=ctx.user_id,
@@ -115,17 +185,15 @@ async def mcp_payload[DepsT: AgentContext](
             workload_name=ctx.agent_name,
             scope=getattr(ctx, "scope", None),
             session_id=str(agent_run_id),
+            conversation_id=conversation_id,
         )
         token = workspace_env["LEMMA_TOKEN"]
+        agent_environment = host_agent_environment(workspace_env)
     finally:
         await workspace_service.close()
-    return {
+    payload: JsonObject = {
+        "environment": agent_environment,
         "server_name": LEMMA_MCP_SERVER_NAME,
-        "url": (
-            f"{settings.api_url.rstrip('/')}/agent-runtime/conversations/"
-            f"{conversation_id}/mcp"
-        ),
-        "authorization": f"Bearer {token}",
         "token": token,
         "token_expires_at": _token_expiry_iso(token),
         "run_id": str(agent_run_id),
@@ -142,6 +210,12 @@ async def mcp_payload[DepsT: AgentContext](
             extra_names=extra_tool_names,
         ),
     }
+    # This release's own `lemma`, for an agent on the same Mac as this backend:
+    # the host puts its `bin/` first on the agent's PATH if it accepts it.
+    cli = cli_root()
+    if cli is not None:
+        payload["lemma_cli"] = cli
+    return payload
 
 
 def token_expires_at(mcp: JsonObject) -> datetime | None:
@@ -225,6 +299,7 @@ def _prompt_payload(
     messages: Sequence[Message],
     ctx: AgentContext,
     runtime_instructions: str,
+    open_notifications: str | None = None,
 ) -> JsonObject:
     sections: list[str] = []
     instructions = build_agent_instructions(
@@ -244,8 +319,11 @@ def _prompt_payload(
     # No output_schema/structured keys: nothing downstream reads them. The run
     # spec carries only system_prompt + user_prompt, and the schema reaches the
     # agent as the `lemma_final_answer` tool's inputSchema over MCP.
+    history = _render_history(messages)
+    if open_notifications:
+        history = open_notifications + ("\n\n" + history if history else "")
     return {
-        "user_prompt": prepend_runtime_notes(_render_history(messages)),
+        "user_prompt": prepend_runtime_notes(history),
         "system_prompt": "\n\n".join(section for section in sections if section),
     }
 
@@ -255,6 +333,7 @@ def _turn_messages(
     *,
     carries_history: bool,
     resumed_tool_call_id: str | None = None,
+    agent_run_id: UUID | None = None,
 ) -> list[Message]:
     """The messages this prompt has to carry.
 
@@ -277,10 +356,29 @@ def _turn_messages(
     start of. This costs nothing in the usual case, because a resumable harness
     only lacks a stored session on a conversation's first turn, where there is
     no history to send.
+
+    And a turn answers every message that is its own, not only the newest: the
+    one that started it, any that arrived before it was dispatched, and -- for
+    a follow-up turn -- everything the person said while the previous turn was
+    working, which the follow-up claims (``steered_into_run``). "The latest
+    user message" alone answered the last of three and dropped the other two on
+    a session that had never seen them.
     """
     ordered = sorted(messages, key=lambda item: item.sequence)
     if carries_history:
         return ordered
+    if agent_run_id is not None:
+        answering = [
+            message
+            for message in ordered
+            if message.role == MessageRole.USER
+            and (
+                message.agent_run_id == agent_run_id
+                or (message.metadata or {}).get(STEERED_INTO_RUN) == str(agent_run_id)
+            )
+        ]
+        if answering:
+            return answering
     if resumed_tool_call_id is not None:
         resumed = [
             message
@@ -374,6 +472,55 @@ def _user_turn_text(message: Message) -> str:
     return body
 
 
+def steer_prompt(message: Message) -> list[JsonObject]:
+    """A message sent mid-turn, as the ACP content a ``STEER_RUN`` carries.
+
+    The same text a turn that started with this message would have carried, so
+    a steered message reads to the agent exactly as a prompted one does --
+    sender, quoted reply, attachments and all.
+    """
+    return [{"type": "text", "text": _user_turn_text(message)}]
+
+
+def _history_tool_result(result: object) -> str:
+    """One tool return, as it appears in a replayed transcript.
+
+    Everything `_render_history` produces ends up concatenated into a single
+    user turn -- the ACP layer merges system framing, history and the new
+    message into one text block -- so a tool result is not on a tool channel by
+    the time a model reads it. It reads as something the user typed.
+
+    That is tolerable for data. It is not tolerable for Lemma's own
+    instructions to the agent: `load_skill` appends a "Local Lemma Workspace
+    Override" paragraph addressed to the reader, and replaying it inside a user
+    turn on every non-resuming turn is why agents echoed it back into their
+    replies. The agent already acted on it when the tool returned; it does not
+    need it again, and it must not receive it as the user's words.
+    """
+    rendered = json.dumps(to_json_value(result), indent=2)
+    if LOCAL_WORKSPACE_SKILL_OVERRIDE_MARKER not in rendered:
+        return rendered
+    # Every depth it can be stored at. A result `unwrap_mcp_content` could not
+    # unwrap -- more than one content block, say -- keeps the skill as JSON text
+    # inside a text block, so the paragraph is escaped once by the tool and
+    # again by the `json.dumps` above. Matching only the single-escaped form
+    # left it in, on exactly the path it most needed removing from.
+    for override in SKILL_RUNTIME_OVERRIDES:
+        for encoded in _encodings_of(override, depth=3):
+            rendered = rendered.replace(encoded, "")
+    return rendered
+
+
+def _encodings_of(text: str, *, depth: int) -> list[str]:
+    """`text` as it reads after 1..depth rounds of JSON string escaping."""
+    forms = []
+    for _ in range(depth):
+        text = json.dumps(text)[1:-1]
+        forms.append(text)
+    # Deepest first, so a shallower form cannot match inside a deeper one.
+    return forms[::-1]
+
+
 def _message_text(message: Message) -> str:
     if message.kind == MessageKind.TOOL_CALL:
         body = (
@@ -384,7 +531,7 @@ def _message_text(message: Message) -> str:
         body = (
             f"Tool result {message.tool_name or 'unknown_tool'}"
             f"({message.tool_call_id}):\n"
-            f"{json.dumps(to_json_value(message.tool_result), indent=2)}"
+            f"{_history_tool_result(message.tool_result)}"
         )
     elif message.role == MessageRole.USER:
         return _user_turn_text(message)

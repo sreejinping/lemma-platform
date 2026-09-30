@@ -2,9 +2,10 @@
 
 use super::{
     AcceptOutcome, Arc, AtomicBool, CANCEL_KILL_AFTER, Command, CommandKind, CommandRejection,
-    JournalCallbacks, PermissionDecision, RejectionCode, RunSpec, RunState, StreamSegments,
-    TargetWorker, Utc, Value, redact_error, short_revision, terminal_failure,
+    JournalCallbacks, PermissionDecision, RejectionCode, RunSpec, RunState, Steer, StreamSegments,
+    TargetWorker, Value, redact_error, short_revision, terminal_failure,
 };
+use crate::protocol::SteerRunPayload;
 
 /// Why a command was refused, decided where the refusal happens.
 ///
@@ -108,7 +109,10 @@ pub(crate) fn command_rejection(
 
 impl TargetWorker {
     pub(crate) fn handle_command(&mut self, command: &Command) -> anyhow::Result<()> {
-        if command.expires_at < Utc::now() {
+        // Judged by Lemma's clock, which set the expiry: this one can be
+        // minutes out. And never for a cancel -- stopping late is still
+        // stopping, and refusing it leaves the run going.
+        if command.kind != CommandKind::CancelRun && command.expires_at < self.lemma_now() {
             return Err(refuse(RefusedBecause::CommandExpired, "command is expired"));
         }
         match command.kind {
@@ -116,7 +120,41 @@ impl TargetWorker {
             CommandKind::CancelRun => self.handle_cancel(command),
             CommandKind::ResolvePermission => self.handle_resolve_permission(command),
             CommandKind::RefreshCredential => self.handle_refresh_credential(command),
+            CommandKind::SteerRun => self.handle_steer(command),
         }
+    }
+
+    /// Hand a message to the turn still running for it.
+    ///
+    /// Delivery is the turn's job, not this one's: the run's driver sends it
+    /// once its prompt is out and reports what the agent said. A run already
+    /// gone has no turn to add to, which is expected rather than an error --
+    /// Lemma's follow-up turn carries the message instead.
+    pub(crate) fn handle_steer(&mut self, command: &Command) -> anyhow::Result<()> {
+        self.journal
+            .record_simple_command(self.target.target_id, command)?;
+        let run_id = command
+            .run_id
+            .ok_or_else(|| anyhow::anyhow!("steer command has no run ID"))?;
+        let payload: SteerRunPayload = serde_json::from_value(command.payload.clone())?;
+        // Fenced like a credential refresh: a steer minted for a dispatch that
+        // has since been superseded is not for the turn running now.
+        let current_epoch = self
+            .journal
+            .get_run(self.target.target_id, run_id)?
+            .map(|run| run.lease_epoch);
+        if current_epoch.is_none() || current_epoch != command.lease_epoch {
+            tracing::debug!(%run_id, "steer is for a run or lease this host is not running");
+            return Ok(());
+        }
+        let Some(active) = self.active_runs.get(&run_id) else {
+            tracing::debug!(%run_id, "no running turn to steer");
+            return Ok(());
+        };
+        if active.steer.send(Steer::from_payload(&payload)).is_err() {
+            tracing::debug!(%run_id, "the run's turn already ended; not steered");
+        }
+        Ok(())
     }
 
     /// Take a replacement Lemma MCP credential for a run still in flight.
@@ -143,6 +181,22 @@ impl TargetWorker {
             .refresh_run_mcp(self.target.target_id, run_id, lease_epoch, mcp)?
         {
             tracing::debug!(%run_id, "refreshed the run's Lemma MCP credential");
+            // The bridge re-reads the journal, but the agent process cannot
+            // have its environment rewritten after spawn. The token file is
+            // the one copy a running agent can pick a new credential up from,
+            // so a refresh that did not rewrite it would leave the agent's own
+            // `lemma` commands failing while its MCP tools kept working.
+            //
+            // Through the run's own credential, so it is refused once the run
+            // has retired it. Journal state is not enough: an aborted run is
+            // not terminal there until `reap_finished`, and a bare write in
+            // that gap left a credential on disk that nothing would remove.
+            if let Some(token) = mcp.get("token").and_then(serde_json::Value::as_str)
+                && let Some(active) = self.active_runs.get(&run_id)
+                && let Err(error) = active.credential.write(token)
+            {
+                tracing::warn!(%run_id, %error, "could not rewrite the run credential file");
+            }
         }
         Ok(())
     }
@@ -180,6 +234,7 @@ impl TargetWorker {
             // between fails exactly like this one. The refresh reschedules
             // itself on the normal interval, so this cannot compound.
             self.refresh_due = std::time::Instant::now();
+            self.force_probe = true;
             // Both revisions in the detail, not only in this log line. The
             // detail is what reaches Lemma on the rejection and is stored with
             // the command, and "how far behind was it?" is the first question
@@ -401,7 +456,7 @@ impl TargetWorker {
                 provider_seen: AtomicBool::new(true),
                 dispatched: AtomicBool::new(true),
                 stream_segments: std::sync::Mutex::new(segments),
-                events_ready: Arc::clone(&self.events_ready),
+                events_ready: self.events_ready.clone(),
             }
             .flush_stream_segments()?;
             if run.prompt_dispatched {

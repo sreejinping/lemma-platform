@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from uuid import UUID
 from app.core.infrastructure.db.uow import SqlAlchemyUnitOfWork
 from app.modules.agent_surfaces.domain.entities import SurfacePlatform
@@ -45,7 +46,11 @@ from app.modules.identity.contracts.surfaces import (
     set_user_preferences,
     user_preferences,
 )
-from app.modules.pod.contracts.personal_workspace import create_named_workspace
+from app.modules.pod.contracts.members import pod_name
+from app.modules.pod.contracts.personal_workspace import (
+    PodLimitReachedError,
+    create_named_workspace,
+)
 
 
 from app.modules.agent_surfaces.domain.onboarding_state import (
@@ -84,9 +89,18 @@ class WorkspaceChoiceAsked(ChallengeRejected):
     """
 
 
+@dataclass(frozen=True, slots=True)
+class OnboardingOutcome:
+    """How provisioning ended, as far as the confirmation needs to know."""
+
+    waiting_on_an_admin: bool = False
+    #: The pod an accepted invitation brought them into, for the reply to name.
+    invited_pod_name: str | None = None
+
+
 async def complete_onboarding_workspace(
     uows: UnitOfWorkFactory, transport: OnboardingTransport, state: PendingState
-) -> bool:
+) -> OnboardingOutcome:
     assert state.user_id is not None
     try:
         return await _provision_and_bind(uows, transport, state)
@@ -137,7 +151,7 @@ async def _park_on_another_workspace(
 
 async def _provision_and_bind(
     uows: UnitOfWorkFactory, transport: OnboardingTransport, state: PendingState
-) -> bool:
+) -> OnboardingOutcome:
     assert state.user_id is not None
     workspace = await ensure_chat_workspace(
         uows,
@@ -152,7 +166,7 @@ async def _provision_and_bind(
         assert pending is not None
         if workspace.status == "organization_access_required":
             pending.step = OnboardingStep.ORGANIZATION_ACCESS_REQUIRED
-            return True
+            return OnboardingOutcome(waiting_on_an_admin=True)
         assert workspace.pod_id is not None and workspace.assistant_id is not None
         if transport.surface is not None:
             # The destination goes on the identity row, which by now exists:
@@ -177,7 +191,11 @@ async def _provision_and_bind(
         if pending.ready_at is None:
             pending.ready_at = datetime.now(timezone.utc)
             uow.collect_events([SurfaceOnboardingReadyEvent(pending_id=pending.id)])
-    return False
+        if workspace.entry == "invitation":
+            return OnboardingOutcome(
+                invited_pod_name=await pod_name(uow.session, workspace.pod_id)
+            )
+    return OnboardingOutcome()
 
 
 async def record_verified_identity(
@@ -376,12 +394,15 @@ async def attach_chosen_workspace(
                     "That account is not in any Lemma organization yet, so there "
                     "is nowhere to put a workspace. Ask your admin to add you."
                 )
-            made = await create_named_workspace(
-                uow,
-                organization_id=organization_id,
-                owner_user_id=user.id,
-                name=choice.new_name,
-            )
+            try:
+                made = await create_named_workspace(
+                    uow,
+                    organization_id=organization_id,
+                    owner_user_id=user.id,
+                    name=choice.new_name,
+                )
+            except PodLimitReachedError as refused:
+                return refused.message
             pod_id = made.pod_id
         else:
             # Re-proving membership rather than trusting the stored list: the

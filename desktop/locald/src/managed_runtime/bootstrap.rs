@@ -118,9 +118,11 @@ impl ManagedRuntimeBootstrap {
             clock_keeper: Mutex::new(None),
             last_clock_error: Mutex::new(None),
             sandbox_images: Mutex::new(SandboxImageStatus::default()),
+            prepared_images: paths.root.join("sandbox-images.json"),
             pending_auth: Mutex::new(None),
             pending_images: Mutex::new(None),
             cancellation: lemma_desktop_process::Cancellation::default(),
+            host_loopback: HostLoopbackState::default(),
         }))
     }
 }
@@ -260,7 +262,7 @@ impl ManagedRuntimeController {
         };
         let capability_file = runtime_path_value(self.runtime.capability_file())?;
         let control_socket = runtime_path_value(self.runtime.control_socket())?;
-        Ok(HashMap::from([
+        let environment = HashMap::from([
             (
                 "DATABASE_URL".into(),
                 format!(
@@ -296,6 +298,20 @@ impl ManagedRuntimeController {
                 "LEMMA_WSL_DISTRIBUTION".into(),
                 self.runtime.wsl_distribution().into(),
             ),
-        ]))
+        ]);
+        // Sandbox ports over vsock rather than the guest's address, which macOS
+        // gates behind a Local Network permission the backend -- a background
+        // process whose executable changes every release -- is never prompted
+        // for. Windows reaches its WSL guest over localhost and needs none.
+        #[cfg(target_os = "macos")]
+        let environment = {
+            let mut environment = environment;
+            environment.insert(
+                "WORKSPACE_LOCAL_TUNNEL_SOCKET".into(),
+                runtime_path_value(&self.runtime.sandbox_tunnel_socket())?,
+            );
+            environment
+        };
+        Ok(environment)
     }
 }

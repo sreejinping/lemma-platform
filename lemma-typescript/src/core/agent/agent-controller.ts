@@ -99,6 +99,17 @@ export interface AgentControllerOptions {
   /** The conversation was renamed mid-stream by the server's title generator. */
   onTitle?: (title: string, conversationId: string | null) => void;
   onError?: (error: unknown) => void;
+  /**
+   * Something the runtime wants the person to read, which is not an error and
+   * not a run status: a model the harness no longer offers, a provider session
+   * that was lost and restarted, an image that could not be saved.
+   *
+   * A host writes these with a human sentence in them and the backend forwards
+   * them; nothing consumed them, so they were written and dropped. Delivered
+   * separately from `onError` because the run is fine -- a consumer should show
+   * these and carry on.
+   */
+  onNotice?: (notice: string, kind: string | undefined) => void;
 }
 
 /** Derived, render-ready outputs computed from a session snapshot. */
@@ -646,6 +657,9 @@ export class AgentController {
     // Set where the buffer is cleared, read where the turn is reconciled.
     let unclaimedAnswer = false;
     let streamFailure: unknown = null;
+    // The reconnect backoff resets when a stream says something, not when it
+    // opens; see `useAssistantSession`, which has the same loop.
+    let deliveredEvent = false;
 
     try {
       for await (const event of readSSE(stream)) {
@@ -660,6 +674,10 @@ export class AgentController {
           // false is what sends this into the catch-up-and-reconnect path
           // below, which is what the server is asking for.
           continue;
+        }
+        deliveredEvent = true;
+        if (parsed.notice) {
+          this.options.onNotice?.(parsed.notice, parsed.noticeKind);
         }
         if (parsed.error) {
           const streamError = new Error(parsed.error);
@@ -739,7 +757,11 @@ export class AgentController {
       if (!controller.signal.aborted) {
         const syncConversationId = streamConversationId ?? this.state.conversationId;
         if (!sawTerminalStatus && syncConversationId) {
+          if (deliveredEvent) this.streamReconnectCount = 0;
           while (!controller.signal.aborted) {
+            // Signed out is final for this loop: every request it makes would
+            // answer 401, every ten seconds, for as long as it ran.
+            if (this.client.auth?.getState().status === "unauthenticated") break;
             const latestConversation = await this.refreshConversation(syncConversationId);
             await this.loadMessages({ conversationId: syncConversationId, limit: 100 });
             if (controller.signal.aborted) break;
@@ -765,7 +787,6 @@ export class AgentController {
                 pod_id: scope.podId ?? undefined,
                 signal: controller.signal,
               });
-              this.streamReconnectCount = 0;
               return await this.consume({
                 stream: newStream,
                 controller,

@@ -80,6 +80,7 @@ fn fake_adapter_in_mode(directory: &TempDir, mode: Option<&str>) -> (ResolvedAda
                 upstream_command: "python3".into(),
                 upstream_version_args: vec!["--version".into()],
                 upstream_path_env: None,
+                environment: BTreeMap::default(),
                 omit_optional_dependencies: false,
                 minimum_upstream_version: None,
                 distribution: "native".into(),
@@ -116,6 +117,8 @@ async fn official_sdk_negotiates_probes_config_and_streams_a_prompt() {
         .run(
             AcpRunRequest {
                 adapter,
+                agent_environment: std::collections::BTreeMap::default(),
+                own_settings: false,
                 run_spec: RunSpec {
                     agent_run_id: Uuid::new_v4(),
                     conversation_id: Uuid::new_v4(),
@@ -140,6 +143,7 @@ async fn official_sdk_negotiates_probes_config_and_streams_a_prompt() {
                 permission_timeout: Duration::ZERO,
                 cancel: lemma_agent_host::acp::never_cancelled(),
                 cancel_grace: Duration::from_secs(5),
+                steer: lemma_agent_host::acp::SteerInbox::default(),
             },
             callbacks.clone(),
         )
@@ -176,6 +180,8 @@ async fn every_harness_opens_and_resumes_in_the_same_saved_directory() {
         let cwd = directory.path().join("lemma/c/2026-09-07/Δ project");
         let request = AcpRunRequest {
             adapter,
+            agent_environment: std::collections::BTreeMap::default(),
+            own_settings: false,
             run_spec: RunSpec {
                 agent_run_id: Uuid::new_v4(),
                 conversation_id: Uuid::new_v4(),
@@ -200,6 +206,7 @@ async fn every_harness_opens_and_resumes_in_the_same_saved_directory() {
             permission_timeout: Duration::ZERO,
             cancel: lemma_agent_host::acp::never_cancelled(),
             cancel_grace: Duration::from_secs(5),
+            steer: lemma_agent_host::acp::SteerInbox::default(),
         };
         AcpDriver
             .run(
@@ -264,6 +271,8 @@ async fn a_forgotten_session_is_answered_and_reported_rather_than_silently_lost(
         .run(
             AcpRunRequest {
                 adapter,
+                agent_environment: std::collections::BTreeMap::default(),
+                own_settings: false,
                 run_spec: RunSpec {
                     agent_run_id: Uuid::new_v4(),
                     conversation_id: Uuid::new_v4(),
@@ -292,6 +301,7 @@ async fn a_forgotten_session_is_answered_and_reported_rather_than_silently_lost(
                 permission_timeout: Duration::ZERO,
                 cancel: lemma_agent_host::acp::never_cancelled(),
                 cancel_grace: Duration::from_secs(5),
+                steer: lemma_agent_host::acp::SteerInbox::default(),
             },
             callbacks.clone(),
         )

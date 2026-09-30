@@ -14,10 +14,30 @@ pub(crate) fn container_has_exited(state: &serde_json::Map<String, Value>) -> bo
             .is_some_and(|value| !value.trim().is_empty())
 }
 
+/// Whether an app answers on a host and port.
+///
+/// Taken as an argument rather than called directly so a unit test can decide
+/// the answer. The real probe opens a TCP connection, and fixtures here map
+/// ports like 49152-49154, which sit inside Linux's ephemeral range -- so a
+/// listener another test had just been assigned could answer a probe meant for
+/// nothing, and a probe meant for a listener could queue behind it. That made
+/// readiness assertions pass on macOS and fail on Linux for reasons that had
+/// nothing to do with the code under test.
+pub(crate) type AppProbe<'a> = &'a dyn Fn(&str, u16, &str) -> bool;
+
 pub(crate) fn snapshot_from_inspect(
     sandbox_id: &str,
     inspect: &serde_json::Map<String, Value>,
     endpoint_host: &str,
+) -> Result<Value, GuestError> {
+    snapshot_from_inspect_with(sandbox_id, inspect, endpoint_host, &app_answers)
+}
+
+pub(crate) fn snapshot_from_inspect_with(
+    sandbox_id: &str,
+    inspect: &serde_json::Map<String, Value>,
+    endpoint_host: &str,
+    probe: AppProbe<'_>,
 ) -> Result<Value, GuestError> {
     let provider_id = inspect
         .get("Id")
@@ -94,6 +114,26 @@ pub(crate) fn snapshot_from_inspect(
             serde_json::from_str::<BTreeMap<String, String>>(encoded)
                 .map_err(|_| GuestError::engine("sandbox metadata label is invalid"))
         })?;
+    // Read back so a re-ensure can tell whether the running container still
+    // has the grants being asked for (`existing_container_verdict`). A
+    // container made before the label existed had the alias -- that was the
+    // only behaviour then -- so absent reads as `true`.
+    let host_access = labels
+        .and_then(|value| value.get("lemma.work/host-access"))
+        .and_then(Value::as_str)
+        .is_none_or(|value| value != "false");
+    // The relay was never granted before its label existed.
+    let host_loopback = labels
+        .and_then(|value| value.get("lemma.work/host-loopback"))
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == "true");
+    // Which hardening this container was made with; see
+    // `SANDBOX_HARDENING_VERSION`. No label is a container from before any.
+    let hardening = labels
+        .and_then(|value| value.get("lemma.work/hardening"))
+        .and_then(Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
     let ports = inspect
         .get("NetworkSettings")
         .and_then(Value::as_object)
@@ -102,13 +142,29 @@ pub(crate) fn snapshot_from_inspect(
     let mut statuses = serde_json::Map::new();
     for app in &apps {
         let host_port = ports.and_then(|value| mapped_port(value, app.port));
+        // Published is what the engine can tell us: the container runs and a
+        // port is mapped. It is not the same as answering, and reporting it as
+        // `ready` is what let the guest promise a browser relay that refused
+        // every connection.
+        let published = running && host_port.is_some();
+        // Every app is probed, eager and lazy alike. Lazy is the case this
+        // exists for: the browser and its relay were reported `ready: true`
+        // from a mapped port while both refused every connection, and the
+        // backend dialled an endpoint the guest had just promised was good.
+        // Probing a lazy app that has not started costs a connection refused,
+        // which on a container on this host is immediate.
+        let answering =
+            published && host_port.is_some_and(|port| probe(endpoint_host, port, &app.health_path));
         statuses.insert(
             app.name.clone(),
             json!({
                 "name": app.name,
                 "public_slug": app.public_slug,
                 "port": app.port,
-                "ready": running && host_port.is_some(),
+                // What the engine knows: it is running and a port is mapped.
+                "published": published,
+                // What was asked: it answered its declared health path.
+                "ready": answering,
                 "private_url": host_port.map(|port| format!("http://{endpoint_host}:{port}")),
             }),
         );
@@ -127,6 +183,8 @@ pub(crate) fn snapshot_from_inspect(
         "provider_id": provider_id,
         "image": image,
         "metadata": metadata,
+        "grants": {"host_access": host_access, "host_loopback": host_loopback},
+        "hardening": hardening,
         "status": {
             "id": sandbox_id,
             "ready": ready,
@@ -152,20 +210,14 @@ pub(crate) fn mapped_port(
         .and_then(|port| port.parse().ok())
 }
 
-pub(crate) fn eager_apps_healthy(snapshot: &Value, apps: &[AppSpec]) -> bool {
-    apps.iter().filter(|app| app.startup == "eager").all(|app| {
-        snapshot["status"]["apps"][&app.name]["private_url"]
-            .as_str()
-            .map(|base| {
-                let path = if app.health_path.starts_with('/') {
-                    app.health_path.clone()
-                } else {
-                    format!("/{}", app.health_path)
-                };
-                probe_http(&format!("{}{path}", base.trim_end_matches('/'))).is_ok()
-            })
-            .unwrap_or(false)
-    })
+/// Whether an app answers its health path, through the guest's one HTTP prober.
+///
+/// `probe_http` is what readiness has always used: any status below 500 is a
+/// server that is serving -- a 401 from the runtime, which wants a credential
+/// guestd does not hold, included -- and a 5xx is one that is not.
+pub(crate) fn app_answers(host: &str, port: u16, health_path: &str) -> bool {
+    let path = health_path.strip_prefix('/').unwrap_or(health_path);
+    probe_http(&format!("http://{host}:{port}/{path}")).is_ok()
 }
 
 impl<E: Engine + 'static> GuestService<E> {

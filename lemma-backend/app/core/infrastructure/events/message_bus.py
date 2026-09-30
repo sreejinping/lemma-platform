@@ -11,8 +11,13 @@ from pydantic import BaseModel
 from faststream.redis import RedisBroker
 from redis.exceptions import RedisError
 
+from app.core.bounded import BoundedDict
 from app.core.config import settings
 from app.core.infrastructure.events.config import event_transport_settings
+from app.core.infrastructure.events.stream_keys import (
+    MEMORY_PRESSURE_KEY,
+    stream_cap_key,
+)
 from app.core.infrastructure.events.stream_subscriber import (
     ensure_stream_groups,
     registered_groups_for_stream,
@@ -122,6 +127,32 @@ async def _group_holding_back_trim(
 TRIM_REPORT_INTERVAL_SECONDS = 60
 
 
+async def _apply_memory_cap(
+    redis_client, stream: str, maxlen: int | None
+) -> int | None:
+    """Lower ``maxlen`` toward the entry count the stream guard says fits in memory.
+
+    Applied only when every group is close to caught up (see ``publish``), and
+    never below half of ``maxlen``: the normal path already guarantees no group
+    is more than that far behind, so the cap bounds a burst between two guard
+    passes without cutting into anything a group has not read. A missing key
+    (no guard running, or the stream is new) leaves ``maxlen`` as it was.
+    """
+    try:
+        raw = await redis_client.get(stream_cap_key(stream))
+    except RedisError:
+        return maxlen
+    if not isinstance(raw, bytes | str | int):
+        return maxlen
+    try:
+        cap = int(raw)
+    except ValueError:
+        return maxlen
+    if maxlen is None:
+        return cap
+    return min(maxlen, max(cap, maxlen // 2))
+
+
 class _KeyedReportThrottle:
     """Lets one observation per key through per interval, counting the rest.
 
@@ -140,7 +171,11 @@ class _KeyedReportThrottle:
 
     def __init__(self, interval_seconds: float) -> None:
         self._interval_seconds = interval_seconds
-        self._seen: dict[tuple[str, str, str | None], tuple[float, int]] = {}
+        # Keys carry stream/group names, which grow with traffic; forgetting
+        # one only lets an extra report through.
+        self._seen: BoundedDict[tuple[str, str, str | None], tuple[float, int]] = (
+            BoundedDict(1024, name="events.trim_report_throttle")
+        )
 
     def should_report(
         self, key: tuple[str, str, str | None], now: float
@@ -150,7 +185,8 @@ class _KeyedReportThrottle:
         `now` is monotonic, so a corrected wall clock cannot push the next
         report into the far future.
         """
-        last_at, suppressed = self._seen.get(key, (None, 0))
+        seen = self._seen.get(key)
+        last_at, suppressed = seen if seen is not None else (None, 0)
         if last_at is not None and now - last_at < self._interval_seconds:
             self._seen[key] = (last_at, suppressed + 1)
             return False, suppressed + 1
@@ -344,7 +380,26 @@ class FastStreamRedisMessageBus:
             # the duplicate.
             await ensure_stream_groups(redis_client, stream)
             maxlen = await self._safe_publish_maxlen(redis_client, stream)
+            if maxlen == event_transport_settings.stream_maxlen_for(stream):
+                # Only on the normal path. A relaxed cap means some group
+                # still needs the entries a memory cap would cut, and a trim
+                # here records no gap -- the guard's own trim does, and it runs
+                # within seconds.
+                maxlen = await _apply_memory_cap(redis_client, stream, maxlen)
             await broker.publish(payload, stream=stream, maxlen=maxlen)
+
+    async def memory_pressure_critical(self) -> bool:
+        """Whether the stream guard has asked publishers to stop.
+
+        Unreadable counts as "no": the flag is an optimisation over a budget
+        the guard enforces anyway, and a Redis that cannot answer a GET cannot
+        take a publish either -- the publish failing is what backs off then.
+        """
+        try:
+            client = await self.redis_client()
+            return bool(await client.exists(MEMORY_PRESSURE_KEY))
+        except RedisError, ConnectionError, OSError:
+            return False
 
     async def close(self) -> None:
         if not self._broker:

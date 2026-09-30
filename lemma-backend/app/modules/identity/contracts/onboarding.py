@@ -22,6 +22,7 @@ from app.modules.identity.infrastructure.mobile_number_claims import (
     acquire_mobile_number_claim_lock,
     get_other_mobile_number_owner_id,
 )
+from app.modules.identity.infrastructure.chat_account_policy import is_chat_account
 from app.modules.identity.infrastructure.models.user_models import User
 from app.modules.identity.infrastructure.user_cache import get_user_cache
 from app.modules.identity.services.auth_abuse import RateLimitExceeded
@@ -106,12 +107,7 @@ async def ensure_chat_workspace(
 
     async with uow_factory() as uow:
         user = await uow.session.get(User, user_id, with_for_update=True)
-        if (
-            user is None
-            or not user.is_active
-            or user.is_deleted
-            or not user.is_verified
-        ):
+        if user is None or not is_chat_account(user):
             raise ChallengeRejected("A verified active account is required")
         if verified_phone:
             normalized = normalize_mobile_e164(verified_phone)
@@ -146,6 +142,32 @@ async def ensure_chat_workspace(
             email=email,
             full_name=name or None,
             arrived_through_organization_id=installation_organization_id,
+        )
+
+
+async def accept_chat_invitations(
+    uow_factory: UnitOfWorkFactory, *, user_id: UUID
+) -> None:
+    """Honour a recognised chat user's pending invitations before offering pods.
+
+    Somebody who already has an account and messages from a new chat is asked
+    which workspace to use; a pod they were invited to belongs on that list,
+    and accepting it is what puts it there. Only a verified address may.
+    """
+    from app.modules.identity.api.dependencies import get_organization_service
+    from app.modules.identity.services.pending_invitations import (
+        accept_pending_invitations,
+    )
+
+    async with uow_factory() as uow:
+        user = await uow.session.get(User, user_id)
+        if user is None or not user.is_verified:
+            return
+        await accept_pending_invitations(
+            uow,
+            organization_service=get_organization_service(uow),
+            user_id=user_id,
+            email=user.email,
         )
 
 
@@ -194,6 +216,6 @@ async def active_chat_user(
     uow: SqlAlchemyUnitOfWork, user_id: UUID
 ) -> UserEntity | None:
     user = await uow.session.get(User, user_id)
-    if user is None or not user.is_active or user.is_deleted or not user.is_verified:
+    if user is None or not is_chat_account(user):
         return None
     return user.to_entity()

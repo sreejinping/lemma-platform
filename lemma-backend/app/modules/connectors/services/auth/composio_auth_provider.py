@@ -15,10 +15,17 @@ os.environ.setdefault("COMPOSIO_CACHE_DIR", "/tmp/composio")
 from app.modules.connectors.infrastructure.composio_client import get_composio_client
 
 from app.modules.connectors.domain.account import ComposioCredentials, OAuthCredentials
-from app.modules.connectors.domain.auth_config import AuthConfigSource
+from app.modules.connectors.domain.auth_config import (
+    COMPOSIO_ORG_CREDENTIALS_REQUIRED,
+    COMPOSIO_SYSTEM_DEFAULT_REASON,
+    AuthConfigSource,
+)
 from app.modules.connectors.domain.auth_install import ResolvedAuthInstall
 from app.modules.connectors.domain.connector import AuthScheme
-from app.modules.connectors.domain.errors import ConnectorValidationError
+from app.modules.connectors.domain.errors import (
+    ConnectorReauthRequiredError,
+    ConnectorValidationError,
+)
 from app.modules.connectors.domain.ports import ConnectorRepositoryPort
 from app.modules.connectors.services.auth.auth_provider import AuthProviderInterface
 from app.core.concurrency.offload import run_blocking
@@ -222,6 +229,15 @@ class ComposioAuthProvider(AuthProviderInterface):
                 "type": "use_custom_auth",
                 "auth_scheme": custom_auth_scheme,
             }
+        elif not install.composio_managed_auth:
+            # A SYSTEM_DEFAULT install made while Composio still managed this
+            # toolkit. Asking for managed credentials now is answered with a
+            # 404 that surfaced as a 502; refuse the way creating the install
+            # would have, so the person is told the org needs its own app.
+            raise ConnectorValidationError(
+                COMPOSIO_ORG_CREDENTIALS_REQUIRED,
+                details={"reason": COMPOSIO_SYSTEM_DEFAULT_REASON},
+            )
         else:
             options = {"type": "use_composio_managed_auth"}
         auth_config = await run_blocking(
@@ -314,6 +330,7 @@ class ComposioAuthProvider(AuthProviderInterface):
         state: str,
         redirect_uri: str,
         code_verifier: str | None = None,
+        connection_fields: dict[str, object] | None = None,
     ) -> Tuple[str, str]:
         # Accepted and ignored. Composio runs the OAuth dance itself and hands
         # back a connection, so there is no authorization request of ours to
@@ -328,14 +345,33 @@ class ComposioAuthProvider(AuthProviderInterface):
 
         redirect_url = f"{redirect_uri}?state={state}"
 
-        connection_request = await run_blocking(
-            lambda: composio.connected_accounts.initiate(
+        # Shopify's OAuth mode needs the store before Composio can build the
+        # authorization URL -- `subdomain` becomes `{subdomain}.myshopify.com`.
+        # Only sent when the kind declared such a field, so every other toolkit
+        # makes exactly the call it made before.
+        if connection_fields:
+            from composio.types import auth_scheme as composio_auth_scheme
+
+            config = composio_auth_scheme.oauth2(dict(connection_fields))
+            start = lambda: composio.connected_accounts.initiate(  # noqa: E731
                 user_id=str(user_id),
                 auth_config_id=auth_config_id,
                 callback_url=redirect_url,
-            ),
-            limiter="external_http",
-        )
+                config=config,
+            )
+        else:
+            # `link()`, not `initiate()`: Composio is retiring `initiate()` for
+            # redirect sign-ins on its managed auth configs, and says so with a
+            # Sunset header on every call. Same connected-account id, same
+            # redirect. `initiate()` stays for the connect that carries fields,
+            # because `link()` takes none.
+            start = lambda: composio.connected_accounts.link(  # noqa: E731
+                user_id=str(user_id),
+                auth_config_id=auth_config_id,
+                callback_url=redirect_url,
+            )
+
+        connection_request = await run_blocking(start, limiter="external_http")
 
         if not connection_request.redirect_url:
             raise ConnectorValidationError("No redirect URL found for Composio app")
@@ -434,6 +470,13 @@ class ComposioAuthProvider(AuthProviderInterface):
             lambda: composio.connected_accounts.get(credentials.connection_id),
             limiter="external_http",
         )
+
+        # Composio keeps answering with the last token it held after the
+        # connection has died, so reading the token alone handed back a dead
+        # one and the call failed later, at the provider, as something else.
+        status = str(getattr(connection_account, "status", "") or "").upper()
+        if status in _TERMINAL_CONNECTION_STATES:
+            raise ConnectorReauthRequiredError(reason=f"composio_{status.lower()}")
 
         state_value = connection_account.state.val
         access_token = getattr(state_value, "access_token", None)

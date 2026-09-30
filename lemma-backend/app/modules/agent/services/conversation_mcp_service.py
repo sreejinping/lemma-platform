@@ -1,5 +1,9 @@
 """Request-scoped tool resolution for conversation MCP calls.
 
+The caller is the Agent Host link: a local agent's Lemma tool calls arrive as
+``mcp`` frames (``agent_host_link_mcp``), each re-authorized here against the
+run's token and its conversation.
+
 Thin adapter over `AgentToolDispatcher`: this service owns the conversation
 authorization + context loading and the MCP wire format (``lemma_``-prefixed
 names, `CallToolResult` wrapping); the dispatcher owns toolset resolution and
@@ -31,7 +35,11 @@ from app.modules.agent.services.mcp_content import (
     tool_call_error,
     tool_call_result,
 )
-from app.modules.agent.domain.value_objects import JsonObject, to_json_value
+from app.modules.agent.domain.value_objects import (
+    TERMINAL_AGENT_RUN_STATUSES,
+    JsonObject,
+    to_json_value,
+)
 from app.modules.agent.infrastructure.mcp import (
     exported_tool_name,
     normalize_local_mcp_tool_name,
@@ -81,7 +89,18 @@ class ConversationMCPService:
         self.uow_factory = SessionUnitOfWorkFactory(async_session_maker)
         self.dispatcher = AgentToolDispatcher(self.uow_factory)
 
-    async def authorize(self, *, conversation_id: UUID, token: str) -> bool:
+    async def authorize(
+        self,
+        *,
+        conversation_id: UUID,
+        token: str,
+        agent_run_id: UUID | None = None,
+    ) -> bool:
+        """Whether ``token`` may use ``conversation_id``'s tools as ``agent_run_id``.
+
+        A named run has to be one of this conversation's: a token good for one
+        conversation must not act as, or read, a run of another.
+        """
         try:
             session = await get_session_without_request_response(
                 token,
@@ -112,6 +131,15 @@ class ConversationMCPService:
             )
             if conversation is None or conversation.user_id != token_user_id:
                 return False
+            if agent_run_id is not None:
+                run = await ConversationRepository(uow).get_agent_run(agent_run_id)
+                if run is None or run.conversation_id != conversation_id:
+                    logger.warning(
+                        "agent.conversation_mcp_service.run_not_in_conversation.denied",
+                        conversation_id=str(conversation_id),
+                        agent_run_id=str(agent_run_id),
+                    )
+                    return False
             # Owning the conversation is not access to the pod it lives in. Every
             # HTTP conversation route also asserts membership
             # (``CONVERSATION_MEMBERSHIP``), because ownership plus an agent grant
@@ -133,6 +161,12 @@ class ConversationMCPService:
             return False
         return True
 
+    async def run_has_ended(self, *, agent_run_id: UUID) -> bool:
+        """Whether the run is terminal (or gone): nothing will resume it."""
+        async with self.uow_factory() as uow:
+            run = await ConversationRepository(uow).get_agent_run(agent_run_id)
+        return run is None or run.status in TERMINAL_AGENT_RUN_STATUSES
+
     async def parked_tool_return(
         self,
         *,
@@ -141,9 +175,10 @@ class ConversationMCPService:
     ) -> JsonObject | None:
         """The answer to a parked interaction, or ``None`` while it is pending.
 
-        The host's MCP bridge polls this after `ask_user` or `request_approval`
-        hands it a parked id, and hands the result back as that tool's return so
-        the model never leaves its turn.
+        The host's MCP bridge waits on this, with an ``interaction_wait`` frame,
+        after `ask_user` or `request_approval` hands it a parked id, and hands
+        the result back as that tool's return so the model never leaves its
+        turn.
 
         Nothing new is stored to make this work. Deciding an interaction already
         writes a synthesized tool RETURN under the same durable id -- that is how
@@ -176,7 +211,7 @@ class ConversationMCPService:
             conversation=conversation,
             ctx=ctx,
             agent_run_id=agent_run_id,
-            # This route is reached only by the Agent Host MCP bridge, which is
+            # This is reached only by the Agent Host MCP bridge, which is
             # the harness that has no other way to return a structured result.
             # The assembler applies the "does this run owe one?" gate.
             include_final_answer=True,
@@ -319,6 +354,12 @@ class ConversationMCPService:
             run = None
             if agent_run_id is not None:
                 run = await conversation_repo.get_agent_run(agent_run_id)
+                if run is not None and str(run.conversation_id) != str(conversation_id):
+                    # `authorize` refuses this first; kept so no caller can
+                    # build a context from another conversation's run.
+                    raise ValueError(
+                        f"Run {agent_run_id} is not in conversation {conversation_id}"
+                    )
             if run is None:
                 run = await conversation_repo.get_active_agent_run(conversation_id)
             agent_id = conversation.agent_id or (run.agent_id if run else None)
@@ -377,7 +418,15 @@ class ConversationMCPService:
                 pod_cwd=pod_cwd_from_workspace_cwd(workspace_location.cwd),
                 **surface_context_from_conversation(conversation),
             )
-            return agent, conversation, ctx
+        # Outside the unit of work: it opens its own, and holding this one
+        # across it would pin a pooled connection for nothing. Imported here to
+        # keep selection out of the startup import graph.
+        from app.modules.agent.services.host_execution_selection import (
+            host_runs_native_commands,
+        )
+
+        ctx.host_runs_native_commands = await host_runs_native_commands(conversation)
+        return agent, conversation, ctx
 
     async def _resolved_runtime_profile(
         self,
@@ -437,9 +486,3 @@ class ConversationMCPService:
 
 
 conversation_mcp_service = ConversationMCPService()
-
-
-def _surface_platform(conversation: Conversation) -> str | None:
-    metadata = conversation.metadata or {}
-    platform = metadata.get("surface_platform") if isinstance(metadata, dict) else None
-    return str(platform) if platform else None

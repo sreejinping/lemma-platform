@@ -1,5 +1,10 @@
-//! What Local settings writes: the operator config, the AI provider and
-//! sharing. Each one is a locald round trip the page waits on.
+//! Operator commands outside the workspace's Settings: Local settings'
+//! snapshot and sharing, provider model discovery, preparing the sandbox
+//! image, and `configure_ai_provider`, which only lemma-harness's onboarding
+//! invokes. Each one is a locald round trip the page waits on. The
+//! lemma-frontend workspace writes its settings -- `ai`, `email`,
+//! `integrations` and `surfaces` -- through `apply_local_settings` in
+//! `workspace_settings.rs`.
 
 use super::*;
 
@@ -7,18 +12,6 @@ pub(crate) fn control_snapshot_impl(app: AppHandle, id: String) -> Result<(), St
     // Opening settings is not consent to download or repair a local runtime.
     ensure_locald_without_host_pack(&app)?;
     send_to_locald(&app, json!({"cmd":"control.snapshot", "id": id}))
-}
-
-pub(crate) fn apply_operator_config_impl(
-    app: AppHandle,
-    id: String,
-    payload: Value,
-) -> Result<(), String> {
-    ensure_locald(&app)?;
-    send_to_locald(
-        &app,
-        json!({"cmd":"config.apply", "id": id, "payload": payload}),
-    )
 }
 
 pub(crate) fn discover_provider_models_impl(
@@ -62,26 +55,15 @@ pub(crate) fn sharing_action_impl(
     if current_mode(&app) != "local" {
         return Err("sharing is available only for a local workspace".into());
     }
-    if !matches!(
-        action.as_str(),
-        "snapshot" | "preflight" | "enable" | "disable"
-    ) {
-        return Err(format!("unknown sharing action: {action}"));
-    }
     ensure_locald(&app)?;
-    let mut request = json!({
-        "cmd": format!("sharing.{action}"),
-        "id": id,
-    });
-    if let Some(payload) = payload {
-        if action == "preflight" {
-            if let Some(provider) = payload.get("provider") {
-                request["provider"] = provider.clone();
-            }
-        } else {
-            request["payload"] = payload;
-        }
-    }
+    // The same builder and the same native questions as the workspace's This
+    // Mac page. Local settings used to forward its payload as given --
+    // `public_warning_confirmed` included -- so the one page that skipped the
+    // native confirmation was the bundled one, and anything able to drive it
+    // could publish the installation without being asked.
+    let Some(request) = consented_sharing_request(&app, &action, payload, Some(id))? else {
+        return Err("Sharing was not changed.".into());
+    };
     send_to_locald(&app, request)
 }
 
@@ -96,23 +78,6 @@ pub(crate) async fn control_snapshot(
 ) -> Result<(), String> {
     require_control_window(&window)?;
     tauri::async_runtime::spawn_blocking(move || control_snapshot_impl(app, id))
-        .await
-        .map_err(|error| error.to_string())?
-}
-
-#[tauri::command]
-/// Runs off the UI thread. A synchronous `#[tauri::command]` is dispatched on
-/// the main thread, so any command that waits on the daemon, the network or a
-/// child process freezes every window for its whole duration.
-pub(crate) async fn apply_operator_config(
-    window: Webview,
-    app: AppHandle,
-    id: String,
-    payload: Value,
-) -> Result<(), String> {
-    require_agent_host_caller(&window, &app)?;
-    require_control_window(&window)?;
-    tauri::async_runtime::spawn_blocking(move || apply_operator_config_impl(app, id, payload))
         .await
         .map_err(|error| error.to_string())?
 }
@@ -146,11 +111,11 @@ pub(crate) async fn discover_provider_models(
 
 /// Point this installation at an AI provider.
 ///
-/// The one piece of operator configuration the workspace may write, and the
-/// reason is that onboarding cannot honestly ask "which model?" and then send
-/// the user to a different window to answer. Everything else the control page
-/// owns — sharing, tunnels, runtime, integrations — stays where it was: this
-/// command reaches `config.set-ai`, which merges only that section.
+/// Serves lemma-harness, whose onboarding asks "which model?" and answers it
+/// in the same window (`lemma-harness/lib/desktop/local-capabilities.ts`).
+/// The lemma-frontend workspace never invokes it: it writes the `ai` section
+/// with the rest of its settings through `apply_local_settings`. This command
+/// reaches `config.set-ai`, which merges only that section.
 ///
 /// Blocking on purpose. Applying a provider validates it against the provider
 /// and restarts the backend, and both of those can fail in ways the user needs
@@ -212,19 +177,52 @@ pub(crate) async fn prepare_sandbox_image(
     app: AppHandle,
     id: String,
 ) -> Result<(), String> {
-    require_control_window(&window)?;
+    // Asked for from This Mac → Coding agents, where the thing that needs it
+    // is; Local settings no longer offers it.
+    require_local_settings_caller(&window, &app)?;
     tauri::async_runtime::spawn_blocking(move || prepare_sandbox_image_impl(app, id))
         .await
         .map_err(|error| error.to_string())?
 }
 
+/// The workspace Settings sections Local settings may hand over to when it
+/// closes: where the coding agents on this computer are shown, in a local
+/// install and in a hosted workspace.
+pub(crate) const HANDOVER_SECTIONS: [&str; 2] = ["this-mac-agents", "models"];
+
+/// Whether leaving Local settings may open workspace Settings at `section`.
+/// A fixed list, not a pattern: the name ends up in a script evaluated in the
+/// workspace, and although `open_settings_script` serialises it, a page that
+/// may only ever ask for two things should only ever be able to.
+pub(crate) fn handover_section(section: Option<&str>) -> Result<Option<&'static str>, String> {
+    match section {
+        None => Ok(None),
+        Some(asked) => HANDOVER_SECTIONS
+            .iter()
+            .find(|known| **known == asked)
+            .map(|known| Some(*known))
+            .ok_or_else(|| format!("unknown Settings section: {asked}")),
+    }
+}
+
 #[tauri::command]
-pub(crate) fn close_local_settings(window: Webview, app: AppHandle) -> Result<(), String> {
+/// Leave Local settings for the workspace, optionally at a Settings section
+/// -- how its coding-agents card sends someone to the place those agents are
+/// actually managed, instead of to the workspace's front page.
+pub(crate) fn close_local_settings(
+    window: Webview,
+    app: AppHandle,
+    section: Option<String>,
+) -> Result<(), String> {
     require_control_window(&window)?;
+    let section = handover_section(section.as_deref())?;
     window.close().map_err(|error| error.to_string())?;
     if let Some(main) = app.get_window("main") {
         let _ = main.show();
         let _ = main.set_focus();
+    }
+    if let Some(section) = section {
+        open_settings(&app, section, "computer");
     }
     Ok(())
 }

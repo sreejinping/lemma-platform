@@ -2,11 +2,27 @@
 
 use super::*;
 
+/// Every app answers. Readiness here is about how a snapshot is assembled, not
+/// about whether a socket can be opened -- that has its own test.
+fn answering(_host: &str, _port: u16, _path: &str) -> bool {
+    true
+}
+
+/// Nothing answers.
+fn refused(_host: &str, _port: u16, _path: &str) -> bool {
+    false
+}
+
 #[test]
 fn snapshot_uses_guest_ip_and_exact_container_generation() {
     let parsed: Value = serde_json::from_str(&inspect()).unwrap();
-    let snapshot =
-        snapshot_from_inspect("box-1", parsed[0].as_object().unwrap(), "192.168.64.2").unwrap();
+    let snapshot = snapshot_from_inspect_with(
+        "box-1",
+        parsed[0].as_object().unwrap(),
+        "192.168.64.2",
+        &answering,
+    )
+    .unwrap();
 
     assert_eq!(snapshot["provider_id"], "sha256:exact-generation");
     assert_eq!(
@@ -14,6 +30,52 @@ fn snapshot_uses_guest_ip_and_exact_container_generation() {
         "http://192.168.64.2:49152"
     );
     assert_eq!(snapshot["status"]["ready"], true);
+}
+
+/// The lie this whole probe exists to stop telling.
+///
+/// A mapped port and a running container were reported as `ready: true`. On a
+/// real install that is exactly what the browser and its relay looked like
+/// while both refused every connection, so the backend dialled an endpoint the
+/// guest had just promised was good and got ECONNREFUSED.
+#[test]
+fn an_eager_app_nothing_is_serving_is_published_but_not_ready() {
+    // A port that is mapped in the engine's view and bound by nobody.
+    let parsed: Value = serde_json::from_str(&inspect()).unwrap();
+    let snapshot = snapshot_from_inspect_with(
+        "box-1",
+        parsed[0].as_object().unwrap(),
+        "192.168.64.2",
+        &refused,
+    )
+    .unwrap();
+
+    let runtime = &snapshot["status"]["apps"]["runtime"];
+    assert_eq!(runtime["published"], true, "the engine did map the port");
+    assert_eq!(runtime["ready"], false, "but nothing answered on it");
+    assert_eq!(snapshot["status"]["ready"], false);
+}
+
+/// A lazy app that has not started is published and not ready.
+///
+/// This is the case the probe exists for. The browser and its relay are both
+/// lazy, and both were reported `ready: true` off a mapped port while refusing
+/// every connection -- so the backend dialled an endpoint the guest had just
+/// promised was good and got ECONNREFUSED.
+#[test]
+fn a_lazy_app_that_has_not_started_says_so() {
+    let parsed: Value = serde_json::from_str(&inspect()).unwrap();
+    let snapshot = snapshot_from_inspect_with(
+        "box-1",
+        parsed[0].as_object().unwrap(),
+        "192.168.64.2",
+        &refused,
+    )
+    .unwrap();
+
+    let browser = &snapshot["status"]["apps"]["browser"];
+    assert_eq!(browser["published"], true, "the engine did map the port");
+    assert_eq!(browser["ready"], false, "but nothing answered on it");
 }
 
 /// The resting state of every idle workspace, read off a real guest that
@@ -143,7 +205,11 @@ fn a_sandbox_reports_the_apps_it_was_created_with_including_the_relay() {
     let relay = &snapshot["status"]["apps"]["relay"];
     assert_eq!(relay["port"], 4850);
     assert_eq!(relay["private_url"], "http://192.168.64.2:49154");
-    assert_eq!(relay["ready"], true);
+    // Published, because the container declared and mapped it. Not ready:
+    // nothing has started the relay, and saying otherwise is the bug this
+    // whole probe exists to stop.
+    assert_eq!(relay["published"], true);
+    assert_eq!(relay["ready"], false);
 }
 
 /// A container created before the label existed still has to be answered for.
@@ -168,15 +234,20 @@ fn a_sandbox_created_before_the_label_falls_back_to_the_compiled_list() {
         }}
     });
 
-    let snapshot =
-        snapshot_from_inspect("box-1", inspected.as_object().unwrap(), "192.168.64.2").unwrap();
+    let snapshot = snapshot_from_inspect_with(
+        "box-1",
+        inspected.as_object().unwrap(),
+        "192.168.64.2",
+        &answering,
+    )
+    .unwrap();
 
     assert_eq!(
         snapshot["status"]["apps"]["relay"]["private_url"],
         "http://192.168.64.2:49154"
     );
     // Lazy, so a relay nobody has reached for does not hold the sandbox back
-    // from being ready.
+    // from being ready -- but the eager runtime has to actually answer.
     assert_eq!(snapshot["status"]["ready"], true);
 }
 
@@ -213,4 +284,36 @@ fn an_unreadable_apps_label_falls_back_instead_of_failing_the_snapshot() {
 
         assert_eq!(snapshot["status"]["apps"]["runtime"]["port"], 8080);
     }
+}
+
+/// The grants a container was made with are read back off its labels, and a
+/// container from before the label had the alias.
+#[test]
+fn a_snapshot_reports_the_grants_its_container_was_made_with() {
+    let mut value: Value = serde_json::from_str(&inspect()).unwrap();
+    let before_the_label = snapshot_from_inspect_with(
+        "box-1",
+        value[0].as_object().unwrap(),
+        "192.168.64.2",
+        &refused,
+    )
+    .unwrap();
+    assert_eq!(
+        before_the_label["grants"],
+        json!({"host_access": true, "host_loopback": false})
+    );
+
+    value[0]["Config"]["Labels"]["lemma.work/host-access"] = json!("false");
+    value[0]["Config"]["Labels"]["lemma.work/host-loopback"] = json!("true");
+    let narrowed = snapshot_from_inspect_with(
+        "box-1",
+        value[0].as_object().unwrap(),
+        "192.168.64.2",
+        &refused,
+    )
+    .unwrap();
+    assert_eq!(
+        narrowed["grants"],
+        json!({"host_access": false, "host_loopback": true})
+    );
 }

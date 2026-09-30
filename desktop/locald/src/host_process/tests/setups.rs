@@ -31,6 +31,36 @@ fn operator_secrets_are_ephemeral_and_backend_scoped() {
         .contains_key("LEMMA_OPENAI_API_KEY"));
 }
 
+#[test]
+fn the_operators_frontend_keys_reach_only_the_frontend() {
+    let root = tempdir().unwrap();
+    let manager = manager_in(
+        &root,
+        manifest(vec![
+            service("frontend", &["backend"]),
+            service("backend", &[]),
+        ]),
+    );
+    let keys = HashMap::from([("GEMINI_API_KEY".to_owned(), "voice-secret".to_owned())]);
+    assert!(manager.set_frontend_environment(keys.clone()));
+    assert!(
+        !manager.set_frontend_environment(keys),
+        "unchanged is not a change"
+    );
+    assert_eq!(
+        manager.process_spec_for_spawn("frontend").unwrap().env["GEMINI_API_KEY"],
+        "voice-secret"
+    );
+    assert!(!manager
+        .process_spec_for_spawn("backend")
+        .unwrap()
+        .env
+        .contains_key("GEMINI_API_KEY"));
+    assert!(!manager
+        .redact_excerpt("key voice-secret".into())
+        .contains("voice-secret"));
+}
+
 #[cfg(unix)]
 #[test]
 fn migration_setup_receives_the_same_dynamic_backend_environment() {
@@ -318,4 +348,91 @@ fn a_required_setup_that_hangs_still_stops_the_stack() {
     let error = manager.run_setups().unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::TimedOut);
     assert!(error.to_string().contains("migrations"), "{error}");
+}
+
+/// A setup can depend on a value only the running environment has.
+///
+/// The connector catalog imports Composio's apps only when a key is set, and
+/// the key arrives from the operator configuration, not the host pack. So the
+/// stamp folds in the key the setup actually runs with: saving one, changing
+/// it or removing it runs the import again, and nothing else does.
+#[cfg(unix)]
+#[test]
+fn a_setup_reruns_when_a_variable_named_in_its_stamp_changes() {
+    let root = tempdir().unwrap();
+    let marker = root.path().join("ran");
+    let mut value = manifest(vec![service("backend", &[]), service("frontend", &[])]);
+    let mut catalog = setup("connector-catalog");
+    catalog.command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!("echo x >> {}", marker.display()),
+    ];
+    catalog.stamp = Some("release-0.7.0".into());
+    catalog.stamp_env = vec!["COMPOSIO_API_KEY".into()];
+    catalog.optional = true;
+    value.setup.push(catalog);
+    let manager = manager_in(&root, value);
+    let runs = || {
+        std::fs::read_to_string(&marker)
+            .unwrap_or_default()
+            .lines()
+            .count()
+    };
+
+    manager.run_setup_if_stale("connector-catalog").unwrap();
+    manager.run_setup_if_stale("connector-catalog").unwrap();
+    assert_eq!(runs(), 1, "no key, imported once");
+
+    manager.set_backend_environment(HashMap::from([("COMPOSIO_API_KEY".into(), "first".into())]));
+    manager.run_setup_if_stale("connector-catalog").unwrap();
+    manager.run_setup_if_stale("connector-catalog").unwrap();
+    assert_eq!(runs(), 2, "a saved key imports again, once");
+
+    manager.set_backend_environment(HashMap::from([(
+        "COMPOSIO_API_KEY".into(),
+        "second".into(),
+    )]));
+    manager.run_setup_if_stale("connector-catalog").unwrap();
+    assert_eq!(runs(), 3, "a changed key imports again");
+
+    // The recorded stamp never carries the key itself.
+    let stamps = std::fs::read_to_string(manager.setup_stamp_path()).unwrap();
+    assert!(!stamps.contains("second"));
+}
+
+/// Only the named setup runs, whatever the others' stamps say.
+#[cfg(unix)]
+#[test]
+fn running_one_setup_leaves_the_others_alone() {
+    let root = tempdir().unwrap();
+    let marker = root.path().join("ran");
+    let mut value = manifest(vec![service("backend", &[]), service("frontend", &[])]);
+    value.setup[0].command = vec![
+        "/bin/sh".into(),
+        "-c".into(),
+        format!("echo migrations >> {}", marker.display()),
+    ];
+    let manager = manager_in(&root, value);
+    manager.run_setup_if_stale("connector-catalog").unwrap();
+    assert!(
+        !marker.exists(),
+        "migrations ran when only the catalog was asked for"
+    );
+}
+
+#[test]
+fn a_stamp_without_named_variables_is_unchanged() {
+    let mut plain = setup("migrations");
+    plain.stamp = Some("abc".into());
+    assert_eq!(
+        crate::host_process::setups::effective_setup_stamp(&plain, &HashMap::new()).as_deref(),
+        Some("abc")
+    );
+    plain.stamp = None;
+    plain.stamp_env = vec!["X".into()];
+    assert_eq!(
+        crate::host_process::setups::effective_setup_stamp(&plain, &HashMap::new()),
+        None
+    );
 }

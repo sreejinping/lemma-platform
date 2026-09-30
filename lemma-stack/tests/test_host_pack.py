@@ -32,7 +32,7 @@ def _pack(tmp_path):
         "backend/python/bin/python3",
         "frontend/node/bin/node",
         "frontend/frontend-launcher.mjs",
-        "frontend/app/server.js",
+        "frontend/lemma-frontend/server.mjs",
         "backend/assets/browser-sdk/lemma-client.js",
         "backend/assets/browser-sdk/lemma-ui.js",
     ):
@@ -154,3 +154,26 @@ def test_manifest_is_private_and_atomic(paths, tmp_path):
     assert json.loads(destination.read_text()) == {"secret": "value"}
     assert destination.stat().st_mode & 0o777 == 0o600
     assert not list(destination.parent.glob("*.tmp-*"))
+
+
+def test_source_mode_runs_the_workspace_frontend_not_the_harness(paths, tmp_path):
+    for name in ("lemma-backend", "lemma-harness", "lemma-frontend", "desktop/runtime"):
+        (tmp_path / name).mkdir(parents=True)
+    (tmp_path / "desktop/runtime/frontend-launcher.mjs").write_text("")
+    manifest = build_manifest(
+        tmp_path, paths, store.new_document(), _release(), source_root=tmp_path
+    )
+    frontend = next(service for service in manifest["services"] if service["id"] == "frontend")
+    assert frontend["command"][-1] == str(tmp_path / "lemma-frontend")
+
+
+@pytest.mark.parametrize("layout", ["lemma-frontend/server.mjs", "server.mjs"])
+def test_packaged_directory_layouts_remain_launchable(paths, tmp_path, layout):
+    root = _pack(tmp_path)
+    (root / "frontend/lemma-frontend/server.mjs").unlink()
+    server = root / "frontend" / layout
+    server.parent.mkdir(exist_ok=True)
+    server.write_text("test")
+    manifest = build_manifest(root, paths, store.new_document(), _release())
+    frontend = next(service for service in manifest["services"] if service["id"] == "frontend")
+    assert frontend["command"][-1] == str(server)

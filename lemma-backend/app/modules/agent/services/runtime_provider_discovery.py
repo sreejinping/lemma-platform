@@ -9,13 +9,17 @@ from __future__ import annotations
 import ipaddress
 import socket
 from dataclasses import dataclass
-from urllib.parse import urlparse
+from urllib.parse import ParseResult, urlparse
 
 import httpx
 
 from app.core.config import settings
+from app.core.exposure import exposure_settings, local_relaxations_allowed
 from app.core.log.log import get_logger
 from app.core.concurrency.offload import run_blocking
+from app.modules.agent.infrastructure.transport_errors import (
+    local_model_server_name,
+)
 from app.modules.agent.services.context_budget import (
     catalog_metadata_for,
 )
@@ -47,12 +51,49 @@ class DiscoveredModel:
     context_window: int | None = None
 
 
+class ProviderKeyRejectedError(ValueError):
+    """The provider answered the model listing with 401/403.
+
+    Raised rather than folded into "nothing discovered": a rejected key is the
+    commonest mistake when adding a provider, and treating it as an empty list
+    saved a profile that read "Available" and then failed every run.
+    """
+
+
+class ProviderUnreachableError(ValueError):
+    """Nothing answered at the provider's address: refused, or timed out.
+
+    ``local_server_name`` is set when the address was this computer, where the
+    likely fix is "start the model server" rather than "check the URL".
+    """
+
+    def __init__(self, local_server_name: str | None) -> None:
+        super().__init__(local_server_name or "unreachable")
+        self.local_server_name = local_server_name
+
+
+class ProviderListingError(ValueError):
+    """The provider answered, but not with a model list it would share."""
+
+
+def key_rejected_message(provider_name: str) -> str:
+    return f"{provider_name} rejected this API key."
+
+
+def catalog_unreadable_message(provider_name: str) -> str:
+    return (
+        f"Couldn't read the model list from {provider_name}. Check the key, "
+        "or type a model name below."
+    )
+
+
 def _provider_model_catalog(
     *,
     discovered_models: list[DiscoveredModel],
     fallback_model_names: list[str],
     explicit_vision_model_names: set[str] | None = None,
     default_vision: bool = False,
+    provider_name: str = "the provider",
 ) -> list[RuntimeModelCatalogEntry]:
     """Build a model catalog, marking each model VISION-capable when the
     provider advertised image input (``DiscoveredModel.supports_vision``), the
@@ -79,9 +120,7 @@ def _provider_model_catalog(
             order.append(name)
             vision_by_name[name] = False
     if not order:
-        raise ValueError(
-            "Provider model catalog could not be discovered; provide model_names"
-        )
+        raise ValueError(catalog_unreadable_message(provider_name))
     catalog: list[RuntimeModelCatalogEntry] = []
     for name in order:
         supports_vision = default_vision or vision_by_name[name] or name in explicit
@@ -125,14 +164,38 @@ async def _discover_openai_compatible_models(
     api_key: str | None,
     headers: dict[str, str],
 ) -> list[DiscoveredModel]:
+    return await _discover_models(
+        _openai_listing_request(base_url=base_url, api_key=api_key, headers=headers)
+    )
+
+
+async def list_openai_compatible_models(
+    *,
+    base_url: str,
+    api_key: str | None,
+    headers: dict[str, str],
+) -> list[DiscoveredModel]:
+    """`_discover_openai_compatible_models`, saying why when it gets nothing."""
+    return await _list_models(
+        _openai_listing_request(base_url=base_url, api_key=api_key, headers=headers)
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class _ListingRequest:
+    """Where a provider lists its models, and what to send."""
+
+    url: str
+    headers: dict[str, str]
+
+
+def _openai_listing_request(
+    *, base_url: str, api_key: str | None, headers: dict[str, str]
+) -> _ListingRequest:
     request_headers = dict(headers)
     if api_key:
         request_headers.setdefault("Authorization", f"Bearer {api_key}")
-    return await _discover_models(
-        url=_join_url(base_url, "models"),
-        headers=request_headers,
-        parser=_parse_openai_compatible_models,
-    )
+    return _ListingRequest(url=_join_url(base_url, "models"), headers=request_headers)
 
 
 async def _discover_anthropic_compatible_models(
@@ -141,19 +204,147 @@ async def _discover_anthropic_compatible_models(
     api_key: str,
     headers: dict[str, str],
 ) -> list[DiscoveredModel]:
-    request_headers = {
-        "x-api-key": api_key,
-        "anthropic-version": "2023-06-01",
-        **headers,
-    }
     return await _discover_models(
-        url=_join_url(base_url, "models"),
-        headers=request_headers,
-        parser=_parse_openai_compatible_models,
+        _anthropic_listing_request(base_url=base_url, api_key=api_key, headers=headers)
     )
 
 
+async def list_anthropic_compatible_models(
+    *,
+    base_url: str,
+    api_key: str,
+    headers: dict[str, str],
+) -> list[DiscoveredModel]:
+    """`_discover_anthropic_compatible_models`, saying why when it gets nothing."""
+    return await _list_models(
+        _anthropic_listing_request(base_url=base_url, api_key=api_key, headers=headers)
+    )
+
+
+def _anthropic_listing_request(
+    *, base_url: str, api_key: str, headers: dict[str, str]
+) -> _ListingRequest:
+    return _ListingRequest(
+        url=_anthropic_models_url(base_url),
+        headers={
+            "x-api-key": api_key,
+            "anthropic-version": "2023-06-01",
+            **headers,
+        },
+    )
+
+
+def _anthropic_models_url(base_url: str) -> str:
+    """Where an Anthropic-compatible route lists its models.
+
+    The base URL is the one the Anthropic SDK takes -- ``https://api.anthropic.com``,
+    to which it appends ``/v1/messages`` -- so the listing is ``/v1/models``,
+    not ``/models``. A route given with the version already on it is left
+    alone rather than doubled.
+    """
+    trimmed = base_url.rstrip("/")
+    if trimmed.endswith("/v1"):
+        return f"{trimmed}/models"
+    return f"{trimmed}/v1/models"
+
+
 _PUBLIC_URL_ERROR = "base_url must be a public http(s) URL"
+_SHARED_LOOPBACK_ERROR = (
+    "Models on this computer can't be added while Lemma is shared: other "
+    "people's requests would reach your computer. Turn sharing off to add it."
+)
+
+
+def lemma_service_ports() -> frozenset[int]:
+    """The loopback ports this installation's own services listen on.
+
+    A model provider at one of these is not a model provider: it is the API
+    (whose own routes then receive the provider's bearer key), the web app,
+    Postgres, Redis or SuperTokens, reached from inside the backend. Read from
+    the URLs the backend is configured with, so a Desktop install's random
+    ports are covered without being named anywhere.
+    """
+    configured = (
+        settings.api_url,
+        settings.frontend_url,
+        settings.auth_frontend_url,
+        settings.supertokens_core_url,
+        settings.database_url,
+        settings.redis_url,
+    )
+    return frozenset(port for raw in configured if (port := _port_of(raw)))
+
+
+def _port_of(raw: str | None) -> int | None:
+    try:
+        return urlparse(str(raw)).port if raw else None
+    except ValueError:
+        return None
+
+
+def _loopback_allowed_for(parsed: ParseResult) -> bool:
+    """Local and unshared, and not a port this installation serves on."""
+    if not local_relaxations_allowed():
+        return False
+    try:
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    except ValueError as exc:
+        raise ValueError(_PUBLIC_URL_ERROR) from exc
+    return port not in lemma_service_ports()
+
+
+def _refuse_loopback_while_shared(
+    ip: ipaddress.IPv4Address | ipaddress.IPv6Address,
+) -> None:
+    """Say why a model server on this computer is refused, when the reason is
+    sharing.
+
+    The one refusal a person can act on: it is their own model server, and
+    loopback is closed only while the installation is shared. The generic
+    "must be a public URL" read as "your URL is malformed".
+    """
+    if (
+        ip.is_loopback
+        and settings.is_local_mode()
+        and exposure_settings.installation_shared
+    ):
+        raise ValueError(_SHARED_LOOPBACK_ERROR)
+
+
+def _unresolvable_host_allowed() -> bool:
+    """Whether a name that resolves nowhere may pass, which is only under test.
+
+    The product scenarios point a provider at a reserved name that their egress
+    proxy answers for, as they do for connectors, whose guard
+    (``app.core.net.url_guard``) makes the same allowance. What the guard
+    refuses is unchanged: an address literal, and a name that resolves into
+    private space, are still checked. Not in ``local``, where a name that
+    resolves nowhere is a typo, and saying so beats saving a provider that no
+    run can reach.
+    """
+    return settings.environment == "testing"
+
+
+async def _addresses_of(host: str) -> list[str] | None:
+    """The addresses to check for ``host``; ``None`` when there are none to check.
+
+    ``None`` only for a name that resolves nowhere where that is allowed -- see
+    `_unresolvable_host_allowed`. An address literal is its own answer.
+    """
+    try:
+        ipaddress.ip_address(host)
+        return [host]
+    except ValueError:
+        pass
+    try:
+        infos = await run_blocking(
+            socket.getaddrinfo, host, None, limiter="external_http"
+        )
+    except OSError as exc:
+        if _unresolvable_host_allowed():
+            return None
+        raise ValueError(_PUBLIC_URL_ERROR) from exc
+    return [str(info[4][0]) for info in infos]
 
 
 async def _validate_public_base_url(url: str) -> None:
@@ -163,27 +354,20 @@ async def _validate_public_base_url(url: str) -> None:
     schemes and any host that resolves to a loopback/private/link-local/reserved
     address (e.g. ``http://169.254.169.254/`` cloud metadata, ``http://10.x``).
     Loopback is permitted in local/testing mode so development against a model
-    server on localhost still works. (Note: this validates at resolve time; it
-    does not pin the connection, so it is not fully DNS-rebinding-proof — it
-    closes the practical metadata/internal-service vector.)
+    server on localhost still works -- but not while the installation is shared,
+    when "a member" is anybody who joined over the network, and never on a port
+    Lemma itself serves on. (Note: this validates at resolve time; it does not
+    pin the connection, so it is not fully DNS-rebinding-proof — it closes the
+    practical metadata/internal-service vector.)
     """
     parsed = urlparse(url)
     if parsed.scheme not in ("http", "https") or not parsed.hostname:
         raise ValueError(_PUBLIC_URL_ERROR)
     host = parsed.hostname
-    allow_loopback = settings.is_local_mode()
-    candidates: list[str] = []
-    try:
-        ipaddress.ip_address(host)
-        candidates.append(host)
-    except ValueError:
-        try:
-            infos = await run_blocking(
-                socket.getaddrinfo, host, None, limiter="external_http"
-            )
-        except OSError as exc:
-            raise ValueError(_PUBLIC_URL_ERROR) from exc
-        candidates.extend(str(info[4][0]) for info in infos)
+    allow_loopback = _loopback_allowed_for(parsed)
+    candidates = await _addresses_of(host)
+    if candidates is None:
+        return
     if not candidates:
         raise ValueError(_PUBLIC_URL_ERROR)
     for addr in candidates:
@@ -193,6 +377,7 @@ async def _validate_public_base_url(url: str) -> None:
             raise ValueError(_PUBLIC_URL_ERROR) from exc
         if ip.is_loopback and allow_loopback:
             continue
+        _refuse_loopback_while_shared(ip)
         if (
             ip.is_private
             or ip.is_loopback
@@ -204,24 +389,46 @@ async def _validate_public_base_url(url: str) -> None:
             raise ValueError(_PUBLIC_URL_ERROR)
 
 
-async def _discover_models(
-    *,
-    url: str,
-    headers: dict[str, str],
-    parser,
-) -> list[DiscoveredModel]:
-    await _validate_public_base_url(url)
+async def _discover_models(request: _ListingRequest) -> list[DiscoveredModel]:
+    """The provider's models, or none when it could not be asked.
+
+    Creating a profile tolerates an empty answer -- the caller may type model
+    names instead -- so only a rejected key and an unsafe URL propagate.
+    """
+    try:
+        return await _list_models(request)
+    except ProviderUnreachableError, ProviderListingError:
+        # Not an error at this layer: the create form falls back to the names
+        # the person typed, and says so when there are none.
+        return []
+
+
+async def _list_models(request: _ListingRequest) -> list[DiscoveredModel]:
+    """The provider's models, raising a typed reason when there are none to read.
+
+    Raises `ProviderKeyRejectedError` for 401/403, `ProviderUnreachableError`
+    when nothing answered, `ProviderListingError` for any other answer that is
+    not a model list, and ``ValueError`` for a URL the SSRF guard refuses.
+    """
+    await _validate_public_base_url(request.url)
     try:
         async with httpx.AsyncClient(timeout=10) as client:
-            response = await client.get(url, headers=headers)
+            response = await client.get(request.url, headers=request.headers)
         response.raise_for_status()
-    except httpx.HTTPError:
-        return []
+    except httpx.HTTPStatusError as exc:
+        if exc.response.status_code in (401, 403):
+            raise ProviderKeyRejectedError(str(exc.response.status_code)) from exc
+        raise ProviderListingError(str(exc.response.status_code)) from exc
+    except (httpx.ConnectError, httpx.TimeoutException) as exc:
+        raise ProviderUnreachableError(local_model_server_name(exc)) from exc
+    except httpx.HTTPError as exc:
+        raise ProviderListingError(type(exc).__name__) from exc
     try:
         payload = response.json()
-    except ValueError:
-        return []
-    return parser(payload)
+    except ValueError as exc:
+        raise ProviderListingError("not JSON") from exc
+    # Anthropic's listing has the same `data: [{id}]` shape as OpenAI's.
+    return _parse_openai_compatible_models(payload)
 
 
 def _parse_openai_compatible_models(payload: object) -> list[DiscoveredModel]:

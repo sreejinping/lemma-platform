@@ -88,13 +88,14 @@ def _packaged_bindings(root: Path) -> _Bindings:
         "frontend launcher",
         ("frontend/frontend-launcher.mjs",),
     )
+    # lemma-frontend's custom server, not Next's generated `server.js`: only
+    # the custom server carries the voice and live-call WebSocket gateways.
     frontend_server = _required_file(
         root,
-        "Next.js standalone server",
+        "frontend server",
         (
-            "frontend/server.js",
-            "frontend/app/server.js",
-            "frontend/lemma-frontend/server.js",
+            "frontend/lemma-frontend/server.mjs",
+            "frontend/server.mjs",
         ),
     )
     backend_dir = (root / "backend").resolve()

@@ -29,8 +29,52 @@ class AgentHostPairingRejected(AgentHostRepositoryError):
     code = "AGENT_HOST_PAIRING_REJECTED"
 
 
+#: What the host shows when the account removed this computer. The Desktop
+#: frontend matches on "was removed from this account"; keep the phrase.
+INSTALLATION_REVOKED_MESSAGE = (
+    "This computer was removed from this account. Connect it again from "
+    "Lemma to turn it back on."
+)
+
+
+class AgentHostInstallationRevoked(AgentHostPairingRejected):
+    """A pairing for an installation its user removed, without ``reenable``.
+
+    Removing a computer has to stick: the host's auto-connect would otherwise
+    pair it again seconds later. Only a pairing the person asked for from the
+    app (``reenable``) brings it back.
+    """
+
+    code = "installation_revoked"
+
+    def __init__(self) -> None:
+        super().__init__(INSTALLATION_REVOKED_MESSAGE)
+
+
 class AgentHostProtocolViolation(AgentHostRepositoryError):
     code = "AGENT_HOST_PROTOCOL_VIOLATION"
+
+
+class AgentHostStaleLease(AgentHostProtocolViolation):
+    """A batch for a lease epoch that has since been superseded.
+
+    The three protocol violations below are subclasses rather than new codes so
+    everything that already catches ``AgentHostProtocolViolation`` keeps doing
+    so. They exist because the link answers each with its own error code: the
+    host drops its outbox for a run it no longer owns, resends from the
+    watermark after a gap, and stops sending to a run that already ended.
+    Distinguishing them used to mean reading the message text of one 409.
+    """
+
+    code = "AGENT_HOST_STALE_LEASE"
+
+
+class AgentHostSequenceGap(AgentHostProtocolViolation):
+    code = "AGENT_HOST_SEQUENCE_GAP"
+
+
+class AgentHostTerminalRun(AgentHostProtocolViolation):
+    code = "AGENT_HOST_TERMINAL_RUN"
 
 
 class AgentHostRunConflict(AgentHostRepositoryError):

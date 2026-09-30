@@ -1,0 +1,1110 @@
+import { desktopBridgeAvailable, invoke } from "./bridge";
+import { readDiskUsage, type DiskUsage } from "./disk-space";
+
+/** This computer's own settings, as Settings → This Mac reads and writes them.
+ *
+ *  Everything here reaches the shell through `invoke`, and every command it
+ *  names refuses in Rust unless the caller is this installation's own
+ *  workspace on its loopback origin (`desktop/src/workspace_settings.rs`). So
+ *  this file decides what to *show*; it is never what decides who may act.
+ *
+ *  Pure where it can be. The React panels in `this-mac-*.tsx` are thin over
+ *  these, and `tests/this-mac.test.ts` drives these with a pretend shell. */
+
+/* ── who sees it ───────────────────────────────────────────────────── */
+
+/** The loopback hosts a local install serves its workspace on.
+ *
+ *  Kept in step with `TRUSTED_LOCAL_BASES` in `desktop/src/main.rs`, whose
+ *  hosts the shell grants its commands on their exact origin at runtime. A
+ *  page anywhere else -- the LAN address or tunnel host sharing moves this
+ *  window to -- is one the shell will not answer, whatever it asks. */
+const LOCAL_WORKSPACE_HOSTS = ["app.lemma.localhost"];
+
+export function onLocalWorkspaceOrigin(): boolean {
+    if (typeof window === "undefined") return false;
+    return LOCAL_WORKSPACE_HOSTS.includes(window.location?.hostname ?? "");
+}
+
+/** What the This Mac group should be, on this page.
+ *
+ *  There is no account check. Who may change this computer is decided by where
+ *  the page is, not who is signed in: the desktop app's own window, on this
+ *  installation's loopback origin, is the person at this Mac -- the same rule
+ *  the shell enforces on every command (`workspace_settings.rs`).
+ *
+ *  - `hidden`: a browser, a hosted workspace, or anything that is not a local
+ *    install. Nothing is drawn, not even a hint: a machine's settings are not
+ *    a thing a visitor should learn exist.
+ *  - `elsewhere`: in the app, on a local install, but on a shared origin. The
+ *    shell will not answer here, so the group says where the settings are
+ *    instead of offering controls that would fail.
+ *  - `shown`: in the app, on this installation's own loopback origin.
+ *  - `pending`: the origin has not been read yet (it is read after mount). */
+export type ThisMacAvailability = "hidden" | "pending" | "elsewhere" | "shown";
+
+export function thisMacAvailability({
+    bridge,
+    localDeployment,
+    localOrigin,
+}: {
+    bridge: boolean;
+    localDeployment: boolean;
+    localOrigin: boolean | null;
+}): ThisMacAvailability {
+    if (!bridge || !localDeployment) return "hidden";
+    if (localOrigin === null) return "pending";
+    return localOrigin ? "shown" : "elsewhere";
+}
+
+/* ── the snapshot ──────────────────────────────────────────────────── */
+
+export interface IntegrationConfig {
+    composio_enabled: boolean;
+    google_client_id: string;
+    microsoft_client_id: string;
+    github_client_id: string;
+    slack_client_id: string;
+}
+
+export interface SurfaceConfig {
+    slack_socket_mode: boolean;
+    telegram_polling: boolean;
+    teams_app_id: string;
+    teams_tenant_id: string;
+    whatsapp_phone_number_id: string;
+    whatsapp_waba_id: string;
+    resend_inbound_domain: string;
+}
+
+export interface OperatorAi {
+    protocol: string;
+    base_url: string;
+    default_model: string;
+    models: string[];
+    vision_models: string[];
+    allow_private_network: boolean;
+    last_validated_at_unix_ms: number | null;
+    /** Reads images for teammates whose own model cannot. Empty: none chosen. */
+    image_model: string;
+    /** Titles and summaries. Empty: the default model does them. */
+    fast_model: string;
+}
+
+export type EmailProvider = "none" | "resend" | "smtp";
+
+export interface EmailConfig {
+    provider: EmailProvider;
+    from_email: string;
+    smtp_host: string;
+    smtp_port: number;
+    smtp_user: string;
+    smtp_use_tls: boolean;
+}
+
+export type SharingMode = "this_computer" | "local_network" | "public";
+export type WhoCanJoin = "invite_only" | "open";
+export type TunnelProvider = "ngrok" | "cloudflare";
+
+export interface ProviderReadiness {
+    installed: boolean;
+    authenticated: boolean;
+    version: string | null;
+    message: string | null;
+    instructions: string[];
+    tunnels: { id: string; name: string }[];
+}
+
+export interface Sharing {
+    mode: SharingMode;
+    phase: string;
+    canonical_url: string;
+    provider: TunnelProvider | null;
+    provider_readiness: Partial<Record<TunnelProvider, ProviderReadiness>>;
+    warnings: string[];
+    last_error: string | null;
+    interfaces: { name: string; address: string; label: string }[];
+    selected_interface: string | null;
+    qr_svg: string | null;
+    transition_running: boolean;
+    who_can_join: WhoCanJoin;
+    public_confirmation: string;
+    apps_limitation: string;
+    preferences: {
+        cloudflare_setup?: "automatic" | "existing";
+        cloudflare_hostname?: string | null;
+        cloudflare_tunnel_id?: string | null;
+        cloudflare_tunnel_owned?: boolean;
+        cloudflare_tunnel_name?: string | null;
+        selected_interface?: string | null;
+        last_provider?: TunnelProvider | null;
+    };
+}
+
+export interface ThisMacSnapshot {
+    release: string | null;
+    state: { ready: boolean; running: boolean; status: string; last_error: string | null; url: string; api_url: string };
+    services: { id: string; running: boolean; circuit_open?: boolean }[];
+    operator: {
+        config: { revision: number; ai: OperatorAi; integrations: IntegrationConfig; surfaces: SurfaceConfig; email: EmailConfig };
+        secrets: Record<string, boolean>;
+        readiness: Record<string, string>;
+    };
+    sharing: Sharing | null;
+    sandbox_images: { state: string; detail: string; done_mb?: number | null; total_mb?: number | null } | null;
+    paths: { locald: string; logs: string } | null;
+    /** What Lemma takes on this disk; null from a shell that predates it. */
+    disk_usage: DiskUsage | null;
+    app: { version: string; channel: string; updates_supported: boolean; start_at_login: boolean; repair_available: boolean };
+    /** What the background service's start found that someone has to act
+     *  on. Optional so a hand-built snapshot need not name it. */
+    warnings?: StartupWarning[];
+}
+
+const record = (value: unknown): Record<string, unknown> =>
+    value && typeof value === "object" && !Array.isArray(value) ? (value as Record<string, unknown>) : {};
+const text = (value: unknown, fallback = ""): string => (typeof value === "string" ? value : fallback);
+const flag = (value: unknown): boolean => value === true;
+const strings = (value: unknown): string[] => (Array.isArray(value) ? value.filter((one) => typeof one === "string") : []);
+
+/** Narrow the shell's loose JSON. The Rust side is free to add fields; what
+ *  this page reads has a default, so a missing one degrades to "not set"
+ *  rather than a crash inside Settings. */
+export function readSnapshot(payload: unknown): ThisMacSnapshot {
+    const raw = record(payload);
+    const state = record(raw.state);
+    const operator = record(raw.operator);
+    const config = record(operator.config);
+    const ai = record(config.ai);
+    const integrations = record(config.integrations);
+    const surfaces = record(config.surfaces);
+    const email = record(config.email);
+    const provider = text(email.provider, "none");
+    const app = record(raw.app);
+    const sharing = raw.sharing && typeof raw.sharing === "object" ? readSharing(raw.sharing) : null;
+    const images = record(raw.sandbox_images);
+    const paths = record(raw.paths);
+    return {
+        release: typeof raw.release === "string" ? raw.release : null,
+        state: {
+            ready: flag(state.ready),
+            running: flag(state.running),
+            status: text(state.status),
+            last_error: typeof state.last_error === "string" && state.last_error ? state.last_error : null,
+            url: text(state.url),
+            api_url: text(state.api_url),
+        },
+        services: (Array.isArray(raw.services) ? raw.services : []).map((one) => {
+            const service = record(one);
+            return { id: text(service.id), running: flag(service.running), circuit_open: flag(service.circuit_open) };
+        }),
+        operator: {
+            config: {
+                revision: typeof config.revision === "number" ? config.revision : 0,
+                ai: {
+                    protocol: text(ai.protocol, "unconfigured"),
+                    base_url: text(ai.base_url),
+                    default_model: text(ai.default_model),
+                    models: strings(ai.models),
+                    vision_models: strings(ai.vision_models),
+                    allow_private_network: flag(ai.allow_private_network),
+                    last_validated_at_unix_ms: typeof ai.last_validated_at_unix_ms === "number" ? ai.last_validated_at_unix_ms : null,
+                    image_model: text(ai.image_model),
+                    fast_model: text(ai.fast_model),
+                },
+                integrations: {
+                    composio_enabled: flag(integrations.composio_enabled),
+                    google_client_id: text(integrations.google_client_id),
+                    microsoft_client_id: text(integrations.microsoft_client_id),
+                    github_client_id: text(integrations.github_client_id),
+                    slack_client_id: text(integrations.slack_client_id),
+                },
+                surfaces: {
+                    slack_socket_mode: flag(surfaces.slack_socket_mode),
+                    telegram_polling: flag(surfaces.telegram_polling),
+                    teams_app_id: text(surfaces.teams_app_id),
+                    teams_tenant_id: text(surfaces.teams_tenant_id),
+                    whatsapp_phone_number_id: text(surfaces.whatsapp_phone_number_id),
+                    whatsapp_waba_id: text(surfaces.whatsapp_waba_id),
+                    resend_inbound_domain: text(surfaces.resend_inbound_domain),
+                },
+                email: {
+                    provider: provider === "resend" || provider === "smtp" ? provider : "none",
+                    from_email: text(email.from_email),
+                    smtp_host: text(email.smtp_host),
+                    smtp_port: typeof email.smtp_port === "number" && email.smtp_port > 0 ? email.smtp_port : 587,
+                    smtp_user: text(email.smtp_user),
+                    smtp_use_tls: email.smtp_use_tls !== false,
+                },
+            },
+            secrets: Object.fromEntries(Object.entries(record(operator.secrets)).map(([key, value]) => [key, value === true])),
+            readiness: Object.fromEntries(Object.entries(record(operator.readiness)).map(([key, value]) => [key, text(value)])),
+        },
+        sharing,
+        sandbox_images: raw.sandbox_images
+            ? {
+                  state: text(images.state, "unknown"),
+                  detail: text(images.detail),
+                  done_mb: typeof images.done_mb === "number" ? images.done_mb : null,
+                  total_mb: typeof images.total_mb === "number" ? images.total_mb : null,
+              }
+            : null,
+        paths: raw.paths ? { locald: text(paths.locald), logs: text(paths.logs) } : null,
+        disk_usage: readDiskUsage(raw.disk_usage),
+        warnings: readStartupWarnings(raw.warnings),
+        app: {
+            version: text(app.version),
+            channel: text(app.channel, "dev"),
+            updates_supported: flag(app.updates_supported),
+            start_at_login: flag(app.start_at_login),
+            repair_available: flag(app.repair_available),
+        },
+    };
+}
+
+/** One of the background service's startup warnings. `code` is what the page
+ *  switches on; `message` is the daemon's sentence, already written for a
+ *  person and naming the versions involved. */
+export interface StartupWarning {
+    code: string;
+    message: string;
+    version: string | null;
+}
+
+export function readStartupWarnings(value: unknown): StartupWarning[] {
+    return (Array.isArray(value) ? value : []).flatMap((one) => {
+        const warning = record(one);
+        const message = text(warning.message).trim();
+        return message ? [{ code: text(warning.code), message, version: text(warning.version) || null }] : [];
+    });
+}
+
+/** What Overview calls a warning, and where its next step is. */
+export function startupWarningLine(warning: StartupWarning): { title: string; next: "updates" | "logs" } {
+    switch (warning.code) {
+        case "update-interrupted": return { title: "Your last update didn’t finish.", next: "updates" };
+        case "update-record-unreadable": return { title: "Lemma couldn’t read an update in progress.", next: "updates" };
+        case "settings-writes-disabled": return { title: "Settings changes are turned off.", next: "logs" };
+        default: return { title: "Lemma repaired something while starting.", next: "logs" };
+    }
+}
+
+export function readSharing(payload: unknown): Sharing {
+    const raw = record(payload);
+    const readiness = record(raw.provider_readiness);
+    const provider = (value: unknown): ProviderReadiness => {
+        const one = record(value);
+        return {
+            installed: flag(one.installed),
+            authenticated: flag(one.authenticated),
+            version: typeof one.version === "string" ? one.version : null,
+            message: typeof one.message === "string" ? one.message : null,
+            instructions: strings(one.instructions),
+            tunnels: (Array.isArray(one.tunnels) ? one.tunnels : []).map((tunnel) => {
+                const t = record(tunnel);
+                return { id: text(t.id), name: text(t.name) };
+            }),
+        };
+    };
+    const mode = text(raw.mode, "this_computer");
+    return {
+        mode: mode === "local_network" || mode === "public" ? mode : "this_computer",
+        phase: text(raw.phase, "ready"),
+        canonical_url: text(raw.canonical_url),
+        provider: raw.provider === "ngrok" || raw.provider === "cloudflare" ? raw.provider : null,
+        provider_readiness: {
+            ...(readiness.ngrok ? { ngrok: provider(readiness.ngrok) } : {}),
+            ...(readiness.cloudflare ? { cloudflare: provider(readiness.cloudflare) } : {}),
+        },
+        warnings: strings(raw.warnings),
+        last_error: typeof raw.last_error === "string" && raw.last_error ? raw.last_error : null,
+        interfaces: (Array.isArray(raw.interfaces) ? raw.interfaces : []).map((one) => {
+            const item = record(one);
+            return { name: text(item.name), address: text(item.address), label: text(item.label) };
+        }),
+        selected_interface: typeof raw.selected_interface === "string" ? raw.selected_interface : null,
+        qr_svg: typeof raw.qr_svg === "string" && raw.qr_svg ? raw.qr_svg : null,
+        transition_running: flag(raw.transition_running),
+        who_can_join: raw.who_can_join === "open" ? "open" : "invite_only",
+        public_confirmation: text(raw.public_confirmation),
+        apps_limitation: text(raw.apps_limitation),
+        preferences: record(raw.preferences) as Sharing["preferences"],
+    };
+}
+
+/* ── the commands ──────────────────────────────────────────────────── */
+
+/** What This Mac may ask of the shell. Every one of these is in
+ *  `WORKSPACE_COMMANDS`, granted in `workspace.json`, and caller-checked. */
+export const thisMac = {
+    snapshot: async () => readSnapshot(await invoke("local_settings_snapshot")),
+    applySection: (payload: SectionPayload | SectionsPayload) => invoke("apply_local_settings", { payload }),
+    sharing: (action: "snapshot" | "preflight" | "enable" | "disable" | "access", payload?: Record<string, unknown>) =>
+        invoke<{ cancelled?: boolean; event?: string; sharing?: unknown; preflight?: unknown }>("local_sharing", { action, payload }),
+    setStartAtLogin: (enabled: boolean) => invoke<boolean>("set_start_at_login", { enabled }),
+    /** Answers with the Agent Host's fresh status. */
+    setHostExecution: (enabled: boolean) => invoke<unknown>("set_host_execution", { enabled }),
+    /** True when it ran, false when the native confirmation was declined. */
+    repair: () => invoke<boolean>("repair_runtime"),
+    openLogs: () => invoke("open_logs"),
+    prepareSandbox: () => invoke("prepare_sandbox_image", { id: "this-mac-" + Date.now() }),
+    checkUpdate: () => invoke<AppUpdateStatus>("check_for_app_update"),
+    installUpdate: (expectedVersion: string) => invoke("install_app_update", { resetData: false, expectedVersion }),
+    telemetryStatus: () => invoke<{ available?: boolean; enabled?: boolean; host?: string; install_id?: string }>("telemetry_status"),
+    setTelemetry: (enabled: boolean) => invoke("set_telemetry_enabled", { enabled }),
+    diagnosticLogs: (source: string | null, cursor: string | null) =>
+        invoke<{ entries?: string; nextCursor?: string | null; sources?: { id: string; label: string }[] }>("diagnostic_logs", { source, cursor }),
+    discoverModels: (payload: Record<string, unknown>) => invoke<unknown>("discover_provider_models", { payload }),
+    /** Server setup's Test: one read-only request, made by the daemon with the
+     *  typed credential or the stored one. */
+    /** Both ask natively before the backup goes; `cancelled` when declined. */
+    deleteUpdateBackup: () => invoke<unknown>("delete_update_backup"),
+    freeUpSpace: () => invoke<unknown>("free_up_disk_space"),
+    testSetup: (payload: SetupTestPayload) => invoke<{ detail?: unknown; models?: unknown }>("test_server_setup", { payload }),
+};
+
+/** What a Test sends. `ai` tests a provider draft; every other service one key. */
+export type SetupTestPayload =
+    | { service: "ai"; ai: Record<string, unknown>; api_key?: string }
+    | { service: SetupService; credential?: string; from_email?: string };
+
+export type SetupService = "composio" | "telegram" | "slack" | "deepgram" | "brave" | "resend" | "gemini";
+
+/* ── run commands on this Mac ──────────────────────────────────────── */
+
+/** What turning the switch on means, for the computer it is on. */
+export function hostExecutionConsequence(noun = "this Mac"): string {
+    return `Commands run on ${noun} inside a sandbox: they can read most files, write only to the conversation folder and caches, and use your gh/git logins. Everything else still runs in the VM.`;
+}
+
+export interface HostExecutionRow {
+    checked: boolean;
+    /** Why the switch cannot be used, or null when it can. */
+    blocked: string | null;
+    consequence: string;
+}
+
+/** What the shell says when the owner's pairing with this Lemma does not
+ *  exist yet, and the switch was flipped anyway. */
+const NOT_PAIRED_HERE = /not paired with the Lemma installed on it/i;
+
+/** Said while the switch waits for this computer to finish connecting. */
+export function notConnectedYet(noun: string): string {
+    return `Available once ${noun} finishes connecting.`;
+}
+
+/** Said when the shell will not report on the service at all. */
+export const AGENT_SERVICE_SILENT = "Lemma’s agent service isn’t responding. Restart Lemma.";
+
+/** The "Run commands on this Mac" switch, from the Agent Host's status.
+ *  Pure, so what it says in each state is tested without a page. */
+export function hostExecutionRow(
+    status: { available?: boolean; host_execution: { enabled: boolean; available: boolean } | null } | null,
+    noun = "this Mac",
+): HostExecutionRow {
+    const consequence = hostExecutionConsequence(noun);
+    /* A build without the Agent Host will never answer, so waiting for it
+       would be a stage nobody can leave. */
+    if (status?.available === false) {
+        return { checked: false, blocked: "This build of Lemma doesn’t include the Agent Host.", consequence };
+    }
+    const setting = status?.host_execution ?? null;
+    if (!setting) {
+        return { checked: false, blocked: "Waiting for this computer’s Agent Host…", consequence };
+    }
+    if (!setting.available) {
+        return {
+            checked: false,
+            blocked: "Only available on macOS, which can confine commands in a sandbox. Commands run in the VM.",
+            consequence,
+        };
+    }
+    return { checked: setting.enabled, blocked: null, consequence };
+}
+
+/** The switch as Settings shows it: {@link hostExecutionRow}, held until this
+ *  computer's own pairing exists, and said in a person's words.
+ *
+ *  The switch belongs to this computer's pairing with the Lemma installed on
+ *  it, so it stays off-limits until that pairing exists: flipped earlier, the
+ *  host refused with its own error text and the switch sprang back. A target
+ *  from an older shell does not say whether it is that pairing, and is given
+ *  the benefit of the doubt. `error` is the shell not answering at all. */
+export function hostExecutionSwitch(
+    status: {
+        available?: boolean;
+        host_execution: { enabled: boolean; available: boolean } | null;
+        targets?: readonly { local?: boolean | null }[];
+    } | null,
+    { error = null, noun = "this Mac" }: { error?: string | null; noun?: string } = {},
+): HostExecutionRow {
+    const row = hostExecutionRow(status, noun);
+    if (!status?.host_execution && status?.available !== false) {
+        return { ...row, blocked: error ? AGENT_SERVICE_SILENT : notConnectedYet(noun) };
+    }
+    if (row.blocked) return row;
+    const targets = status?.targets;
+    if (targets && !targets.some((target) => target.local !== false)) {
+        return { ...row, blocked: notConnectedYet(noun) };
+    }
+    return row;
+}
+
+/** A refusal from flipping the switch, in words. */
+export function hostExecutionError(reason: unknown, noun = "this Mac"): string {
+    const message = reason instanceof Error ? reason.message : String(reason ?? "");
+    if (NOT_PAIRED_HERE.test(message)) return notConnectedYet(noun);
+    if (/control endpoint unavailable|is not connected|disconnected|timed out/i.test(message)) return AGENT_SERVICE_SILENT;
+    return friendlyError(reason);
+}
+
+/** Whether This Mac's commands make sense at all right now. */
+export function thisMacReachable(): boolean {
+    return desktopBridgeAvailable() && onLocalWorkspaceOrigin();
+}
+
+/* ── overview ──────────────────────────────────────────────────────── */
+
+export interface AppUpdateStatus {
+    channel: string;
+    currentVersion: string;
+    buildCommit?: string | null;
+    updatesSupported: boolean;
+    availableVersion?: string | null;
+    runtimeDownloadBytes?: number | null;
+    dataCompatibility: string;
+    installedPostgresMajor?: number | null;
+    candidatePostgresMajor?: number | null;
+}
+
+export function healthState(snapshot: ThisMacSnapshot): "running" | "starting" | "attention" | "stopped" {
+    const services = snapshot.services;
+    if (snapshot.state.last_error && !snapshot.state.ready) return "attention";
+    if (services.some((service) => service.circuit_open)) return "attention";
+    if (snapshot.state.ready && services.length > 0 && services.every((service) => service.running)) return "running";
+    return snapshot.state.running ? "starting" : "stopped";
+}
+
+/** How long a start may take before Overview stops calling it one. A cold
+ *  start migrates and warms models, so this is generous; past it, "Starting"
+ *  would be a stage nobody can leave. */
+export const STARTING_PATIENCE_MS = 3 * 60_000;
+
+/** The services still not running after a start has had its time, or null
+ *  while it is within it (or not starting at all). */
+export function stuckStarting(snapshot: ThisMacSnapshot, startingSinceMs: number | null, nowMs: number): string | null {
+    if (healthState(snapshot) !== "starting" || startingSinceMs === null) return null;
+    if (nowMs - startingSinceMs < STARTING_PATIENCE_MS) return null;
+    const down = snapshot.services.filter((service) => !service.running).map((service) => SERVICE_NAMES[service.id] ?? service.id);
+    return down.length
+        ? `Lemma’s ${down.join(" and ")} ${down.length === 1 ? "isn’t" : "aren’t"} running yet, and should be by now.`
+        : "Lemma is taking longer than it should to start.";
+}
+
+/** What is wrong, when Overview says "Needs attention": the stack's own
+ *  error, or which service stopped. Null when there is nothing to say. */
+export function healthDetail(snapshot: ThisMacSnapshot): string | null {
+    if (healthState(snapshot) !== "attention") return null;
+    if (snapshot.state.last_error) return snapshot.state.last_error;
+    const stopped = snapshot.services.filter((service) => service.circuit_open).map((service) => SERVICE_NAMES[service.id] ?? service.id);
+    return stopped.length
+        ? `Lemma’s ${stopped.join(" and ")} kept stopping, so Lemma stopped restarting ${stopped.length === 1 ? "it" : "them"}.`
+        : null;
+}
+
+const SERVICE_NAMES: Record<string, string> = { backend: "server", frontend: "workspace" };
+
+const HEALTH_WORDS = { running: "Running", starting: "Starting", attention: "Needs attention", stopped: "Stopped" } as const;
+
+/** One line: "Running · v0.8.0 · up to date". The update part only when
+ *  there is something true to say; a build that cannot update itself says
+ *  nothing about being current. */
+export function healthLine(snapshot: ThisMacSnapshot, update: AppUpdateStatus | null): string {
+    const parts: string[] = [HEALTH_WORDS[healthState(snapshot)]];
+    const version = update?.currentVersion || snapshot.app.version;
+    if (version) {
+        const channel = snapshot.app.channel && snapshot.app.channel !== "stable" ? " " + snapshot.app.channel : "";
+        parts.push("v" + version + channel);
+    }
+    /* Not "available" for an update that cannot be installed yet: Updates
+       says why, and the one line here should not promise it. */
+    const blocked = update?.dataCompatibility === "postgres-major-change";
+    if (update?.updatesSupported && !blocked) parts.push(update.availableVersion ? update.availableVersion + " available" : "up to date");
+    return parts.join(" · ");
+}
+
+/* ── coding agents: the sandbox image ──────────────────────────────── */
+
+/** What the sandbox row says, and whether the download is worth offering.
+ *  `not-prepared` and `failed` are the only states where the button does
+ *  anything useful. */
+export function sandboxWording(
+    state: string | null | undefined,
+    noun: string,
+    downloaded: string | null = null,
+): { text: string; offer: boolean } {
+    switch (state) {
+        case "ready":
+            return { text: `Downloaded. Pods can run code, shells and browsers on ${noun}.`, offer: false };
+        case "downloading":
+            return { text: downloaded ? `Downloading… ${downloaded}` : "Downloading…", offer: false };
+        case "failed":
+            return { text: "The last download did not finish. The first task that needs it will try again, or try now.", offer: true };
+        case "unsupported":
+            return { text: "This installation runs no private runtime, so there is nothing to download.", offer: false };
+        case "not-prepared":
+            return { text: "Not downloaded. Coding agents do not need it; pods need it to run code, shells and browsers.", offer: true };
+        default:
+            return { text: "Checking…", offer: false };
+    }
+}
+
+/* ── sharing ───────────────────────────────────────────────────────── */
+
+export function sharingModeName(mode: SharingMode, noun: string): string {
+    if (mode === "local_network") return "Local network";
+    if (mode === "public") return "Public";
+    return noun.charAt(0).toUpperCase() + noun.slice(1);
+}
+
+/** One line of consequence per choice. */
+export function sharingModeConsequence(mode: SharingMode, noun: string): string {
+    if (mode === "local_network") return "Phones and laptops on this Wi-Fi can open Lemma. Use it only on a network you trust.";
+    if (mode === "public") return "Anyone with the link can reach the sign-in page, through your ngrok or Cloudflare account.";
+    return `Only ${noun} can open Lemma.`;
+}
+
+/** Who may create an account, said the way locald says it. Invite-only is the
+ *  default because an unset preference means exactly that on the daemon. */
+export function joinPolicyCopy(whoCanJoin: WhoCanJoin, mode: SharingMode): string {
+    const open = whoCanJoin === "open";
+    if (mode === "public") {
+        return open
+            ? "Anyone with the link can create an account."
+            : "Anyone with the link can reach sign-in. Only people you invite can create an account.";
+    }
+    if (mode === "local_network") {
+        return open ? "Anyone on this network can create an account." : "Only people you invite can create an account.";
+    }
+    return open
+        ? "Once shared, anyone who can reach Lemma can create an account."
+        : "Once shared, only people you invite can create an account.";
+}
+
+/** A sharing transition's phase, in words. */
+export function sharingPhaseWords(phase: string): string {
+    const words: Record<string, string> = {
+        preflight: "Checking",
+        gateway: "Starting the gateway",
+        provisioning_dns: "Setting up the address",
+        starting_tunnel: "Opening the public link",
+        restarting: "Restarting Lemma",
+    };
+    return words[phase] ?? "Working";
+}
+
+/** Whether a transition is under way, from any of the three places that say so. */
+export function sharingBusy(sharing: Sharing | null): boolean {
+    if (!sharing) return false;
+    return sharing.transition_running || !["ready", "error"].includes(sharing.phase || "ready");
+}
+
+export type SharingPlan =
+    | { kind: "lan"; interface: string }
+    | { kind: "public"; provider: TunnelProvider; cloudflareSetup: "automatic" | "existing"; hostname: string; tunnelId: string; tunnelName: string };
+
+/** The enable request for a plan, or the one thing still missing from it. */
+export function enablePayload(plan: SharingPlan): { payload: Record<string, unknown> } | { missing: string } {
+    if (plan.kind === "lan") {
+        if (!plan.interface) return { missing: "Choose the network to share on." };
+        return { payload: { mode: "local_network", interface: plan.interface, public_warning_confirmed: false } };
+    }
+    /* No consent flag from here. The shell sets it only after its own native
+       confirmation, and would clear one this page sent. */
+    const payload: Record<string, unknown> = { mode: "public", provider: plan.provider };
+    if (plan.provider === "cloudflare") {
+        const hostname = plan.hostname.trim();
+        if (!hostname) return { missing: "Enter the public hostname to create in your Cloudflare zone." };
+        payload.cloudflare_setup = plan.cloudflareSetup;
+        payload.hostname = hostname;
+        if (plan.cloudflareSetup === "existing") {
+            if (!plan.tunnelId) return { missing: "Choose one of your named tunnels." };
+            payload.cloudflare_tunnel_id = plan.tunnelId;
+            payload.cloudflare_tunnel_name = plan.tunnelName;
+        }
+    }
+    return { payload };
+}
+
+/** Terminal commands the tunnel's own readiness names, so they can be copied. */
+export function setupCommands(readiness: ProviderReadiness | undefined): { command: string | null; text: string }[] {
+    return (readiness?.instructions ?? []).map((instruction) => {
+        const match = /`([^`]+)`/.exec(instruction);
+        return { command: match ? match[1] : null, text: instruction.replace(/`/g, "") };
+    });
+}
+
+/* ── updates ───────────────────────────────────────────────────────── */
+
+export function formatBytes(bytes: number | null | undefined): string | null {
+    if (!bytes || !Number.isFinite(bytes) || bytes <= 0) return null;
+    const mb = bytes / (1024 * 1024);
+    return mb >= 1024 ? `${(mb / 1024).toFixed(1)} GB` : `${Math.round(mb)} MB`;
+}
+
+/** What an update is about to change, in the words the shell uses too. */
+export function postgresMajorChangeMessage(update: AppUpdateStatus): string {
+    const from = update.installedPostgresMajor;
+    const to = update.candidatePostgresMajor;
+    const change = from && to ? `from Postgres ${from} to Postgres ${to}` : "to a different Postgres version";
+    return `Lemma ${update.availableVersion ?? "’s next version"} moves its database ${change}, which it can’t do automatically yet, `
+        + "so it isn’t offered here. Keep using this version; your pods, files and accounts are safe.";
+}
+
+export function updateOffer(update: AppUpdateStatus | null): { blocked: string | null; cost: string } {
+    if (!update?.availableVersion) return { blocked: null, cost: "" };
+    const runtime = formatBytes(update.runtimeDownloadBytes);
+    return {
+        blocked: update.dataCompatibility === "postgres-major-change" ? postgresMajorChangeMessage(update) : null,
+        /* Honest about what follows the restart: the app is small, the
+           runtime it then fetches is not, and someone on a hotspot should
+           know before, not after. */
+        cost: runtime
+            ? `The update is small. After Lemma restarts it downloads about ${runtime} before the workspace opens.`
+            : "After Lemma restarts it downloads its runtime once before the workspace opens.",
+    };
+}
+
+/** The channel is a property of the build, not a switch: a nightly and a
+ *  release are different downloads. Said once, rather than offered as a
+ *  toggle that would have to install a different app to mean anything. */
+export function channelLine(update: AppUpdateStatus | null, channel: string): string {
+    const current = update?.channel || channel;
+    if (current === "unknown") return "Lemma couldn’t tell which channel this build is on.";
+    if (current === "nightly") return "Nightly builds don’t update themselves. Newer ones are on the releases page.";
+    if (current === "stable") return "Stable releases. Nightly builds are a separate download from the releases page.";
+    return "A development build, which doesn’t update itself.";
+}
+
+/** Where newer builds are, for a build that cannot fetch them itself. */
+export const RELEASES_PAGE = "https://github.com/lemma-work/lemma-platform/releases";
+
+/** An update check or install that did not happen, in words: a declined
+ *  install is a choice, not an error, and a failed check is the network's. */
+export function updateProblem(reason: unknown): { text: string; neutral: boolean } {
+    const message = reason instanceof Error ? reason.message : String(reason ?? "");
+    if (/was not installed/i.test(message)) return { text: "Not installed. Lemma is still on this version.", neutral: true };
+    if (/could not download|network|timed out|connect|dns|resolve|fetch/i.test(message)) {
+        return { text: "Couldn’t reach the update server. Check your connection and try again.", neutral: false };
+    }
+    return { text: friendlyError(reason), neutral: false };
+}
+
+/* ── server setup: credential forms ────────────────────────────────── */
+
+export type CredentialForm =
+    | "composio" | "google" | "github" | "microsoft" | "slack-app" | "deepgram" | "voice-calls" | "brave"
+    | "slack" | "telegram" | "teams" | "whatsapp" | "resend";
+
+/** Where a form sits on Server setup. */
+export type SetupGroup = "connectors" | "channels" | "voice" | "search";
+
+export type SectionName = "integrations" | "surfaces" | "email" | "ai";
+
+export interface CredentialField {
+    key: string;
+    label: string;
+    /** A secret is written to the vault and never read back — only whether
+     *  one is stored. */
+    secret?: boolean;
+    kind?: "text" | "toggle";
+}
+
+export interface CredentialFormSpec {
+    form: CredentialForm;
+    group: SetupGroup;
+    title: string;
+    /** The one line of consequence. */
+    use: string;
+    fields: CredentialField[];
+    /** Needs a public link for its callbacks to arrive. */
+    needsPublicLink?: boolean;
+    /** How to get the credentials, with where to go. */
+    hint: { steps: string; url: string; label: string };
+    /** The Test button, and the secret whose typed value it tests. */
+    test?: { service: SetupService; field: string };
+    /** Shows the OAuth redirect URL the app must allow. */
+    redirect?: boolean;
+}
+
+/** The forms, in the order people need them. Field keys are the daemon's:
+ *  the plain field name for values, and the vault name for secrets. */
+export const CREDENTIAL_FORMS: CredentialFormSpec[] = [
+    { form: "composio", group: "connectors", title: "Composio", use: "Adds hundreds of ready-made connectors — Notion, Linear, HubSpot and more — without an OAuth app of your own.",
+        fields: [{ key: "integrations.composio_api_key", label: "API key", secret: true },
+            { key: "integrations.composio_webhook_secret", label: "Webhook secret (optional)", secret: true }],
+        hint: { steps: "Sign in to Composio, open Settings → API keys and create a key. Saving it adds Composio’s connectors to the catalog.", url: "https://platform.composio.dev", label: "Open Composio" },
+        test: { service: "composio", field: "integrations.composio_api_key" } },
+    { form: "google", group: "connectors", title: "Google", use: "Lets people here connect Gmail, Calendar and Drive.", redirect: true,
+        fields: [{ key: "google_client_id", label: "Client ID" }, { key: "integrations.google_client_secret", label: "Client secret", secret: true }],
+        hint: { steps: "In Google Cloud Console, create an OAuth client of type Web application, add the redirect URL below, and enable the Gmail, Calendar and Drive APIs.", url: "https://console.cloud.google.com/apis/credentials", label: "Open Google Cloud Console" } },
+    { form: "microsoft", group: "connectors", title: "Microsoft", use: "Lets people here connect Outlook, OneDrive and other Microsoft accounts.", redirect: true,
+        fields: [{ key: "microsoft_client_id", label: "Client ID" }, { key: "integrations.microsoft_client_secret", label: "Client secret", secret: true }],
+        hint: { steps: "In Microsoft Entra, register an app with the redirect URL below as a Web platform, then create a client secret under Certificates & secrets.", url: "https://entra.microsoft.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade", label: "Open app registrations" } },
+    { form: "github", group: "connectors", title: "GitHub", use: "Lets people here connect repositories, issues and pull requests.", redirect: true,
+        fields: [{ key: "github_client_id", label: "Client ID" }, { key: "integrations.github_client_secret", label: "Client secret", secret: true }],
+        hint: { steps: "In GitHub, Settings → Developer settings → OAuth Apps → New OAuth App. Use the redirect URL below as the callback, then generate a client secret.", url: "https://github.com/settings/developers", label: "Open GitHub developer settings" } },
+    { form: "slack-app", group: "connectors", title: "Slack connector", use: "Lets each person connect their own Slack account to read and post as themselves.", redirect: true,
+        fields: [{ key: "slack_client_id", label: "Client ID" }, { key: "integrations.slack_client_secret", label: "Client secret", secret: true }],
+        hint: { steps: "At api.slack.com/apps, create an app, add the redirect URL below under OAuth & Permissions, and copy the client ID and secret from Basic Information.", url: "https://api.slack.com/apps", label: "Open Slack apps" } },
+    { form: "telegram", group: "channels", title: "Telegram", use: "Answer in Telegram. Works without a public link.",
+        fields: [{ key: "surfaces.telegram_bot_token", label: "Bot token", secret: true }],
+        hint: { steps: "Message @BotFather in Telegram, send /newbot, and paste the token it gives you.", url: "https://t.me/BotFather", label: "Open BotFather" },
+        test: { service: "telegram", field: "surfaces.telegram_bot_token" } },
+    { form: "slack", group: "channels", title: "Slack bot", use: "Answer in Slack. Works without a public link, through Socket Mode.",
+        fields: [{ key: "surfaces.slack_app_token", label: "App-level token (xapp-…)", secret: true },
+            { key: "surfaces.slack_signing_secret", label: "Signing secret (only with Public sharing)", secret: true }],
+        hint: { steps: "Uses the Slack connector app above: set that up first, then at api.slack.com/apps turn on Socket Mode for the same app, which creates the app-level token (scope connections:write). Install the bot from a pod’s Reach settings.", url: "https://api.slack.com/apps", label: "Open Slack apps" },
+        test: { service: "slack", field: "surfaces.slack_app_token" } },
+    { form: "resend", group: "channels", title: "Email in", use: "Receive and answer email, each at its own address.",
+        fields: [{ key: "resend_inbound_domain", label: "Inbound domain" },
+            { key: "surfaces.resend_signing_secret", label: "Webhook signing secret (only with Public sharing)", secret: true }],
+        hint: { steps: "Uses the Resend key from Email above. In Resend, add a receiving domain and point its MX record at Resend; Lemma collects the mail itself, so no webhook is needed unless Lemma is shared publicly.", url: "https://resend.com/domains", label: "Open Resend domains" } },
+    { form: "whatsapp", group: "channels", title: "WhatsApp Business", use: "Answer on WhatsApp.", needsPublicLink: true,
+        fields: [{ key: "whatsapp_phone_number_id", label: "Phone number ID" }, { key: "whatsapp_waba_id", label: "Business account ID" },
+            { key: "surfaces.whatsapp_access_token", label: "Access token", secret: true },
+            { key: "surfaces.whatsapp_verify_token", label: "Verify token", secret: true },
+            { key: "surfaces.whatsapp_app_secret", label: "App secret", secret: true }],
+        hint: { steps: "Needs Public sharing: Meta delivers messages to a webhook on the internet. In Meta for Developers, add WhatsApp to an app and copy the IDs and a permanent access token.", url: "https://developers.facebook.com/apps", label: "Open Meta for Developers" } },
+    { form: "teams", group: "channels", title: "Microsoft Teams", use: "Answer in Teams.", needsPublicLink: true,
+        fields: [{ key: "teams_app_id", label: "Bot app ID" }, { key: "teams_tenant_id", label: "Tenant ID" },
+            { key: "surfaces.teams_app_password", label: "App password", secret: true }],
+        hint: { steps: "Needs Public sharing: Teams delivers messages to a webhook on the internet. Create an Azure Bot, and copy its app ID, tenant and a client secret.", url: "https://portal.azure.com/#create/Microsoft.AzureBot", label: "Create an Azure Bot" } },
+    { form: "deepgram", group: "voice", title: "Deepgram", use: "Turns replies into voice notes, and incoming voice notes into text.",
+        fields: [{ key: "integrations.deepgram_api_key", label: "API key", secret: true }],
+        hint: { steps: "Sign up at Deepgram and create an API key in the console. New accounts come with free credit.", url: "https://console.deepgram.com", label: "Open Deepgram console" },
+        test: { service: "deepgram", field: "integrations.deepgram_api_key" } },
+    { form: "voice-calls", group: "voice", title: "Voice calls", use: "Lets people talk live, in a call. Needs both keys.",
+        fields: [{ key: "integrations.gemini_api_key", label: "Gemini API key (the voice)", secret: true },
+            { key: "integrations.typesafe_api_key", label: "TypeSafe API key (routes each call to the right place)", secret: true }],
+        hint: { steps: "Create a Gemini API key in Google AI Studio, and a TypeSafe key for call routing. Saving restarts Lemma’s workspace server, which is the one that carries calls.", url: "https://aistudio.google.com/apikey", label: "Open Google AI Studio" },
+        test: { service: "gemini", field: "integrations.gemini_api_key" } },
+    { form: "brave", group: "search", title: "Brave Search", use: "Better, fresher web results than the built-in search. Optional.",
+        fields: [{ key: "integrations.brave_search_api_key", label: "API key", secret: true }],
+        hint: { steps: "Subscribe to the Brave Search API (there is a free plan) and copy the key from the dashboard.", url: "https://api-dashboard.search.brave.com", label: "Open Brave Search API" },
+        test: { service: "brave", field: "integrations.brave_search_api_key" } },
+];
+
+export function formSpec(form: CredentialForm): CredentialFormSpec {
+    return CREDENTIAL_FORMS.find((one) => one.form === form)!;
+}
+
+/** Old focus names still land somewhere: a "Set up on this Mac" link from an
+ *  older page, or a menu that asks for a form by its former name. */
+export function formFromFocus(focus: string | null): CredentialForm | null {
+    if (!focus) return null;
+    return CREDENTIAL_FORMS.some((one) => one.form === focus) ? (focus as CredentialForm) : null;
+}
+
+type PlainSection = "integrations" | "surfaces";
+
+/** Plain values live in one of the two sections, whichever holds the key. */
+function sectionHolding(config: ThisMacSnapshot["operator"]["config"], key: string): PlainSection | null {
+    if (key in config.integrations) return "integrations";
+    if (key in config.surfaces) return "surfaces";
+    return null;
+}
+
+/** Whether a secret is stored under a vault name. */
+export function stored(snapshot: ThisMacSnapshot, key: string): boolean {
+    return snapshot.operator.secrets[key] === true;
+}
+
+/** Whether a form holds anything the owner has set. "Anything", not
+ *  "everything": several of these carry independent credentials, and no rule
+ *  here could honestly say which are required. */
+export function formConfigured(snapshot: ThisMacSnapshot, form: CredentialForm): boolean {
+    const config = snapshot.operator.config;
+    return formSpec(form).fields.some((field) => {
+        if (field.secret) return stored(snapshot, field.key);
+        const section = sectionHolding(config, field.key);
+        const value = section ? (config[section] as unknown as Record<string, unknown>)[field.key] : undefined;
+        return typeof value === "boolean" ? value : typeof value === "string" && value.trim() !== "";
+    });
+}
+
+export type Draft = Record<string, string | boolean>;
+/** A secret's pending change: left alone, replaced with a value, or removed. */
+export type SecretIntent = { action: "keep" } | { action: "replace"; value: string } | { action: "remove" };
+
+export interface SectionValue {
+    name: SectionName;
+    value: IntegrationConfig | SurfaceConfig | EmailConfig | OperatorAi;
+}
+
+export interface SectionPayload {
+    expected_revision: number;
+    section: SectionValue;
+    secrets: Record<string, SecretIntent>;
+}
+
+/** Several sections saved as one change, so the server restarts once. */
+export interface SectionsPayload {
+    expected_revision: number;
+    sections: SectionValue[];
+    secrets: Record<string, SecretIntent>;
+}
+
+/** The secret changes that mean something: a typed value, or a removal. */
+export function meaningfulIntent(intent: SecretIntent | undefined): SecretIntent | null {
+    if (!intent || intent.action === "keep") return null;
+    if (intent.action === "replace") return intent.value.trim() ? { action: "replace", value: intent.value.trim() } : null;
+    return intent;
+}
+
+/** The `config.apply` requests one form's draft becomes.
+ *
+ *  One per section it touches, each carrying that section's whole value —
+ *  the daemon replaces a section, it does not merge fields — and only the
+ *  secrets that belong to it. A secret typed and then cleared is `keep`, not
+ *  `remove`: removing is its own button, because an empty field is how every
+ *  secret looks when it is stored. */
+export function sectionPayloads(
+    snapshot: ThisMacSnapshot,
+    form: CredentialForm,
+    draft: Draft,
+    secrets: Record<string, SecretIntent>,
+): SectionPayload[] {
+    const config = snapshot.operator.config;
+    const values = {
+        integrations: { ...config.integrations } as unknown as Record<string, unknown>,
+        surfaces: { ...config.surfaces } as unknown as Record<string, unknown>,
+    };
+    const touched = new Set<PlainSection>();
+    const secretsBySection: Record<PlainSection, Record<string, SecretIntent>> = { integrations: {}, surfaces: {} };
+    for (const field of formSpec(form).fields) {
+        if (field.secret) {
+            const section = field.key.split(".")[0] as PlainSection;
+            const intent = meaningfulIntent(secrets[field.key]);
+            if (intent) {
+                secretsBySection[section][field.key] = intent;
+                touched.add(section);
+            }
+            continue;
+        }
+        if (!(field.key in draft)) continue;
+        const section = sectionHolding(config, field.key);
+        if (!section) continue;
+        const next = draft[field.key];
+        const value = typeof next === "string" ? next.trim() : next;
+        if (values[section][field.key] !== value) {
+            values[section][field.key] = value;
+            touched.add(section);
+        }
+    }
+    /* Composio is on exactly while it has a key: the key is the whole of
+       setting it up, and a separate switch was one more thing to forget. */
+    if (form === "composio") {
+        const intent = meaningfulIntent(secrets["integrations.composio_api_key"]);
+        const enabled = intent ? intent.action === "replace" : stored(snapshot, "integrations.composio_api_key");
+        if (values.integrations.composio_enabled !== enabled) {
+            values.integrations.composio_enabled = enabled;
+            touched.add("integrations");
+        }
+    }
+    return (["integrations", "surfaces"] as const)
+        .filter((section) => touched.has(section))
+        .map((section) => ({
+            expected_revision: config.revision,
+            section: { name: section, value: values[section] as unknown as IntegrationConfig & SurfaceConfig },
+            secrets: secretsBySection[section],
+        }));
+}
+
+/** A form's section changes as the one `config.apply` they become.
+ *
+ *  However many sections a save spans, it is one change: the daemon checks
+ *  one revision and restarts the server once. Empty when nothing changed. */
+export function asOneChange(parts: SectionPayload[]): SectionPayload | SectionsPayload | null {
+    if (parts.length === 0) return null;
+    if (parts.length === 1) return parts[0];
+    return {
+        expected_revision: parts[0].expected_revision,
+        sections: parts.map((part) => part.section),
+        secrets: Object.assign({}, ...parts.map((part) => part.secrets)),
+    };
+}
+
+/* ── point of need ─────────────────────────────────────────────────── */
+
+/** Which developer-credential form a connector's OAuth app lives in on this
+ *  install, if any. By id, because these are the catalog's own native
+ *  connectors, and the system OAuth client each one needs is the
+ *  `CONNECTOR_*_CLIENT_ID` the operator form writes. */
+export function oauthFormForConnector(connectorId: string): CredentialForm | null {
+    const id = connectorId.toLowerCase();
+    if (id === "gmail" || id.startsWith("google")) return "google";
+    if (id === "github") return "github";
+    /* Teams answers as the Teams bot, not through the Microsoft OAuth app. */
+    if (id === "microsoft_teams" || id === "teams") return "teams";
+    if (id.startsWith("microsoft") || id.startsWith("outlook") || id === "onedrive" || id === "sharepoint") return "microsoft";
+    if (id === "slack") return "slack-app";
+    return null;
+}
+
+/** Which form a channel's bot credentials live in on this install, if any. */
+export function credentialFormForChannel(platform: string): CredentialForm | null {
+    const key = platform.toUpperCase();
+    if (key === "SLACK") return "slack";
+    if (key === "TELEGRAM") return "telegram";
+    if (key === "TEAMS") return "teams";
+    if (key === "WHATSAPP") return "whatsapp";
+    if (key === "EMAIL" || key === "RESEND") return "resend";
+    return null;
+}
+
+/* ── models: what this computer already serves ─────────────────────── */
+
+export interface LocalServer {
+    id: "ollama" | "lmstudio";
+    name: string;
+    baseUrl: string;
+}
+
+/** The two local model servers people run, on their default loopback ports.
+ *  Lemma never runs a model process of its own: these are endpoints the
+ *  person already has, and detecting one only saves them typing its URL. */
+export const LOCAL_SERVERS: LocalServer[] = [
+    { id: "ollama", name: "Ollama", baseUrl: "http://127.0.0.1:11434/v1" },
+    { id: "lmstudio", name: "LM Studio", baseUrl: "http://127.0.0.1:1234/v1" },
+];
+
+export interface DetectedServer extends LocalServer {
+    models: string[];
+}
+
+/** Ask each local server for its models. One that does not answer, or answers
+ *  with nothing, is simply not offered: a suggestion that cannot work is not
+ *  one.
+ *
+ *  `api_key: ""` on purpose. Omitted, the shell would attach the operator's
+ *  stored provider key to the request — right for re-listing that provider,
+ *  and exactly wrong for probing a different endpoint. */
+export async function detectLocalServers(
+    discover: (payload: Record<string, unknown>) => Promise<unknown> = thisMac.discoverModels,
+): Promise<DetectedServer[]> {
+    const found = await Promise.all(LOCAL_SERVERS.map(async (server) => {
+        try {
+            const models = await discover({
+                ai: {
+                    protocol: "openai_compat",
+                    base_url: server.baseUrl,
+                    default_model: "",
+                    models: [],
+                    vision_models: [],
+                    allow_private_network: false,
+                },
+                api_key: "",
+            });
+            const list = strings(models);
+            return list.length ? { ...server, models: list } : null;
+        } catch {
+            return null;
+        }
+    }));
+    return found.filter((one): one is DetectedServer => one !== null);
+}
+
+/** The key a no-auth loopback server is given, matching what locald hands the
+ *  backend for the same case (`local_no_auth`). The profile schema wants a
+ *  key; the server ignores it. */
+export const LOCAL_SERVER_KEY = "lemma-local";
+
+export interface ProviderDraft {
+    protocol: "openai" | "anthropic";
+    name: string;
+    baseUrl: string;
+    models: string[];
+    /** The models this install says read images, so the organization's copy
+     *  can offer them for images too. */
+    visionModels: string[];
+    /** Null when this provider needs no key (a loopback server). */
+    needsKey: boolean;
+}
+
+const LOOPBACK = /^https?:\/\/(127\.0\.0\.1|localhost|\[::1\])(:\d+)?(\/|$)/i;
+
+/** The operator's AI provider on this install, as an organization provider.
+ *
+ *  Null when none is configured. The key is not here and cannot be: the page
+ *  only ever learns that one is stored. So a keyed provider asks for it once
+ *  more, and a loopback one needs none. */
+export function operatorProvider(snapshot: ThisMacSnapshot): ProviderDraft | null {
+    const ai = snapshot.operator.config.ai;
+    if (ai.protocol !== "openai_compat" && ai.protocol !== "anthropic_compat") return null;
+    if (!ai.base_url || !ai.default_model) return null;
+    const models = [ai.default_model, ...ai.models.filter((model) => model !== ai.default_model)];
+    const server = LOCAL_SERVERS.find((one) => one.baseUrl === ai.base_url.replace(/\/$/, ""));
+    return {
+        protocol: ai.protocol === "anthropic_compat" ? "anthropic" : "openai",
+        name: server?.name ?? hostName(ai.base_url),
+        baseUrl: ai.base_url,
+        models,
+        visionModels: ai.vision_models.filter((model) => models.includes(model)),
+        needsKey: !LOOPBACK.test(ai.base_url),
+    };
+}
+
+function hostName(url: string): string {
+    try {
+        return new URL(url).hostname.replace(/^api\./, "");
+    } catch {
+        return "AI provider";
+    }
+}
+
+/** Whether the organization already has a provider on this route, so the
+ *  suggestion or the Add to workspace offer is not made twice. */
+export function alreadyInWorkspace(baseUrl: string, runtimes: { baseUrl?: string | null; archived?: boolean }[]): boolean {
+    const want = baseUrl.replace(/\/+$/, "").toLowerCase();
+    return runtimes.some((runtime) => !runtime.archived && (runtime.baseUrl ?? "").replace(/\/+$/, "").toLowerCase() === want);
+}
+
+/** Add this computer's provider to the organization.
+ *
+ *  Deliberately *not* followed by clearing the operator profile. That profile
+ *  is the deployment's `system:lemma`, which the backend falls back to
+ *  wherever nothing more specific is set: a pod with no default runtime,
+ *  conversation titles, summaries, image reading. Clearing it after the move
+ *  would quietly take the model away from all of those. So the organization
+ *  gains a provider it can pick and manage by name, and the fallback stays
+ *  where it was. */
+export async function addToWorkspace(
+    draft: ProviderDraft,
+    apiKey: string,
+    add: (key: { protocol: "openai" | "anthropic"; name: string; baseUrl: string; apiKey: string; models: string[]; visionModels?: string[] }) => Promise<void>,
+): Promise<void> {
+    const key = draft.needsKey ? apiKey.trim() : LOCAL_SERVER_KEY;
+    if (!key) throw new Error("Enter the API key for " + draft.name + ". Lemma cannot read back the one stored on this computer.");
+    await add({ protocol: draft.protocol, name: draft.name, baseUrl: draft.baseUrl, apiKey: key, models: draft.models, visionModels: draft.visionModels });
+}
+
+/* ── errors ────────────────────────────────────────────────────────── */
+
+/** Daemon and shell errors, said in a way a person can act on. */
+export function friendlyError(reason: unknown): string {
+    const message = reason instanceof Error ? reason.message : String(reason ?? "");
+    if (/not allowed by ACL|only the Lemma workspace on/i.test(message)) {
+        return "Lemma can change these settings only from its own window on this computer.";
+    }
+    if (/control endpoint unavailable|is not connected|disconnected/i.test(message)) {
+        return "Lemma’s background service isn’t running. Restarting Lemma usually brings it back.";
+    }
+    if (/another local operation is running|busy|still finishing/i.test(message)) {
+        return "Lemma is already doing something. Wait for it to finish and try again.";
+    }
+    if (/config-conflict|revision/i.test(message)) {
+        return "These settings changed somewhere else. Reopen them to see the current values.";
+    }
+    return message.replace(/^Error:\s*/, "") || "That didn’t work.";
+}

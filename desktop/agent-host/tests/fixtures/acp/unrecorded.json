@@ -1,0 +1,4 @@
+{
+  "$comment": "Pinned adapters with no recorded transcript yet, and why. Each is normalized by the generic ACP rules until it has one. An entry here is a debt: record the adapter with record_transcript.py and delete its line.",
+  "cursor@native-acp-1": "Cursor's agent is not installed on the machine the other transcripts were recorded on."
+}

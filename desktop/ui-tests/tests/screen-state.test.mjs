@@ -105,13 +105,77 @@ test('a Windows permission is a setup button, not a retry', () => {
   assert.equal(restart.showPrepareWindows, false);
 });
 
-test('a stack that could not start offers a data reset but not a reinstall', () => {
+/**
+ * A service that stopped, or a runtime that did not install, has nothing to do
+ * with the data. Offering to erase it beside Try again is how somebody loses
+ * everything to a network blip.
+ */
+test('a stack that could not start never offers to erase data', () => {
   for (const errorCode of ['locald-start-failed', 'locald-disconnected', 'runtime-install-failed']) {
     const screen = deriveScreen({ error: true, errorCode }, {});
-    assert.equal(screen.showResetData, true, errorCode);
+    assert.equal(screen.showResetData, false, errorCode);
     assert.equal(screen.showFullReinstall, false, errorCode);
     assert.equal(screen.showRetry, true, errorCode);
+    assert.equal(screen.showRecovery, true, errorCode);
   }
+});
+
+test('only the data failures offer a reset', () => {
+  for (const errorCode of ['local-data-incompatible', 'local-data-reset-incomplete']) {
+    assert.equal(deriveScreen({ error: true, errorCode }, {}).showResetData, true, errorCode);
+  }
+});
+
+test('each known failure says which thing stopped', () => {
+  const headline = (state) => deriveScreen({ error: true, ...state }, {}).headline;
+  assert.equal(headline({ errorCode: 'runtime-install-failed' }), "Lemma couldn't finish installing.");
+  assert.equal(headline({ errorCode: 'locald-disconnected' }), "Lemma's local service stopped.");
+  assert.equal(headline({ errorCode: 'locald-start-failed' }), "Lemma's local service stopped.");
+  assert.equal(headline({ errorCode: 'wsl-required' }), 'Windows needs one permission.');
+  assert.equal(headline({ errorCode: 'wsl-reboot-required' }), 'One restart, then Lemma continues.');
+  assert.equal(headline({ errorCode: 'host-operation-failed' }), 'Something stopped.');
+});
+
+test('the untouched-data note is only as strong as the failure allows', () => {
+  const note = (state) => deriveScreen({ error: true, ...state }, {}).note;
+  assert.equal(note({ errorCode: 'locald-disconnected' }), 'Your data is untouched.');
+  assert.equal(
+    note({ errorCode: 'runtime-install-failed', status: 'Lemma could not reach github.com to download its runtime.' }),
+    'Your data is untouched. Lemma needs the internet once to finish installing.',
+  );
+  // Not a download failure, so being online is not the fix and is not said.
+  assert.equal(
+    note({ errorCode: 'runtime-install-failed', status: 'This copy of Lemma and its runtime do not match.' }),
+    'Your data is untouched.',
+  );
+  assert.equal(note({ errorCode: 'host-operation-failed' }), '');
+});
+
+/**
+ * Data another release wrote is kept by going back to that release; data whose
+ * credentials were replaced is not, and must not be offered the same way out.
+ */
+test('data from another release offers the previous version before erasing', () => {
+  const screen = deriveScreen({
+    error: true,
+    errorCode: 'local-data-incompatible',
+    status: 'the workspace database on this computer was created by PostgreSQL 16 and this release runs PostgreSQL 17; local data must be reset',
+  }, {});
+  assert.equal(screen.headline, "This version of Lemma can't open your existing data.");
+  assert.equal(screen.note, 'Your data is still on this computer.');
+  assert.match(screen.keepDataUrl, /^https:\/\/github\.com\/lemma-work\/lemma-platform\/releases$/);
+  assert.equal(screen.resetLabel, 'Erase and start fresh');
+  assert.equal(screen.showResetData, true);
+  assert.equal(screen.showRetry, false);
+
+  const locked = deriveScreen({
+    error: true,
+    errorCode: 'local-data-incompatible',
+    status: "this installation's private credentials were replaced; local data must be reset",
+  }, {});
+  assert.equal(locked.keepDataUrl, '');
+  assert.equal(locked.resetLabel, 'Reset local data');
+  assert.equal(locked.headline, "Lemma can't open your existing data.");
 });
 
 test('an ordinary failure keeps Try again and nothing else', () => {
@@ -119,7 +183,52 @@ test('an ordinary failure keeps Try again and nothing else', () => {
   assert.equal(screen.showRetry, true);
   assert.equal(screen.showResetData, false);
   assert.equal(screen.showFullReinstall, false);
+  assert.equal(screen.showRecovery, false);
   assert.equal(screen.errorDetail, 'boom');
+});
+
+/**
+ * A VPN or DNS filter that blocks the VM while the Mac resolves fine used to
+ * reach this screen as "Something stopped." above "registry DNS lookup
+ * failed" -- true, and no help to anyone.
+ */
+test('a VM whose DNS is blocked says so, says what to do, and offers a retry', () => {
+  const raw = 'core.images failed: lookup registry-1.docker.io on 127.0.0.53:53: server misbehaving; registry DNS lookup failed';
+  const status = "Your Mac can reach the internet, but Lemma's VM can't look up names. A VPN or DNS " +
+    `filter such as Cloudflare WARP is likely blocking it. Pause it and press Try again, or allow Lemma's VM through it. (${raw})`;
+  const mac = deriveScreen({ error: true, errorCode: 'guest-dns-blocked', status }, {});
+  assert.equal(mac.headline, "Lemma's VM can't look up names.");
+  assert.match(mac.note, /^Your Mac can reach the internet/);
+  assert.match(mac.note, /Cloudflare WARP/);
+  assert.match(mac.note, /press Try again/);
+  assert.equal(mac.showRetry, true);
+  assert.equal(mac.showResetData, false);
+  // The note already says the sentence; the box keeps what the guest said.
+  assert.equal(mac.errorDetail, raw);
+  assert.equal(mac.logSource, 'vm');
+
+  const windows = deriveScreen({ error: true, errorCode: 'guest-dns-blocked', status }, { windows: true });
+  assert.match(windows.note, /^Your PC can reach the internet/);
+  assert.match(windows.note, /dnsTunneling/);
+  assert.doesNotMatch(windows.note, /Mac/);
+});
+
+test('a computer with no network is told that, not that a VPN is in the way', () => {
+  const screen = deriveScreen({
+    error: true,
+    errorCode: 'network-dns-failed',
+    status: "This computer can't reach the internet right now. Connect to a network, then press Try again. (registry DNS lookup failed)",
+  }, {});
+  assert.equal(screen.headline, "This computer isn't online.");
+  assert.match(screen.note, /can't reach the internet right now/);
+  assert.doesNotMatch(screen.note, /VPN/);
+  assert.equal(screen.showRetry, true);
+  assert.equal(screen.errorDetail, 'registry DNS lookup failed');
+  assert.equal(diagnosticSourceForState({ errorCode: 'network-dns-failed' }), 'vm');
+
+  // A status without the raw report on its end is shown whole.
+  const bare = deriveScreen({ error: true, errorCode: 'network-dns-failed', status: 'offline' }, {});
+  assert.equal(bare.errorDetail, 'offline');
 });
 
 test('an error with no status still says something', () => {

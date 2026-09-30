@@ -86,8 +86,9 @@ shows its stage without invented byte counts. Interrupted downloads resume,
 verified archives are reused, and failed staging directories are never
 activated.
 
-Select **Create account** after Lemma reports Ready. Local signup stays inside
-the Desktop window. Local-only configuration disables email verification and
+Select **Create account** after Lemma reports Ready. The first account on an
+installation is always admitted, and is an ordinary account like any other.
+Local signup stays inside the Desktop window. Local-only configuration disables email verification and
 internet-facing auth throttles; SMTP is not required. Hosted Lemma sign-in
 continues to use the system browser.
 
@@ -104,51 +105,85 @@ Signup, files, tables, settings, and normal workspace access do not wait for
 Hugging Face. Semantic operations report a temporary capability error if the
 model is still preparing.
 
-## Configure an AI provider
+## Set up the server
 
-If no validated provider exists, authenticated local pages show **Configure an
-AI provider**. Open it, or use **Local settings → AI provider**.
+A local install runs the whole Lemma server, and a few things it does need a
+key only you can supply. After you create the first account, Lemma shows a
+short checklist; the same cards live in **Settings → This Mac → Server setup**
+(This PC on Windows), where each one shows whether it is **Ready**, **Needs
+setup** or **Optional**, what it unlocks, a **Test** button, and where to get
+what it needs.
 
-Supported setup paths include:
+| Card | Needed for | What to enter |
+| --- | --- | --- |
+| **AI model** (required) | Teammates' work, conversation titles, summaries, reading images | A provider, its key, and the models to use |
+| **Email** | Invitations, password resets and sign-in codes by email | A Resend API key and sender address, or an SMTP server |
+| **Connectors** | Gmail, GitHub, Slack, Notion and the rest | A Composio key, and/or your own Google, Microsoft, GitHub or Slack OAuth app |
+| **Channels** | Answering in Telegram, Slack, email, WhatsApp and Teams | A bot token, Slack app-level token or inbound domain |
+| **Voice** | Voice notes, spoken and read | A Deepgram key |
+| **Web search** | Looking things up | Nothing (DuckDuckGo); optionally a Brave Search key |
 
-- OpenAI-compatible APIs;
-- Anthropic-compatible APIs;
-- local Ollama;
-- local LM Studio.
+Until an AI model is set up, agents answer with *Set up an AI model in This
+Mac → Server setup* and the Settings entry carries a dot. Everything else
+works without one.
+
+### The AI model
+
+Choose a provider — OpenAI, Anthropic, OpenRouter, Ollama, LM Studio, or any
+other OpenAI- or Anthropic-compatible endpoint — enter its key, and **List
+models**. Pick the model teammates use and, optionally:
+
+- **a model that reads images**, used when a teammate's own model cannot see
+  an attachment (Anthropic's models read images themselves);
+- **a fast model** for conversation titles and summaries, which keeps those
+  cheap.
+
+**Test** lists the provider's models and asks the chosen one for a one-word
+answer. **Save** validates the provider again, stores the key in macOS
+Keychain or Windows Credential Manager, and restarts only the backend; a
+failed restart restores the previous configuration.
 
 To run models on your own machine — and this is also the answer if you have no
 API key at all, since nothing here requires a hosted account — start Ollama or
-LM Studio and press **Ollama** or **LM Studio**. Each fills in that tool's
-loopback base URL, which **Validate & apply** then probes for its model list.
-Lemma talks to them as ordinary OpenAI-compatible providers, so the models,
-their memory, and their lifecycle stay owned by the tool you already run. Local
-inference then works without internet; connectors, web access, and other
-external services still require their own networks.
+LM Studio. Server setup marks either one as **found** when it answers on its
+default port, and needs no key for it. Lemma talks to them as ordinary
+OpenAI-compatible providers, so the models, their memory, and their lifecycle
+stay owned by the tool you already run. Local inference then works without
+internet; connectors, web access, and other external services still require
+their own networks.
 
-Enter a base URL, default model, and API key when required, then choose
-**Validate & apply**. Lemma discovers models and verifies that the default
-model is usable. Configuration and secrets are applied transactionally; a
-failed backend restart restores the prior configuration. Secrets live in
-macOS Keychain or Windows Credential Manager.
+This model is the server's own. Your organization can add more providers for
+teammates in **Settings → Models**, which also offers this one as **Add to
+workspace**. Configure a model before the first `lemma chat` or `lemma agent
+run`, or those are the commands that report it.
 
-Agents remain unavailable with a clear reason until a provider validates.
-Non-AI features remain available. Configure a provider before the first `lemma
-chat` or `lemma agent run`, or those are the commands that report it.
+### Email
 
-## Configure integrations and surfaces
+Without email, invitations still work: share the invitation link yourself.
+With **Resend**, verify your domain in Resend, create an API key, and send
+from an address on that domain; with **SMTP**, enter your provider's server,
+port, user and password (for Gmail, an app password). After saving, **Send a
+test email** sends one to you.
 
-Use **Local settings → Integrations** for Composio and custom Google or
-Microsoft OAuth applications. Copy the callback URL displayed by the running
-installation; ports are deliberately dynamic.
+### Connectors and channels
 
-Use **Agent Surfaces** for Slack, Telegram, Teams, WhatsApp, and Resend.
-Socket/long-polling modes do not require ingress. Webhook surfaces require a
-public callback configured by the operator; Lemma does not create a tunnel
-silently. Resend is optional and is unrelated to local account creation.
+A connector or channel that needs one of these offers **Set up on this Mac**
+where it fails, opening its form. Copy the redirect URL shown with the OAuth
+forms; ports are deliberately dynamic. Saving a Composio key imports its
+connectors straight away.
+
+Telegram and Slack need no public address: a saved Telegram bot token turns
+on polling, and a saved Slack app-level token turns on Socket Mode. Inbound
+email is collected by polling Resend. WhatsApp and Teams deliver messages to a
+webhook on the internet, so they work only while Lemma is shared publicly.
+Use **Agent Surfaces** to attach a channel to a teammate.
 
 ## Share a local installation
 
-Open **Local settings → Sharing** from the workspace footer or the tray.
+Open **Settings → This Mac → Sharing**, or **Desktop settings…** in the menu bar or tray.
+While sharing is on, this window moves to the shared address, where the
+workspace cannot change this computer's settings; **Desktop settings…** then
+opens the native Local settings, whose Overview turns sharing off.
 
 - **This computer** keeps the existing `app.lemma.localhost` origin.
 - **Local network** binds one selected private IPv4/Wi-Fi interface and shows a
@@ -159,9 +194,14 @@ Open **Local settings → Sharing** from the workspace footer or the tray.
   kept in private app storage. Existing named tunnels remain available as an
   advanced option, and Lemma never installs either CLI.
 
-Every public activation repeats this warning: **Anyone with this link can
-create an account and use this Lemma installation.** Public sharing intentionally
-keeps signup open in this release. Cloudflare Quick Tunnels are not available.
+**Who can join** decides who may create an account once the installation is
+shared. It is **invite-only** by default: the first account on the installation
+is always admitted (onboarding creates it before sharing can be turned on), and
+after that only an address you have invited to an organization can sign up; anyone else is told the Lemma is
+invite-only. Set to **open**, it lets anyone who reaches the address make an
+account. Every public activation asks you to confirm what the link will allow.
+Cloudflare Quick Tunnels are not available.
+[Desktop security](architecture/desktop-security.md) has the full model.
 
 The shared URL covers the workspace, auth, API, files, streamed chat/tool
 calls, and webhook callbacks. Published pod apps stay local-only because their
@@ -205,7 +245,7 @@ On first start Lemma asks the OS for two high loopback ports and persists them
 in `locald/network.json`. If an unrelated process later occupies either port,
 Lemma does not terminate it; it allocates and persists a new pair.
 
-The current URLs appear in Local settings and `lemma-stack status --json`:
+The current URLs appear in Settings → This Mac → Server setup → Advanced, Local settings, and `lemma-stack status --json`:
 
 | Surface | Shape |
 | --- | --- |
@@ -257,7 +297,7 @@ lemma-stack logs frontend
 ```
 
 Managed configuration uses the same schema, validation, rollback, and OS vault
-as Local settings:
+as This Mac settings:
 
 ```bash
 lemma-stack config list
@@ -296,7 +336,7 @@ Start from the symptom:
 | A `lemma` command behaves differently from the app, or reports an unexpected schema | `lemma doctor` — it diagnoses client/server version skew and duplicate CLI installs. |
 | The stack will not start, or a component is unhealthy | `lemma-stack doctor`, then the logs below. |
 
-The setup error view and **Local settings → Diagnostics** expose bounded,
+The setup error view, **Settings → This Mac → Server setup → Advanced** and **Local settings → Diagnostics** expose bounded,
 redacted logs for:
 
 - installer;
@@ -325,7 +365,7 @@ for the health timeout.
 
 ### Anonymous install health
 
-**Local settings → Diagnostics** carries one switch: *Send anonymous install
+**Settings → This Mac → Server setup → Advanced** (and Local settings → Diagnostics) carries one switch: *Send anonymous install
 health*. It is on in official builds and off in every build without an
 ingestion key compiled in, which includes anything you build yourself.
 
@@ -352,7 +392,7 @@ Three switches turn it off, and any one is enough:
 LEMMA_TELEMETRY=0            # this launch
 ```
 
-the toggle in Local settings, which is remembered and is never overridden by an
+the toggle in This Mac settings or Local settings, which is remembered and is never overridden by an
 upgrade; and building without an ingestion key, which is the default for a
 local build.
 
@@ -365,8 +405,9 @@ does not mean offline operation.
 
 ### Checking for updates
 
-Opening **Local settings**, and pressing **Check for updates** or **Install
-update** there, fetches one file:
+Opening **Settings → This Mac → Updates** (or Local settings, which keeps an
+update row for a hosted workspace and for when the workspace will not load),
+and pressing **Check now** or **Download and install** there, fetches one file:
 
 ```
 https://github.com/lemma-work/lemma-platform/releases/latest/download/latest.json

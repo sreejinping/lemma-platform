@@ -25,14 +25,27 @@ mod diagnostics;
 mod engine;
 mod health;
 mod host_control;
+// Giving disk back to the host: unused images, and trimming the data disk.
+mod image_prune;
+// Served only on Linux, by the resident guest; the relay is tested everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod host_dns;
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod host_loopback;
+mod image_check;
 mod images;
 mod network;
 mod protocol;
 mod pull_claim;
+mod pull_progress;
 mod readiness;
 mod sandbox;
+mod sandbox_firewall;
 mod sandbox_inspect;
 mod sandbox_run;
+// Served only on Linux, over vsock; the protocol is tested everywhere.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+mod sandbox_tunnel;
 mod serve;
 mod service;
 mod spec;
@@ -43,14 +56,28 @@ pub(crate) use core_data::*;
 pub(crate) use diagnostics::*;
 pub(crate) use engine::*;
 pub use engine::{Engine, NerdctlEngine};
+pub use host_dns::HOST_DNS_VSOCK_PORT;
+pub use host_loopback::HOST_LOOPBACK_VSOCK_PORT;
+pub(crate) use host_loopback::{
+    host_loopback_directory, prepare_relay_directory, HOST_LOOPBACK_MOUNT,
+};
+pub(crate) use image_check::*;
+// Only the tests name its items; the service reaches it through methods.
+#[cfg(test)]
+pub(crate) use image_prune::*;
 pub(crate) use images::*;
 pub(crate) use network::*;
 pub use protocol::{handle_reader, GuestError, GuestRequest, GuestResponse};
 pub(crate) use pull_claim::*;
 pub(crate) use readiness::*;
 pub(crate) use sandbox::*;
+// Reached through `GuestService::ensure_network_isolation`; the rule sets
+// themselves are named directly only by the tests.
+#[cfg(test)]
+pub(crate) use sandbox_firewall::*;
 pub(crate) use sandbox_inspect::*;
 pub(crate) use sandbox_run::*;
+pub use sandbox_tunnel::TUNNEL_VSOCK_PORT;
 pub use serve::serve_vsock;
 pub use service::GuestService;
 pub(crate) use spec::*;

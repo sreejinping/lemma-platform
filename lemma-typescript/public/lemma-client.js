@@ -9198,10 +9198,59 @@ var LemmaClient = (() => {
   // src/supertokens.ts
   var import_supertokens_web_js = __toESM(require_supertokens_web_js(), 1);
   var import_session = __toESM(require_session2(), 1);
+
+  // src/refresh-breaker.ts
+  var RefreshSuspendedError = class extends Error {
+    constructor(retryAt) {
+      super("Session refresh is paused after repeated failures.");
+      __publicField(this, "retryAt");
+      this.name = "RefreshSuspendedError";
+      this.retryAt = retryAt;
+    }
+  };
+  function createRefreshBreaker(options = {}) {
+    var _a, _b, _c, _d, _e, _f;
+    const budget = (_a = options.budget) != null ? _a : 4;
+    const windowMs = (_b = options.windowMs) != null ? _b : 6e4;
+    const cooldownMs = (_c = options.cooldownMs) != null ? _c : 3e4;
+    const maxCooldownMs = (_d = options.maxCooldownMs) != null ? _d : 5 * 6e4;
+    const forgetAfterMs = (_e = options.forgetAfterMs) != null ? _e : 10 * 6e4;
+    const now = (_f = options.now) != null ? _f : Date.now;
+    let attempts = [];
+    let until = 0;
+    let strikes = 0;
+    let lastTrip = -Infinity;
+    return {
+      admit() {
+        var _a2;
+        const at = now();
+        if (at < until) throw new RefreshSuspendedError(until);
+        if (at - lastTrip > forgetAfterMs) strikes = 0;
+        attempts = attempts.filter((when) => at - when < windowMs);
+        if (attempts.length >= budget) {
+          until = at + Math.min(maxCooldownMs, cooldownMs * 2 ** strikes);
+          strikes += 1;
+          lastTrip = at;
+          attempts = [];
+          (_a2 = options.onTrip) == null ? void 0 : _a2.call(options, until);
+          throw new RefreshSuspendedError(until);
+        }
+        attempts.push(at);
+      },
+      suspendedUntil() {
+        return now() < until ? until : null;
+      }
+    };
+  }
+
+  // src/supertokens.ts
   var APP_NAME = "Lemma";
   var SESSION_API_SUFFIX = "/st/auth";
   var initializedSignature = null;
   var unauthorisedListeners = /* @__PURE__ */ new Set();
+  var refreshBreaker = createRefreshBreaker({
+    onTrip: () => unauthorisedListeners.forEach((listener) => listener())
+  });
   function normalizePath(pathname) {
     const trimmed = pathname.trim();
     if (!trimmed || trimmed === "/") {
@@ -9282,6 +9331,12 @@ var LemmaClient = (() => {
            * the one case it was raised for.
            */
           maxRetryAttemptsForSessionRefresh: 3,
+          /* Thrown inside SuperTokens' refresh `try`, so a refused refresh never
+             reaches the network and fails only the request that asked for it. */
+          preAPIHook: async (context) => {
+            if (context.action === "REFRESH_SESSION") refreshBreaker.admit();
+            return context;
+          },
           onHandleEvent: (event) => {
             if (event.action === "UNAUTHORISED") {
               unauthorisedListeners.forEach((listener) => listener());
@@ -9291,6 +9346,30 @@ var LemmaClient = (() => {
       ]
     });
     initializedSignature = signature;
+  }
+
+  // src/reachability.ts
+  function isUnreachableStatus(status) {
+    return status >= 500 || status === 429 || status === 408 || status === 0;
+  }
+  function refreshFailureKind(error) {
+    if (!error || typeof error !== "object") return "absent";
+    const candidate = error;
+    const status = typeof candidate.status === "number" ? candidate.status : candidate.statusCode;
+    if (typeof status === "number") return isUnreachableStatus(status) ? "unreachable" : "absent";
+    return error instanceof TypeError || candidate.name === "TypeError" || candidate.name === "NetworkError" ? "unreachable" : "absent";
+  }
+  async function probeReachable(apiUrl, fetchImpl = fetch) {
+    try {
+      const response = await fetchImpl(`${apiUrl.replace(/\/$/, "")}/health/live`, {
+        method: "GET",
+        credentials: "omit",
+        cache: "no-store"
+      });
+      return !isUnreachableStatus(response.status);
+    } catch {
+      return false;
+    }
   }
 
   // src/auth.ts
@@ -9509,6 +9588,7 @@ var LemmaClient = (() => {
   function hasHeader(headers, name) {
     return Object.keys(headers).some((key) => key.toLowerCase() === name.toLowerCase());
   }
+  var ownOriginRecoveryTried = false;
   var AuthManager = class {
     /**
      * @param token A credential to present as `Authorization: Bearer`. Supplying
@@ -9524,11 +9604,13 @@ var LemmaClient = (() => {
       __publicField(this, "state", { status: "loading", user: null });
       __publicField(this, "listeners", /* @__PURE__ */ new Set());
       __publicField(this, "authCheckPromise", null);
+      __publicField(this, "authRevision", 0);
+      __publicField(this, "onUnauthorised", () => this.markUnauthenticated());
       this.apiUrl = apiUrl;
       this.authUrl = authUrl;
       this.injectedToken = (token == null ? void 0 : token.trim()) || detectInjectedToken();
       if (!this.injectedToken) {
-        ensureCookieSessionSupport(this.apiUrl, () => this.markUnauthenticated());
+        ensureCookieSessionSupport(this.apiUrl, this.onUnauthorised);
       }
     }
     /** Whether requests will use an injected Bearer token (testing mode). */
@@ -9663,7 +9745,7 @@ var LemmaClient = (() => {
         });
         return response.status !== 401;
       } catch {
-        return false;
+        return true;
       }
     }
     /**
@@ -9675,7 +9757,7 @@ var LemmaClient = (() => {
         return this.injectedToken;
       }
       this.assertBrowserContext();
-      ensureCookieSessionSupport(this.apiUrl, () => this.markUnauthenticated());
+      ensureCookieSessionSupport(this.apiUrl, this.onUnauthorised);
       const token = await import_session2.default.getAccessToken();
       if (!token) {
         throw new Error("Token unavailable");
@@ -9690,7 +9772,7 @@ var LemmaClient = (() => {
         return this.injectedToken;
       }
       this.assertBrowserContext();
-      ensureCookieSessionSupport(this.apiUrl, () => this.markUnauthenticated());
+      ensureCookieSessionSupport(this.apiUrl, this.onUnauthorised);
       const refreshed = await import_session2.default.attemptRefreshingSession();
       if (!refreshed) {
         throw new Error("Session refresh failed");
@@ -9732,40 +9814,112 @@ var LemmaClient = (() => {
       if (this.authCheckPromise) {
         return this.authCheckPromise;
       }
-      this.authCheckPromise = this.performAuthCheck().finally(() => {
-        this.authCheckPromise = null;
+      const checking = this.performAuthCheck(this.authRevision).finally(() => {
+        if (this.authCheckPromise === checking) this.authCheckPromise = null;
       });
-      return this.authCheckPromise;
+      this.authCheckPromise = checking;
+      return checking;
     }
-    async performAuthCheck() {
+    /**
+     * One refresh for an app that calls the API through its own origin.
+     *
+     * The session is shared between hosts by the HttpOnly cookies, but the
+     * markers the browser SDK reads (`sFrontToken`, `st-last-access-token-update`)
+     * are host-only on purpose, so a pod app keeps its own copy. If that copy is
+     * half-cleared -- the update marker left behind with no front token, as a
+     * failed refresh leaves it -- `doesSessionExist()` answers "no" without ever
+     * asking, and the app sends a signed-in person to sign in forever. Drop the
+     * stale marker on this host and ask once: the refresh carries the shared
+     * cookie and returns this origin's own front token. Once per page, so a
+     * genuinely signed-out app cannot storm the endpoint.
+     */
+    async recoverOwnOriginSession() {
+      if (ownOriginRecoveryTried || typeof document === "undefined") return false;
+      ownOriginRecoveryTried = true;
+      try {
+        if (new URL(this.apiUrl, window.location.href).origin !== window.location.origin) {
+          return false;
+        }
+      } catch {
+        return false;
+      }
+      document.cookie = "st-last-access-token-update=; expires=Thu, 01 Jan 1970 00:00:00 GMT; path=/";
+      return import_session2.default.doesSessionExist();
+    }
+    /**
+     * Whether the API answers at all -- its liveness probe, not a session check.
+     * What a retry after `unreachable` should wait on, so that an outage does
+     * not spend the refresh breaker's budget and trip it into a sign-out.
+     */
+    isReachable() {
+      return probeReachable(this.apiUrl);
+    }
+    /**
+     * The local session, with the reason when there is none.
+     *
+     * `doesSessionExist()` folds every failed refresh into "no": a 401, a server
+     * that did not answer, and SuperTokens' duplicate-cookie answer -- a 200
+     * with no `front-token`, which the SDK throws on without saving anything.
+     * One direct refresh tells them apart. It also is the retry the duplicate
+     * answer needs: the server cleared the stray copy on that response, so this
+     * refresh carries one cookie and succeeds. Where the SDK already knows there
+     * is no session (the update marker without a front token) it answers
+     * without touching the network.
+     */
+    async localSession() {
+      try {
+        if (await import_session2.default.doesSessionExist()) return "exists";
+      } catch (error) {
+        return refreshFailureKind(error);
+      }
+      try {
+        if (await import_session2.default.attemptRefreshingSession()) return "exists";
+      } catch (error) {
+        if (refreshFailureKind(error) === "unreachable") return "unreachable";
+      }
+      try {
+        return await this.recoverOwnOriginSession() ? "exists" : "absent";
+      } catch (error) {
+        return refreshFailureKind(error);
+      }
+    }
+    async performAuthCheck(revision) {
+      const unauthenticated = () => revision === this.authRevision ? this.applyUnauthenticatedState() : this.state;
+      const unreachable = () => {
+        if (revision !== this.authRevision) return this.state;
+        const next = { status: "unreachable", user: null };
+        this.setState(next);
+        return next;
+      };
       this.setState({ status: "loading", user: null });
       if (!this.injectedToken && typeof window !== "undefined") {
-        ensureCookieSessionSupport(this.apiUrl, () => this.markUnauthenticated());
-        try {
-          if (!await import_session2.default.doesSessionExist()) {
-            return this.applyUnauthenticatedState();
-          }
-        } catch {
-          return this.applyUnauthenticatedState();
-        }
+        ensureCookieSessionSupport(this.apiUrl, this.onUnauthorised);
+        const local = await this.localSession();
+        if (local === "unreachable") return unreachable();
+        if (local === "absent") return unauthenticated();
       }
+      if (revision !== this.authRevision) return this.state;
       try {
         const response = await fetch(
           `${this.apiUrl}/users/me`,
           this.getRequestInit({ method: "GET" })
         );
         if (response.status === 401) {
-          return this.applyUnauthenticatedState();
+          return unauthenticated();
+        }
+        if (isUnreachableStatus(response.status)) {
+          return unreachable();
         }
         if (!response.ok) {
-          return this.applyUnauthenticatedState();
+          return unauthenticated();
         }
         const user = await response.json();
+        if (revision !== this.authRevision) return this.state;
         const next = { status: "authenticated", user };
         this.setState(next);
         return next;
-      } catch {
-        return this.applyUnauthenticatedState();
+      } catch (error) {
+        return refreshFailureKind(error) === "unreachable" ? unreachable() : unauthenticated();
       }
     }
     /**
@@ -9773,6 +9927,8 @@ var LemmaClient = (() => {
      * Does NOT redirect — call redirectToAuth() explicitly if desired.
      */
     markUnauthenticated() {
+      this.authRevision += 1;
+      this.authCheckPromise = null;
       this.applyUnauthenticatedState();
     }
     /**
@@ -9780,13 +9936,15 @@ var LemmaClient = (() => {
      * Returns true when the session is no longer active.
      */
     async signOut() {
+      this.authRevision += 1;
+      this.authCheckPromise = null;
       if (this.injectedToken) {
         this.clearInjectedToken();
         this.markUnauthenticated();
         return true;
       }
       this.assertBrowserContext();
-      ensureCookieSessionSupport(this.apiUrl, () => this.markUnauthenticated());
+      ensureCookieSessionSupport(this.apiUrl, this.onUnauthorised);
       try {
         await import_session2.default.signOut();
       } catch {
@@ -9930,7 +10088,7 @@ var LemmaClient = (() => {
   }
 
   // src/version.ts
-  var SDK_VERSION = "0.8.0";
+  var SDK_VERSION = "0.9.0";
   var CLIENT_HEADER_NAME = "X-Lemma-Client";
   var APP_HEADER_NAME = "X-Lemma-App";
   var KNOWN_CLIENTS = [
@@ -10190,6 +10348,20 @@ var LemmaClient = (() => {
       }
     }
     async stream(path, options = {}) {
+      const response = await this.streamResponse(path, options);
+      if (!response.body) {
+        throw new ApiError(response.status, "Stream response had no body.");
+      }
+      return response.body;
+    }
+    /**
+     * `stream`, but the whole successful `Response` rather than only its body.
+     *
+     * For a caller that has to read the status as well as the bytes: a ranged
+     * read is only a slice if it came back 206, and a server that ignored the
+     * `Range` answers 200 with the file from byte 0.
+     */
+    async streamResponse(path, options = {}) {
       var _a, _b, _c;
       let response;
       try {
@@ -10218,10 +10390,7 @@ var LemmaClient = (() => {
       if (!response.ok) {
         throw await this.parseError(response);
       }
-      if (!response.body) {
-        throw new ApiError(response.status, "Stream response had no body.");
-      }
-      return response.body;
+      return response;
     }
     /**
      * A binary response, optionally only part of one.
@@ -10231,6 +10400,16 @@ var LemmaClient = (() => {
      * was capped and there was no way to ask for the rest.
      */
     async requestBytes(method, path, options = {}) {
+      return (await this.requestBytesResponse(method, path, options)).blob;
+    }
+    /**
+     * `requestBytes`, with the status and `Content-Range` it came back with.
+     *
+     * A ranged read needs them: 206 (or a `Content-Range` starting where it
+     * asked) is the only evidence the server honoured the `Range` rather than
+     * answering with the whole file again.
+     */
+    async requestBytesResponse(method, path, options = {}) {
       const url = `${this.apiUrl}${path}`;
       const init = this.auth.getRequestInit({ method });
       if (options.headers) {
@@ -10243,7 +10422,11 @@ var LemmaClient = (() => {
       if (!response.ok) {
         throw await this.parseError(response);
       }
-      return response.blob();
+      return {
+        blob: await response.blob(),
+        status: response.status,
+        contentRange: response.headers.get("Content-Range")
+      };
     }
   };
 
@@ -10369,7 +10552,7 @@ var LemmaClient = (() => {
   // src/openapi_client/core/OpenAPI.ts
   var OpenAPI = {
     BASE: "",
-    VERSION: "0.8.0",
+    VERSION: "0.9.0",
     WITH_CREDENTIALS: false,
     CREDENTIALS: "include",
     TOKEN: void 0,
@@ -10736,116 +10919,6 @@ var LemmaClient = (() => {
   // src/openapi_client/services/AgentHostService.ts
   var AgentHostService = class {
     /**
-     * Append Agent Host Events
-     * Append one ordered batch to the run's stream.
-     *
-     * There is no second lane to publish on: every event type travels the one
-     * ordered stream, and the ack watermark is the stream's last entry.
-     * @param requestBody
-     * @param authorization
-     * @returns AgentHostEventAck Successful Response
-     * @throws ApiError
-     */
-    static agentHostEventsAppend(requestBody, authorization) {
-      return request(OpenAPI, {
-        method: "POST",
-        url: "/agent-host/events/append",
-        headers: {
-          "authorization": authorization
-        },
-        body: requestBody,
-        mediaType: "application/json",
-        errors: {
-          422: `Validation Error`
-        }
-      });
-    }
-    /**
-     * Publish Agent Host Harnesses
-     * Replace this host's harness snapshots with the reported set.
-     * @param requestBody
-     * @param authorization
-     * @returns AgentHostHarnessPublishResponse Successful Response
-     * @throws ApiError
-     */
-    static agentHostHarnessesPublish(requestBody, authorization) {
-      return request(OpenAPI, {
-        method: "PUT",
-        url: "/agent-host/harnesses",
-        headers: {
-          "authorization": authorization
-        },
-        body: requestBody,
-        mediaType: "application/json",
-        errors: {
-          422: `Validation Error`
-        }
-      });
-    }
-    /**
-     * Complete Agent Host Pairing
-     * Consume a pairing code and issue the host secret, shown exactly once.
-     * @param requestBody
-     * @returns AgentHostPairingCompleted Successful Response
-     * @throws ApiError
-     */
-    static agentHostPairingComplete(requestBody) {
-      return request(OpenAPI, {
-        method: "POST",
-        url: "/agent-host/pairings/complete",
-        body: requestBody,
-        mediaType: "application/json",
-        errors: {
-          422: `Validation Error`
-        }
-      });
-    }
-    /**
-     * Poll Agent Host Commands
-     * Long-poll for commands, carrying the host's control updates up.
-     *
-     * This owns its own units of work rather than the request-scoped one: the
-     * idle wait below can hold the connection open for 25 seconds, and a
-     * transaction must not stay open across it.
-     * @param requestBody
-     * @param authorization
-     * @returns AgentHostPollResponse Successful Response
-     * @throws ApiError
-     */
-    static agentHostPoll(requestBody, authorization) {
-      return request(OpenAPI, {
-        method: "POST",
-        url: "/agent-host/poll",
-        headers: {
-          "authorization": authorization
-        },
-        body: requestBody,
-        mediaType: "application/json",
-        errors: {
-          422: `Validation Error`
-        }
-      });
-    }
-    /**
-     * Self Revoke Agent Host
-     * Let a host retire its own credential, e.g. on uninstall.
-     * @param authorization
-     * @returns AgentHostResponse Successful Response
-     * @throws ApiError
-     */
-    static agentHostSelfRevoke(authorization) {
-      return request(OpenAPI, {
-        method: "POST",
-        url: "/agent-host/revoke",
-        headers: {
-          "authorization": authorization
-        },
-        errors: {
-          422: `Validation Error`
-        }
-      });
-    }
-    /**
      * Create Agent Host Pairing
      * Mint a short-lived pairing code for a machine this user controls.
      *
@@ -10881,6 +10954,11 @@ var LemmaClient = (() => {
     /**
      * Revoke Agent Host
      * Revoke a host, invalidating its secret immediately.
+     *
+     * The secret stops authenticating the moment this commits, but a link opened
+     * with it before then is already past authentication. The notice closes it,
+     * on whichever replica holds it, instead of leaving it working until the host
+     * happens to reconnect.
      * @param hostId
      * @returns AgentHostResponse Successful Response
      * @throws ApiError
@@ -10938,6 +11016,45 @@ var LemmaClient = (() => {
 
   // src/openapi_client/services/AgentRuntimeService.ts
   var AgentRuntimeService = class {
+    /**
+     * Clear the Organization's Default Model
+     * @param organizationId
+     * @returns void
+     * @throws ApiError
+     */
+    static agentRuntimeDefaultClear(organizationId) {
+      return request(OpenAPI, {
+        method: "DELETE",
+        url: "/organizations/{organization_id}/agent-runtime/default",
+        path: {
+          "organization_id": organizationId
+        },
+        errors: {
+          422: `Validation Error`
+        }
+      });
+    }
+    /**
+     * Set the Organization's Default Model
+     * @param organizationId
+     * @param requestBody
+     * @returns AgentRuntimeConfig Successful Response
+     * @throws ApiError
+     */
+    static agentRuntimeDefaultSet(organizationId, requestBody) {
+      return request(OpenAPI, {
+        method: "PUT",
+        url: "/organizations/{organization_id}/agent-runtime/default",
+        path: {
+          "organization_id": organizationId
+        },
+        body: requestBody,
+        mediaType: "application/json",
+        errors: {
+          422: `Validation Error`
+        }
+      });
+    }
     /**
      * List Available Agent Runtime Profiles
      * @param organizationId
@@ -11064,6 +11181,26 @@ var LemmaClient = (() => {
         }
       });
     }
+    /**
+     * Test a Saved Model Provider
+     * @param organizationId
+     * @param profileId
+     * @returns AgentRuntimeProfileTestResponse Successful Response
+     * @throws ApiError
+     */
+    static agentRuntimeProfilesTest(organizationId, profileId) {
+      return request(OpenAPI, {
+        method: "POST",
+        url: "/organizations/{organization_id}/agent-runtime/profiles/{profile_id}/test",
+        path: {
+          "organization_id": organizationId,
+          "profile_id": profileId
+        },
+        errors: {
+          422: `Validation Error`
+        }
+      });
+    }
   };
 
   // src/namespaces/agent-runtime.ts
@@ -11117,6 +11254,31 @@ var LemmaClient = (() => {
       return this.client.request(
         () => AgentRuntimeService.agentRuntimeProfilesRestore(orgId, profileId)
       );
+    }
+    /**
+     * List a saved provider's models and send its default model one short
+     * message. `ok` is false with a plain-language `message` when the key is
+     * rejected or nothing answers; the provider's own error text is never
+     * returned.
+     */
+    testProfile(orgId, profileId) {
+      return this.client.request(
+        () => AgentRuntimeService.agentRuntimeProfilesTest(orgId, profileId)
+      );
+    }
+    /**
+     * Make an organization-wide model provider what every teammate that names
+     * no model runs on. Leave `model_name` out to follow the provider's own
+     * default model.
+     */
+    setOrganizationDefault(orgId, request2) {
+      return this.client.request(
+        () => AgentRuntimeService.agentRuntimeDefaultSet(orgId, request2)
+      );
+    }
+    /** Stop choosing a model for the organization. */
+    clearOrganizationDefault(orgId) {
+      return this.client.request(() => AgentRuntimeService.agentRuntimeDefaultClear(orgId));
     }
     /**
      * @deprecated Runtime defaults are now pod config (`default_profile_id`) or
@@ -11517,6 +11679,7 @@ var LemmaClient = (() => {
           parent_id: options.parent_id,
           type: options.type,
           archived: options.archived,
+          search: options.search,
           limit: (_a = options.limit) != null ? _a : 20,
           page_token: options.page_token
         }
@@ -11609,6 +11772,19 @@ var LemmaClient = (() => {
           body: payload,
           signal: options.signal
         }
+      );
+    }
+    /**
+     * Take back a message sent while a run was working, before the agent has seen
+     * it. Rejects with a 409 once a run has read it, or once it is on its way to
+     * an Agent Host turn.
+     */
+    withdrawMessage(conversationId, messageId, options = {}) {
+      const podId = this.requirePodId(options.pod_id);
+      return this.http.request(
+        "DELETE",
+        `/pods/${podId}/conversations/${conversationId}/messages/${messageId}`,
+        { signal: options.signal }
       );
     }
     retryFailedRun(conversationId, options = {}) {
@@ -11992,11 +12168,16 @@ var LemmaClient = (() => {
       var _a;
       const items = [];
       let pageToken;
+      const seen = /* @__PURE__ */ new Set();
       for (; ; ) {
         const page = await this.releases(name, { limit: pageSize, pageToken });
         items.push(...(_a = page.items) != null ? _a : []);
         pageToken = page.next_page_token;
         if (typeof pageToken !== "string" || !pageToken) return items;
+        if (seen.has(pageToken)) {
+          throw new Error(`Release pages for app "${name}" repeated page token "${pageToken}"; stopping.`);
+        }
+        seen.add(pageToken);
       }
     }
     /**
@@ -12165,6 +12346,29 @@ var LemmaClient = (() => {
         },
         formData,
         mediaType: "multipart/form-data",
+        errors: {
+          422: `Validation Error`
+        }
+      });
+    }
+    /**
+     * Retry File Processing
+     * Queue a document whose processing failed to be read and indexed again, with a fresh retry budget. A file that did not fail is returned unchanged.
+     * @param podId
+     * @param path
+     * @returns FileDetailResponse Successful Response
+     * @throws ApiError
+     */
+    static fileRetryProcessing(podId, path) {
+      return request(OpenAPI, {
+        method: "POST",
+        url: "/pods/{pod_id}/datastore/files/by-path/retry-processing",
+        path: {
+          "pod_id": podId
+        },
+        query: {
+          "path": path
+        },
         errors: {
           422: `Validation Error`
         }
@@ -12542,6 +12746,11 @@ var LemmaClient = (() => {
     }
     get(path) {
       return this.client.request(() => FilesService.fileGet(this.podId(), path));
+    }
+    /** Queue a document whose processing failed to be read again. A file that
+     *  did not fail is returned unchanged. */
+    retryProcessing(path) {
+      return this.client.request(() => FilesService.fileRetryProcessing(this.podId(), path));
     }
     /**
      * Read a file by id.
@@ -13003,11 +13212,16 @@ var LemmaClient = (() => {
           var _a;
           const items = [];
           let pageToken;
+          const seen = /* @__PURE__ */ new Set();
           for (; ; ) {
             const page = await this.revisions.list(name, { limit: pageSize, pageToken });
             items.push(...(_a = page.items) != null ? _a : []);
             pageToken = page.next_page_token;
             if (typeof pageToken !== "string" || !pageToken) return items;
+            if (seen.has(pageToken)) {
+              throw new Error(`Revision pages for function "${name}" repeated page token "${pageToken}"; stopping.`);
+            }
+            seen.add(pageToken);
           }
         },
         /** One revision, with its source and the schemas its code implements. */
@@ -13779,7 +13993,11 @@ var LemmaClient = (() => {
           ));
         },
         execute: (scope, operationName, payload, accountId) => {
-          const body = { payload, account_id: accountId };
+          const body = {
+            payload,
+            account_id: accountId,
+            ...scope.podId ? { pod_id: scope.podId } : {}
+          };
           return this.client.request(() => ConnectorsService.connectorOperationExecute(
             scope.organizationId,
             scope.authConfigName,
@@ -16179,6 +16397,7 @@ var LemmaClient = (() => {
       const { filters, sort, offset, pageSize } = options;
       const rows = [];
       let pageToken;
+      const seen = /* @__PURE__ */ new Set();
       for (; ; ) {
         const page = await this.list(table, {
           filters,
@@ -16192,6 +16411,10 @@ var LemmaClient = (() => {
         if (!pageToken) {
           return rows;
         }
+        if (seen.has(pageToken)) {
+          throw new Error(`Record pages for table "${table}" repeated page token "${pageToken}"; stopping.`);
+        }
+        seen.add(pageToken);
       }
     }
     create(table, data) {
@@ -16825,6 +17048,33 @@ var LemmaClient = (() => {
       });
     }
     /**
+     * Get Email Delivery Status
+     * Whether this local installation can send email. Local installations only; 404 elsewhere.
+     * @returns EmailDeliveryStatusResponse Successful Response
+     * @throws ApiError
+     */
+    static userEmailDeliveryGet() {
+      return request(OpenAPI, {
+        method: "GET",
+        url: "/users/me/email-delivery"
+      });
+    }
+    /**
+     * Send A Test Email
+     * Send a short test email to the signed-in user's own address with this installation's email settings. Local installations only; 404 elsewhere.
+     * @returns EmailDeliveryTestResponse Successful Response
+     * @throws ApiError
+     */
+    static userEmailDeliveryTest() {
+      return request(OpenAPI, {
+        method: "POST",
+        url: "/users/me/email-delivery/test",
+        errors: {
+          429: `Too many test emails; see Retry-After`
+        }
+      });
+    }
+    /**
      * Ensure The Current User Has A Workspace
      * Select an eligible organization and idempotently ensure the current user has a private pod and assistant.
      * @param requestBody
@@ -16884,6 +17134,15 @@ var LemmaClient = (() => {
     }
     ensureFirstWorkspace(payload = {}) {
       return this.client.request(() => UsersService.usersEnsureFirstWorkspace(payload));
+    }
+    /** Whether this local installation can send email. 404 on a server. */
+    emailDelivery() {
+      return this.client.request(() => UsersService.userEmailDeliveryGet());
+    }
+    /** Send a test email to the signed-in user's own address. Local installations
+     *  only; answers `{ ok, message }`, where `message` is fit to show. */
+    sendTestEmail() {
+      return this.client.request(() => UsersService.userEmailDeliveryTest());
     }
     getProfile() {
       return this.client.request(() => UsersService.userProfileGet());
@@ -17342,6 +17601,22 @@ var LemmaClient = (() => {
 
   // src/namespaces/workspace.ts
   var MAX_READ_BYTES = 8 * 1024 * 1024;
+  function contentPath(path, options = {}) {
+    const query = new URLSearchParams({ path });
+    if (options.offset) query.set("offset", String(options.offset));
+    if (options.length) query.set("length", String(options.length));
+    return `/workspace/files:content?${query.toString()}`;
+  }
+  function rangeHeader(range) {
+    return { Range: `bytes=${range.start}-${range.end}` };
+  }
+  function rangeHonoured(status, contentRange, start) {
+    if (contentRange) {
+      const match = /^bytes (\d+)-\d+\/(?:\d+|\*)$/.exec(contentRange.trim());
+      return match !== null && Number(match[1]) === start;
+    }
+    return status === 206;
+  }
   var WebLoginsNamespace = class {
     constructor(http) {
       __publicField(this, "http", http);
@@ -17429,6 +17704,18 @@ var LemmaClient = (() => {
       });
     }
     /**
+     * Whether this person's computer is ready, without starting anything.
+     *
+     * `ready` it is running; `downloading` it is fetching its image, which the
+     * first start after an update does; `starting` it is coming up; `asleep` it
+     * is not running and starts on first use; `unavailable` it could not be asked.
+     * While `downloading`, `done_mb` and `total_mb` say how far it has got, once
+     * that can be measured.
+     */
+    status() {
+      return this.http.request("GET", "/workspace/status");
+    }
+    /**
      * Whether the browser can be watched, without starting anything.
      *
      * `asleep` the computer is paused; `stopped` it is up but the browser is not
@@ -17486,11 +17773,8 @@ var LemmaClient = (() => {
      * you.
      */
     readFile(path, options = {}) {
-      const query = new URLSearchParams({ path });
-      if (options.offset) query.set("offset", String(options.offset));
-      if (options.length) query.set("length", String(options.length));
-      return this.http.requestBytes("GET", `/workspace/files:content?${query.toString()}`, {
-        headers: options.range ? { Range: `bytes=${options.range.start}-${options.range.end}` } : void 0
+      return this.http.requestBytes("GET", contentPath(path, options), {
+        headers: options.range ? rangeHeader(options.range) : void 0
       });
     }
     /**
@@ -17529,13 +17813,22 @@ var LemmaClient = (() => {
       }
       for (; ; ) {
         let part;
+        let honoured;
         try {
-          part = await this.readFile(path, {
-            range: { start, end: start + step - 1 }
+          const answer = await this.http.requestBytesResponse("GET", contentPath(path), {
+            headers: rangeHeader({ start, end: start + step - 1 })
           });
+          part = answer.blob;
+          honoured = rangeHonoured(answer.status, answer.contentRange, start);
         } catch (error) {
           if (error instanceof ApiError && error.statusCode === 416) break;
           throw error;
+        }
+        if (!honoured) {
+          if (start === 0 && part.size < MAX_READ_BYTES) return part;
+          throw new Error(
+            `The server ignored the Range header reading "${path}" at byte ${start}; stopping rather than stitching repeated copies of the file.`
+          );
         }
         if (part.size === 0) break;
         parts.push(part);
@@ -17579,7 +17872,9 @@ var LemmaClient = (() => {
   // src/datastore-changes.ts
   var RECONNECT_BASE_DELAY_MS = 500;
   var RECONNECT_MAX_DELAY_MS = 3e4;
-  var WS_POLICY_VIOLATION = 1008;
+  var WS_UNAUTHENTICATED = 4401;
+  var WS_FORBIDDEN = 4403;
+  var WS_NOT_FOUND = 4404;
   function reconnectDelayMs(attempt) {
     const ceiling = Math.min(
       RECONNECT_MAX_DELAY_MS,
@@ -17600,21 +17895,30 @@ var LemmaClient = (() => {
     let cursor = options.since;
     let attempt = 0;
     let stopped = false;
+    let authRefreshed = false;
     let reconnectTimer = null;
     const status = (next) => {
       var _a;
       return (_a = options.onStatus) == null ? void 0 : _a.call(options, next);
     };
-    const scheduleReconnect = () => {
+    const fail = (error) => {
       var _a;
       if (stopped) return;
-      if (options.maxRetries != null && attempt >= options.maxRetries) {
+      stopped = true;
+      status("closed");
+      (_a = options.onError) == null ? void 0 : _a.call(options, error);
+    };
+    const scheduleReconnect = () => {
+      var _a, _b;
+      if (stopped) return;
+      if (((_a = auth.getState) == null ? void 0 : _a.call(auth).status) === "unauthenticated") {
         stopped = true;
         status("closed");
-        (_a = options.onError) == null ? void 0 : _a.call(
-          options,
-          new Error("Datastore change stream: max reconnect attempts reached")
-        );
+        (_b = options.onError) == null ? void 0 : _b.call(options, new Error("Datastore change stream: signed out"));
+        return;
+      }
+      if (options.maxRetries != null && attempt >= options.maxRetries) {
+        fail(new Error("Datastore change stream: max reconnect attempts reached"));
         return;
       }
       const delay = reconnectDelayMs(attempt);
@@ -17644,10 +17948,6 @@ var LemmaClient = (() => {
         return;
       }
       socket = ws;
-      ws.onopen = () => {
-        attempt = 0;
-        status("open");
-      };
       ws.onmessage = (event) => {
         var _a2;
         let frame;
@@ -17659,6 +17959,9 @@ var LemmaClient = (() => {
         if (!frame || typeof frame !== "object") return;
         const record = frame;
         if (record.type === "ready") {
+          attempt = 0;
+          authRefreshed = false;
+          status("open");
           cursor = record.since || cursor;
           if (cursor) (_a2 = options.onReady) == null ? void 0 : _a2.call(options, { since: cursor });
           return;
@@ -17672,8 +17975,28 @@ var LemmaClient = (() => {
           status("closed");
           return;
         }
-        if (event.code === WS_POLICY_VIOLATION && !options.useCookie) {
-          auth.refreshAccessToken().then(scheduleReconnect, scheduleReconnect);
+        if (event.code === WS_UNAUTHENTICATED) {
+          if (authRefreshed) {
+            fail(new Error("Datastore change stream: session rejected after refresh"));
+            return;
+          }
+          authRefreshed = true;
+          auth.refreshAccessToken().then(
+            scheduleReconnect,
+            (error) => fail(
+              new Error(
+                `Datastore change stream: session refresh failed (${error instanceof Error ? error.message : String(error)})`
+              )
+            )
+          );
+          return;
+        }
+        if (event.code === WS_FORBIDDEN) {
+          fail(new Error("Datastore change stream: no access to this pod's changes"));
+          return;
+        }
+        if (event.code === WS_NOT_FOUND) {
+          fail(new Error("Datastore change stream: pod or table not found"));
           return;
         }
         scheduleReconnect();
@@ -17869,6 +18192,14 @@ var LemmaClient = (() => {
      */
     stream(path, options) {
       return this._http.stream(path, options);
+    }
+    /**
+     * `stream`, returning the whole `Response` so its status and headers can be
+     * read — e.g. whether a ranged read came back 206 or the server ignored the
+     * `Range` and sent the file from the start.
+     */
+    streamResponse(path, options) {
+      return this._http.streamResponse(path, options);
     }
   };
 

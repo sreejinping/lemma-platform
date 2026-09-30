@@ -21,13 +21,13 @@ is the status quo, not a regression this introduced.
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict
 from collections.abc import Sequence
 from typing import Protocol
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from uuid import UUID, uuid4
 
+from app.core.bounded import BoundedDict
 from app.core.log.log import get_logger
 from app.core.request_context import create_inherited_task
 from app.modules.workspace.infrastructure.runtime_bundle import (
@@ -49,6 +49,7 @@ from app.modules.workspace.providers.base import (
     ProviderRejected,
 )
 from sandbox_runtime import runtime_install
+from sandbox_runtime.paths import RUNTIME_OVERLAY_ROOT
 from sandbox_runtime.errors import SandboxError
 from sandbox_runtime.protocol import (
     ProcessOutputSnapshot,
@@ -61,7 +62,7 @@ logger = get_logger(__name__)
 #: Where the overlay lives. Outside `/workspace` on purpose: this is platform
 #: code, not the user's, and putting it in their project root would put it in
 #: their file tree, in their exports, and within reach of an agent's `rm`.
-RUNTIME_ROOT = "/opt/lemma-runtime"
+RUNTIME_ROOT = RUNTIME_OVERLAY_ROOT
 
 #: Staging paths. `/tmp` because they are consumed once and must not survive --
 #: the installer deletes them itself, and a pause would otherwise carry a
@@ -128,12 +129,21 @@ def install_command(
     `/opt` rather than somewhere under the home, deliberately. It is where
     add-on software belongs, it keeps what the platform installed out of the
     directory listing the user browses, and it keeps the disk-copy set that a
-    later migration works from as "the user's files" -- an overlay installed
-    `--no-deps` against one base image has no business being carried onto
-    another. The cost is that on Docker and `lemma_local`, where `/opt` is the
-    container layer, replacing a container discards it and the next ensure
-    reinstalls: about 650ms, once, on the fabric where a container is cheap. On
-    E2B, where the sandbox is the disk, it simply persists.
+    later migration works from as "the user's files".
+
+    It persists on every fabric. On E2B the sandbox is the disk. On Docker and
+    `lemma_local` it is its own mount beside the home -- a volume named after
+    the workspace volume, and a directory beside the home on Desktop's guest --
+    so a replaced container starts with the overlay already installed, and the
+    stamp this probes says so. Without the mount the container layer took it,
+    and the next ensure paid a reinstall. It goes when the sandbox's storage
+    does. A replacement on a newer image keeps the overlay until the version
+    moves; the overlay carries only Lemma's code, and the image's third-party
+    closure moves only with a lockfile that the bundle is built against too.
+
+    The workspace server is the one process that imports its code at container
+    start, so an install does not reach it. `workspace_runtime_restart` restarts
+    the sandbox once, when that is safe, for a server not running this overlay.
     """
     return (
         "sudo -n true 2>/dev/null && SUDO='sudo -n' || SUDO=''; "
@@ -147,7 +157,7 @@ def install_command(
 
 
 class _ManagerClient(Protocol):
-    """The four calls this mixin makes on the workspace manager client.
+    """The calls these mixins make on the workspace manager client.
 
     A Protocol rather than the concrete class because the mixin is mixed *into*
     that service: naming the real type here would be a cycle, and naming nothing
@@ -191,6 +201,11 @@ class _ManagerClient(Protocol):
         wait_seconds: int,
     ) -> ProcessOutputSnapshot: ...
 
+    async def release_sandbox(
+        self, workload_kind: WorkloadKind, logical_id: UUID
+    ) -> None:
+        """Stop the sandbox, keeping its storage; the next ensure resumes it."""
+
 
 class WorkspaceRuntimeBundleMixin:
     """``_ensure_runtime_bundle``, mixed into the workspace sandbox service."""
@@ -208,8 +223,8 @@ class WorkspaceRuntimeBundleMixin:
     #: churn this would hold one key per sandbox the process had ever seen, for
     #: the life of the process. Evicting the oldest costs a probe -- one command
     #: -- which is the cheapest thing in this file.
-    _installed_bundles: OrderedDict[tuple[int, UUID, str, int, int], str] = (
-        OrderedDict()
+    _installed_bundles: BoundedDict[tuple[int, UUID, str, int, int], str] = BoundedDict(
+        _REMEMBERED_SANDBOXES, name="workspace.installed_bundles"
     )
     _inflight_bundles: dict[tuple[int, UUID, str, int, int], asyncio.Task[bool]] = {}
 
@@ -228,15 +243,16 @@ class WorkspaceRuntimeBundleMixin:
     ) -> tuple[int, UUID, str, int, int] | None:
         """Identity for "the overlay is installed", which belongs to the sandbox.
 
-        Unlike a directory, the overlay does not live on a disk that outlives
-        its container: it is written into the sandbox's own filesystem, which on
-        Docker and `lemma_local` is the container layer. So the *epoch* has to be
-        here. `allocation_id` is the logical sandbox and does not move when a
-        container is replaced -- and a replacement that adopts the same volume
-        keeps its files and its storage generation while losing `/opt`
-        entirely. Keyed without the epoch, that sandbox reported the overlay
-        installed and ran the image's older copy, which is the one outcome this
-        whole mechanism exists to make impossible.
+        The overlay has its own mount now, which survives a replaced container,
+        but a container created before that mount existed kept it in its own
+        layer -- so the *epoch* still has to be here. `allocation_id` is the
+        logical sandbox and does not move when a container is replaced, and a
+        replacement without the mount keeps its files and its storage
+        generation while losing `/opt` entirely. Keyed without the epoch, that
+        sandbox reported the overlay installed and ran the image's older copy,
+        which is the one outcome this whole mechanism exists to make
+        impossible. With the mount, the re-probe finds the stamp and installs
+        nothing.
 
         Conservative in the only direction that is safe: a re-probe costs one
         command, a wrong "already installed" costs a sandbox running code we
@@ -276,7 +292,7 @@ class WorkspaceRuntimeBundleMixin:
             # someone has been working in all day is evicted ahead of one that
             # was installed into once and abandoned -- exactly backwards, since
             # the busy one is the whole reason this path avoids I/O.
-            self._installed_bundles.move_to_end(key)
+            self._installed_bundles[key] = bundle.version
             return
 
         task = self._inflight_bundles.get(key) if key is not None else None
@@ -300,9 +316,6 @@ class WorkspaceRuntimeBundleMixin:
         # the life of this process, with the warm path skipping every retry.
         if installed and key is not None:
             self._installed_bundles[key] = bundle.version
-            self._installed_bundles.move_to_end(key)
-            while len(self._installed_bundles) > _REMEMBERED_SANDBOXES:
-                self._installed_bundles.popitem(last=False)
 
     async def _install_bundle(self, user_id: UUID, bundle: RuntimeBundle) -> bool:
         """Install it, reporting whether the sandbox now has this version."""
@@ -376,16 +389,16 @@ class WorkspaceRuntimeBundleMixin:
             ARCHIVE_PATH,
             bundle.archive,
             deadline_at=deadline_at,
-            # No `expected_sha256` here, deliberately. The two providers read
-            # that argument differently -- the workspace runtime treats it as a
-            # precondition on the file *already* at this path, so a first upload
-            # to a path with nothing at it is a 409; E2B treats it as a checksum
-            # of the outgoing bytes. No single value is correct on both.
+            # No `expected_sha256` here, deliberately -- though no longer
+            # because the fabrics disagree about what it means. They read it
+            # the same way now: a precondition on the file *already* at this
+            # path, which a first upload to an empty path cannot satisfy on any
+            # of them.
             #
             # The installer hashes the staged archive against the version
-            # instead, which is stronger than either: the version *is* that
-            # digest, and the check runs against the bytes that actually landed
-            # rather than the ones we believe we sent.
+            # instead, which is stronger than a precondition either way: the
+            # version *is* that digest, and the check runs against the bytes
+            # that actually landed rather than the ones we believe we sent.
         )
 
     async def _run_installer(
@@ -438,7 +451,11 @@ class WorkspaceRuntimeBundleMixin:
         return None
 
     async def _ensure_browser_proxy(
-        self, user_id: UUID, sandbox_info: SandboxInfo
+        self,
+        user_id: UUID,
+        sandbox_info: SandboxInfo,
+        *,
+        wait_seconds: float | None = None,
     ) -> None:
         """Tell this sandbox whether its browser goes through a proxy.
 
@@ -458,17 +475,24 @@ class WorkspaceRuntimeBundleMixin:
         this mixin. A sandbox that could not be told keeps what it had --
         the state it was already in -- and the next session tries again.
         Refusing somebody a shell because a proxy file did not land would be
-        the worse trade.
+        the worse trade. Running out of the caller's `wait_seconds` is the
+        same case, and degrades the same way.
         """
         proxy = browser_proxy_for(_sandbox_uuid(sandbox_info), SandboxKind.WORKSPACE)
+        budget = _INSTALL_BUDGET_SECONDS
+        if wait_seconds is not None:
+            budget = min(budget, wait_seconds)
         try:
-            await self._get_manager_client().write_file(
-                user_id,
-                BROWSER_PROXY_DECISION_PATH,
-                decision_bytes(proxy),
-                deadline_at=_deadline(_INSTALL_BUDGET_SECONDS),
+            await asyncio.wait_for(
+                self._get_manager_client().write_file(
+                    user_id,
+                    BROWSER_PROXY_DECISION_PATH,
+                    decision_bytes(proxy),
+                    deadline_at=_deadline(budget),
+                ),
+                timeout=budget,
             )
-        except _SANDBOX_FAILURES:
+        except (*_SANDBOX_FAILURES, asyncio.TimeoutError):
             logger.warning(
                 "workspace.browser_proxy.delivery_failed.degraded",
                 user_id=str(user_id),

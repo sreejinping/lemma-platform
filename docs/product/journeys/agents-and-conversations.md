@@ -13,6 +13,11 @@ an agent real work, walk away, and be confident it cannot do anything they did
 not permit — and that anything genuinely consequential comes back to them before
 it happens.
 
+People shall be able to copy their messages and teammate replies, including
+separately copying code blocks, tables, quotes and expandable sections. Copy
+controls shall be reachable by keyboard and on touch screens, and shall report
+whether copying succeeded.
+
 ---
 
 ## Capability: Define an agent
@@ -98,6 +103,8 @@ it happens.
   and then to the deployment's.
 - The system shall keep provider credentials secret — never returning them to
   any client, in any response, at any privilege level.
+- If the provider refuses the key a person gives when adding it, then the
+  system shall not add the provider, and shall say the key was rejected.
 - If a configured provider is unreachable, then the system shall fail the run
   with a message saying the provider failed, rather than silently using a
   different one.
@@ -179,6 +186,29 @@ it happens.
   one.
 
 **Contracts:** `agent.conversation.message.append`, `agent.conversation.message.list`
+
+### PS-AGENT-016 — Everyday requests finish while the person waits
+**Status:** covered
+
+- When a person asks the pod's default agent for everyday work — an answer from
+  the pod's tables, a change to a doc, a new record, a file made from the pod's
+  data, a quick look-up on the web, something to remember — the system shall
+  finish it while they wait, on the model the deployment is configured with:
+  an answer, a record or a change to a doc within 30 seconds; a file or a web
+  look-up within 45 seconds; a formatted document such as a PDF or a Word
+  document within 90 seconds; a short research memo drawn from several web
+  sources, with those sources cited, within two minutes.
+- The system shall do what the request named: the record is in the table, the
+  file is at the path asked for, and a doc is changed only where asked.
+- While a person is waiting, the system shall spend the time on the work: it
+  shall not re-check what a tool has already reported, render or screenshot
+  what it has just written in order to check it, or build machinery a plain
+  answer does not need.
+- When a conversation is attached to a doc, the system shall give the agent the
+  doc as it reads at the start of each run, so that a request about the doc
+  does not begin by reading it.
+
+**Contracts:** `agent.conversation.create`, `agent.conversation.message.append`, `agent.conversation.get`
 
 ### PS-AGENT-014 — A conversation is private to the pod
 **Status:** covered
@@ -302,7 +332,10 @@ it happens.
 - When a host is revoked, the system shall stop dispatching work to it
   immediately.
 
-**Contracts:** `agent.host.pairing.create`, `agent.host.pairing.complete`, `agent.host.list`, `agent.host.revoke`, `agent.host.self_revoke`
+**Contracts:** `agent.host.pairing.create`, `agent.host.list`, `agent.host.revoke`
+(the machine's half -- spending the code, and revoking from its own end -- is
+the `pair` and `revoke` frames on the host's link WebSocket, which has no
+OpenAPI operation)
 
 ### PS-AGENT-041 — Work dispatched to a host runs exactly once
 **Status:** covered
@@ -317,7 +350,9 @@ it happens.
   the sandbox root (`~/lemma`) mapped to `~/lemma` on the computer. Existing
   provider sessions shall retain their previous directory across upgrades.
 
-**Contracts:** `agent.host.poll`, `agent.host.events.append`, `agent.host.harnesses.list`
+**Contracts:** `agent.host.harnesses.list` (dispatch itself travels on the
+host's link WebSocket -- `control`, `commands` and `events` frames -- which has
+no OpenAPI operation)
 
 ---
 

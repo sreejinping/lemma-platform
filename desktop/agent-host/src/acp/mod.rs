@@ -23,25 +23,32 @@ use agent_client_protocol::schema::v1::{
 use agent_client_protocol::{AcpAgent, AcpAgentConfig, Agent, ByteStreams, ConnectionTo};
 use async_trait::async_trait;
 use serde_json::{Map, Value};
-use sha2::{Digest, Sha256};
 use tokio::sync::watch;
 
 use crate::adapters::ResolvedAdapter;
 use crate::permissions::{AlwaysAllowOffer, AlwaysAllowScope, PermissionDecision, PermissionGate};
 use crate::protocol::{ConfigOption, EventType, JsonMap, RunSpec, RunState};
 
+mod claude_settings;
 mod driver;
 mod options;
 mod outcome;
 mod permission;
 mod prompt;
+mod session_options;
+mod session_setup;
+mod steering;
 mod supervision;
 
+pub(crate) use claude_settings::{claude_config_dir, claude_sign_in};
 pub use driver::*;
 pub(crate) use options::*;
 pub use outcome::*;
 pub(crate) use permission::*;
 pub use prompt::*;
+pub(crate) use session_options::*;
+pub(crate) use session_setup::*;
+pub use steering::*;
 pub(crate) use supervision::*;
 
 #[cfg(test)]
@@ -52,6 +59,13 @@ pub struct AcpRunRequest {
     pub adapter: ResolvedAdapter,
     pub run_spec: RunSpec,
     pub scratch_directory: PathBuf,
+    /// The Lemma identity this run gives its agent. Resolved by the runtime
+    /// rather than here, because writing the token file needs the Agent Host's
+    /// private directory and the ACP layer has no business knowing that path.
+    pub agent_environment: std::collections::BTreeMap<String, String>,
+    /// Whether the person chose to have this agent load its own skills and
+    /// settings (`HostConfig::own_settings`). See `session_options`.
+    pub own_settings: bool,
     pub mcp_server: Option<McpServer>,
     /// Whether this harness advertised `loadSession` at probe time. A run only
     /// tries to resume `run_spec.resume_session_id` when it did.
@@ -78,6 +92,9 @@ pub struct AcpRunRequest {
     /// How long the agent has to honour `session/cancel` before the run is
     /// failed and the supervisor falls back to killing the process tree.
     pub cancel_grace: Duration,
+    /// Messages Lemma wants added to the turn once it is running. See
+    /// `steering`; an inbox nobody sends on is a run that is never steered.
+    pub steer: SteerInbox,
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +110,8 @@ pub struct AcpRunOutcome {
     /// the user "Agent Host run ended in FAILED" while its partial answer sat
     /// directly above.
     pub message: Option<String>,
+    /// The turn's token usage, as the adapter reported it with its answer.
+    pub usage: Option<Value>,
 }
 
 #[derive(Clone, Debug, serde::Serialize)]
@@ -111,6 +130,9 @@ pub struct AcpProbeOutcome {
     /// and not from reading.
     #[serde(default)]
     pub auth_methods: Value,
+    /// Whether `initialize` advertised `_session/steering`.
+    #[serde(default)]
+    pub steering: bool,
 }
 
 pub trait AcpCallbacks: Send + Sync + 'static {

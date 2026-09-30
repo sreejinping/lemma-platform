@@ -7,12 +7,14 @@ see the exact same tools for a given (agent, conversation).
 
 from __future__ import annotations
 
+from typing import Literal, cast
+
 from pydantic_ai.toolsets import AbstractToolset
 from app.modules.agent.tools.context import ConversationContext
 
 from app.core.infrastructure.db.uow_factory import UnitOfWorkFactory
 from app.modules.agent.domain.entities import Agent, Conversation
-from app.modules.agent.domain.value_objects import AgentToolset
+from app.modules.agent.domain.value_objects import AgentToolset, HarnessKind
 from app.modules.agent.domain.vision import AgentVisionMode
 from app.modules.agent.tools.callable_tool_factory import AgentCallableToolFactory
 from app.modules.agent.tools.toolset_selection import (
@@ -23,6 +25,10 @@ from app.modules.agent.tools.registry import (
     resolve_agent_toolsets,
 )
 from app.modules.agent.services.run_phase_spans import run_phase
+from app.modules.agent.tools.browser.vm_browser import vm_browser_toolset
+from app.modules.agent.tools.workspace_cli.pydantic_adapter import (
+    is_workspace_cli_toolset,
+)
 
 
 async def load_agent_grant_summary(
@@ -41,6 +47,36 @@ async def load_agent_grant_summary(
     )
 
 
+HostExecutionMode = Literal["native", "sandbox"]
+
+
+def notification_toolset() -> AbstractToolset[ConversationContext]:
+    """The tools that answer an open notification or a workflow's form.
+
+    Wrapped the way the capability wraps them: the transitions they call
+    refuse by raising -- answering something already answered, or a form
+    by free text -- and that has to reach the agent as an error it can read,
+    not end its run.
+    """
+    from app.modules.agent.tools.graceful_toolset import GracefulToolset
+    from app.modules.agent.tools.messaging.respond import respond_toolset
+
+    return cast(AbstractToolset[ConversationContext], GracefulToolset(respond_toolset))
+
+
+def _for_host_execution(
+    toolsets: list[AbstractToolset[ConversationContext]],
+    mode: HostExecutionMode,
+) -> list[AbstractToolset[ConversationContext]]:
+    """The toolsets of a run whose commands execute on the user's Mac."""
+    had_shell = any(is_workspace_cli_toolset(toolset) for toolset in toolsets)
+    if mode == "native":
+        toolsets = [t for t in toolsets if not is_workspace_cli_toolset(t)]
+    if had_shell and vm_browser_toolset not in toolsets:
+        toolsets = [*toolsets, vm_browser_toolset]
+    return toolsets
+
+
 class RunToolAssembler:
     """Builds the ordered toolset list for an agent run / tool call."""
 
@@ -55,8 +91,34 @@ class RunToolAssembler:
         include_final_answer: bool = False,
         vision_mode: AgentVisionMode | None = None,
         grants: AgentGrantSummary | None = None,
+        host_execution: HostExecutionMode | None = None,
+        include_notification_tools: bool = False,
+        harness_kind: HarnessKind | None = None,
     ) -> list[AbstractToolset[ConversationContext]]:
         """Every tool this (agent, conversation) can reach.
+
+        ``include_notification_tools`` adds ``respond_to_notification`` and
+        ``submit_workflow_form`` for a run whose harness reaches tools only
+        through this list -- an Agent Host run over MCP. The in-process harness
+        gets them from its open-notifications capability instead, so it leaves
+        this off rather than see them twice. ``harness_kind`` decides it for
+        the runner: any harness but the in-process one is served over MCP.
+
+        ``host_execution`` is set on a run whose commands execute on the
+        user's Mac (docs/architecture/desktop-host-execution.md §7):
+
+        * ``"native"`` -- an Agent Host run. Lemma's command tools are withheld:
+          the coding agent already has a shell and file tools in the same
+          folder on the same Mac, and two tools that do one thing in one place
+          only confuse the model.
+        * ``"sandbox"`` -- an in-process run whose ``exec_command`` runs on the
+          Mac.
+
+        Either way the browser the person watches is still in the VM, and
+        ``agent-browser`` was reached through the shell that is now elsewhere,
+        so an agent that had the workspace CLI gets the ``browser`` tool in its
+        place. Pod, connectors, ``ask_user``, ``display_resource`` and the rest
+        stay.
 
         ``grants`` lets a caller that already loaded the agent's grant summary
         (the runner does, to build its context brief) hand it over instead of
@@ -72,6 +134,12 @@ class RunToolAssembler:
                 vision_mode=vision_mode,
                 grants=grants,
             )
+            if host_execution is not None:
+                toolsets = _for_host_execution(toolsets, host_execution)
+            if harness_kind is not None and harness_kind != HarnessKind.LEMMA:
+                include_notification_tools = True
+            if include_notification_tools and conversation is not None:
+                toolsets = [*toolsets, notification_toolset()]
             span.set_attribute("lemma.toolsets", len(toolsets))
             return toolsets
 

@@ -89,6 +89,12 @@ pub(crate) struct Bindings {
     browser_sdk: PathBuf,
     browser_ui: PathBuf,
     skills: PathBuf,
+    /// The folder whose `bin/lemma` is the CLI of this release, which
+    /// host-execution commands find first on their PATH.
+    lemma_cli: PathBuf,
+    /// The first-party code the backend installs into workspace sandboxes,
+    /// as the hosted image ships it at `/app/runtime-bundle`.
+    runtime_bundle: PathBuf,
     /// `next dev` must not be told it is a production build.
     node_env: &'static str,
     /// Where the backend keeps the key that encrypts stored secrets.
@@ -129,7 +135,7 @@ pub(crate) fn prepare(
         ports,
         source.as_ref(),
         healed,
-        &LocalDomain::from_env(),
+        &LocalDomain::current(),
     )?;
     let destination = paths.root.join("host-pack.json");
     write_private_atomic(&destination, &serde_json::to_vec_pretty(&manifest)?)?;

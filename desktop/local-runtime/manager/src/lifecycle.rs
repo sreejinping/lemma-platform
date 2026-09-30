@@ -21,6 +21,34 @@ pub(crate) fn needs_repair_reason(text: &str) -> Option<String> {
         .filter(|reason| !reason.is_empty())
 }
 
+/// Where a stop spent its time.
+///
+/// `None` for a phase that did not run -- no VM of this process's to stop, or
+/// a platform with no guest at all.
+#[derive(Debug, Default)]
+pub struct StopTimings {
+    /// The guest stopping its containers: the `system.shutdown` round trip.
+    pub guest_services: Option<Duration>,
+    /// What the guest said it stopped, and how long each phase took, or why
+    /// it could not answer. The stop goes on either way.
+    pub guest_report: Option<Result<Value, String>>,
+    /// The VM powering off (macOS) or the distribution being terminated (WSL).
+    pub power_off: Option<Duration>,
+}
+
+/// Whether `child` exited within `budget`, checking every `poll`.
+#[cfg(target_os = "macos")]
+fn wait_for_child_exit(child: &mut Child, budget: Duration, poll: Duration) -> io::Result<bool> {
+    let deadline = Instant::now() + budget;
+    while Instant::now() < deadline {
+        if child.try_wait()?.is_some() {
+            return Ok(true);
+        }
+        thread::sleep(poll);
+    }
+    Ok(false)
+}
+
 impl ManagedRuntime {
     pub fn start(&self) -> io::Result<ManagedRuntimeStatus> {
         self.ensure_capability()?;
@@ -120,54 +148,86 @@ impl ManagedRuntime {
         // would leave the installation permanently unable to start with
         // "managed data disk has an unexpected size".
         remove_if_present(&disk)?;
+        // locald's pre-migration clone of this disk is a copy of the data
+        // being discarded; a reset that kept it would not have erased it.
+        remove_if_present(
+            &self
+                .config
+                .local_root
+                .join("runtime/macos/data.raw.before-migration"),
+        )?;
+        remove_if_present(&self.data_disk_never_mounted)?;
         remove_if_present(&self.control_socket)?;
         Ok(reclaimed)
     }
 
     pub fn stop(&self) -> io::Result<()> {
+        self.stop_timed().map(|_| ())
+    }
+
+    /// `stop`, saying where the time went.
+    ///
+    /// A stop is two waits on two different things -- the guest stopping its
+    /// containers, then the VM powering off -- and a quit that took seventeen
+    /// seconds could not say which of them it had spent them on.
+    pub fn stop_timed(&self) -> io::Result<StopTimings> {
+        // Only the platforms with a guest record anything into it.
+        #[cfg_attr(not(any(target_os = "macos", windows)), allow(unused_mut))]
+        let mut timings = StopTimings::default();
         #[cfg(target_os = "macos")]
         {
             if let Some(mut child) = self.vm.lock().expect("VM lock poisoned").take() {
-                let _ = self.request("system.shutdown", json!({}));
-                let deadline = Instant::now() + Duration::from_secs(20);
-                while Instant::now() < deadline {
-                    if child.try_wait()?.is_some() {
-                        remove_if_present(&self.vm_process_marker)?;
-                        return Ok(());
-                    }
-                    thread::sleep(Duration::from_millis(100));
-                }
-                let result = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
-                if result != 0 {
-                    return Err(io::Error::last_os_error());
-                }
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while Instant::now() < deadline {
-                    if child.try_wait()?.is_some() {
-                        remove_if_present(&self.vm_process_marker)?;
-                        return Ok(());
-                    }
-                    thread::sleep(Duration::from_millis(100));
-                }
-                child.kill()?;
-                child.wait()?;
-                remove_if_present(&self.vm_process_marker)?;
-            } else {
-                self.reclaim_owned_macos_vm()?;
+                let started = Instant::now();
+                timings.guest_report = Some(
+                    self.request("system.shutdown", json!({}))
+                        .map_err(|error| error.to_string()),
+                );
+                timings.guest_services = Some(started.elapsed());
+                let started = Instant::now();
+                let result = self.await_vm_exit(&mut child);
+                timings.power_off = Some(started.elapsed());
+                return result.map(|()| timings);
             }
+            self.reclaim_owned_macos_vm()?;
         }
         #[cfg(windows)]
         {
             // WSL's private distribution is terminated by the host rather
             // than systemd poweroff. Ask the guest to stop every managed
             // container first so databases and sandboxes flush cleanly.
-            let _ = self.request("system.shutdown", json!({}));
+            let started = Instant::now();
+            timings.guest_report = Some(
+                self.request("system.shutdown", json!({}))
+                    .map_err(|error| error.to_string()),
+            );
+            timings.guest_services = Some(started.elapsed());
             // Through the shared runner rather than its own `.output()`. This
             // was a second unbounded wait, on the path where a hang is most
             // visible to a person: they are watching a window refuse to close.
+            let started = Instant::now();
             self.wsl(&["--terminate", self.wsl_distribution()], None)?;
+            timings.power_off = Some(started.elapsed());
         }
-        Ok(())
+        Ok(timings)
+    }
+
+    /// Wait for a VM that has been asked to power off, then make sure it has.
+    #[cfg(target_os = "macos")]
+    fn await_vm_exit(&self, child: &mut Child) -> io::Result<()> {
+        // Polled finely: the guest has already stopped its services by the
+        // time this runs, and powering off is a second or two of systemd.
+        if wait_for_child_exit(child, Duration::from_secs(20), Duration::from_millis(20))? {
+            return remove_if_present(&self.vm_process_marker);
+        }
+        let result = unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+        if result != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if !wait_for_child_exit(child, Duration::from_secs(5), Duration::from_millis(100))? {
+            child.kill()?;
+            child.wait()?;
+        }
+        remove_if_present(&self.vm_process_marker)
     }
 
     pub fn capability_file(&self) -> &Path {
@@ -176,6 +236,26 @@ impl ManagedRuntime {
 
     pub fn control_socket(&self) -> &Path {
         &self.control_socket
+    }
+
+    /// The unix socket `lemma-vz` bridges to the guest's sandbox tunnel.
+    ///
+    /// The backend reaches sandbox ports through it rather than over the
+    /// guest's network address; see `sandbox_tunnel` in lemma-guestd.
+    #[cfg(target_os = "macos")]
+    pub fn sandbox_tunnel_socket(&self) -> PathBuf {
+        self.service_socket(SANDBOX_TUNNEL_PORT)
+    }
+
+    /// The unix socket locald's loopback relay listens on, and `lemma-vz`
+    /// connects to for every guest request to reach a port on this Mac.
+    ///
+    /// The other way round from `service_socket`: those are the VM helper's
+    /// listeners into the guest; this is locald's, out of it. See
+    /// `host_loopback` in lemma-guestd and `loopback_relay` in locald.
+    #[cfg(target_os = "macos")]
+    pub fn host_loopback_socket(&self) -> PathBuf {
+        self.config.local_root.join("run/host-loopback.sock")
     }
 
     #[cfg(target_os = "macos")]
@@ -259,7 +339,13 @@ impl ManagedRuntime {
                 )));
             }
             match self.health() {
-                Ok(status) => return Ok(status),
+                Ok(status) => {
+                    // Health requires the data disk mounted, so this boot got
+                    // past `mkfs` -- the disk is no longer a new one.
+                    #[cfg(target_os = "macos")]
+                    remove_if_present(&self.data_disk_never_mounted)?;
+                    return Ok(status);
+                }
                 Err(error) => last_error = Some(error),
             }
             thread::sleep(Duration::from_millis(250));

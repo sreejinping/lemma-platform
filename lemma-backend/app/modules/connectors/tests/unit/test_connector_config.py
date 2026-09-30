@@ -66,6 +66,12 @@ EXPECTED = [
         64 * 1024 * 1024,
         4096,
     ),
+    (
+        "connector_file_input_max_bytes",
+        "CONNECTOR_FILE_INPUT_MAX_BYTES",
+        25 * 1024 * 1024,
+        4096,
+    ),
     ("connector_encryption_key", "CONNECTOR_ENCRYPTION_KEY", None, "sentinel"),
     ("connector_breaker_enabled", "CONNECTOR_BREAKER_ENABLED", True, False),
     (
@@ -151,3 +157,21 @@ def test_connector_settings_reads_legacy_env_var(
     if isinstance(value, SecretStr):
         value = value.get_secret_value()
     assert value == override
+
+
+@pytest.mark.parametrize(
+    "field,env",
+    [
+        ("composio_api_key", "COMPOSIO_API_KEY"),
+        ("composio_webhook_secret", "COMPOSIO_WEBHOOK_SECRET"),
+        ("connector_encryption_key", "CONNECTOR_ENCRYPTION_KEY"),
+    ],
+)
+def test_connector_secrets_never_print(monkeypatch, field, env):
+    _clear(monkeypatch)
+    monkeypatch.setenv(env, "do-not-print-me")
+
+    loaded = ConnectorSettings()
+
+    assert isinstance(getattr(loaded, field), SecretStr)
+    assert "do-not-print-me" not in repr(loaded)

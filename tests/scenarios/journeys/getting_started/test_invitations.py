@@ -4,9 +4,13 @@ from __future__ import annotations
 
 import pytest
 
-from harness import capability, covers, journey, proves, scenario
+from harness import capability, covers, journey, open_signup, proves, scenario
 
-pytestmark = [journey("Getting started"), capability("Bring a team in")]
+pytestmark = [
+    journey("Getting started"),
+    capability("Bring a team in"),
+    open_signup,
+]
 
 
 @pytest.fixture
@@ -26,6 +30,23 @@ async def test_an_invited_person_joins_with_the_offered_role(world, owner):
     await bob.accepts(invitation)
 
     assert await bob.own_role_in(owner.organization) == "ORG_EDITOR"
+
+
+@scenario("An editor invites up to their own level, and no further")
+@proves("PS-ONB-020")
+@covers("org.invitation.invite", "org.invitation.accept")
+async def test_an_editor_invites_up_to_their_own_level(world, owner):
+    dan = await world.new_person("dan")
+    await dan.accepts(
+        await owner.invites(dan, to=owner.organization, as_role="ORG_EDITOR")
+    )
+    bob = await world.new_person("bob")
+    carol = await world.new_person("carol")
+
+    await bob.accepts(await dan.invites(bob, to=owner.organization, as_role="ORG_EDITOR"))
+    assert await bob.own_role_in(owner.organization) == "ORG_EDITOR"
+
+    await dan.is_refused_inviting(carol, to=owner.organization, as_role="ORG_OWNER")
 
 
 @scenario("An invitation is only usable by the person it was addressed to")
@@ -63,16 +84,33 @@ async def test_an_invitation_is_single_use(world, owner):
     await bob.is_refused_invitation(invitation)
 
 
-@scenario("A person sees the invitations waiting for them")
+@scenario(
+    "Somebody who has not proved their address finds an invitation by its link, "
+    "not by asking for their invitations"
+)
 @proves("PS-ONB-024")
-@covers("org.invitation.list_mine")
-async def test_a_person_sees_their_invitations(world, owner):
+@covers("org.invitation.list_mine", "org.invitation.accept")
+async def test_an_unproven_address_is_not_shown_its_invitations(world, owner):
+    # This stack signs people up without proving their address — as a desktop
+    # install shared with verification off does. There, listing invitations by
+    # address alone would hand an invitation to whoever signed up as that
+    # address first, so the product lists none and the invitation link is the
+    # way in. This scenario used to assert the opposite and failed every night
+    # from the day that was fixed, while the product was right.
     bob = await world.new_person("bob")
     invitation = await owner.invites(bob, to=owner.organization)
 
     waiting = await bob.invitations()
+    assert waiting == [], (
+        f"an address nobody has proved was shown invitations sent to it: {waiting}"
+    )
 
-    assert any(str(i["id"]) == str(invitation["id"]) for i in waiting), waiting
+    # And the link still works: holding the invitation is what proves it was
+    # meant for them.
+    await bob.accepts(invitation)
+    assert str(owner.organization["id"]) in {
+        str(organization["id"]) for organization in await bob.organizations()
+    }
 
 
 @scenario("Only an owner can change what the organization is")

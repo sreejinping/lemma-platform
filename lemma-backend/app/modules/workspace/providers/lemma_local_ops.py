@@ -7,8 +7,10 @@ reason the Desktop provider is small: only lifecycle is genuinely different.
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import AsyncIterable, AsyncIterator
 from datetime import datetime
+from urllib.parse import urlsplit
 
 from sandbox_runtime.protocol import (
     ByteRange,
@@ -22,23 +24,166 @@ from sandbox_runtime.protocol import (
     TerminalSize,
 )
 
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
+from app.modules.workspace.providers.desktop_tunnel import remember_guest_address
+from app.modules.workspace.providers.profiles import FUNCTION_RUNTIME_PORT
 from app.modules.workspace.providers.base import (
     ProcessDescriptor,
     ProviderCapability,
+    ProviderGone,
     ProviderInstance,
     ProviderRejected,
     SandboxEndpoint,
 )
+from app.modules.workspace.providers.lemma_local_config import (
+    LemmaLocalProviderConfig,
+    LocalBridgeError,
+)
+from app.modules.workspace.providers.runtime_client import (
+    RuntimeState,
+    WorkspaceRuntimeClient,
+)
+from app.modules.workspace.providers.runtime_errors import WorkspaceRuntimeError
+
+
+if TYPE_CHECKING:
+    from app.modules.workspace.providers.docker import RuntimeCredentialSigner
 
 
 class LemmaLocalOpsMixin:
     """The `SandboxOpsProvider` half of the Desktop provider."""
 
+    # Set by the provider's constructor; the credential derivation and the
+    # runtime reach below read them.
+    _config: LemmaLocalProviderConfig
+    _runtime_credentials: RuntimeCredentialSigner
+
     capabilities = frozenset(
         {ProviderCapability.PORT_REACH, ProviderCapability.SECRET_DELIVERY}
     )
+
+    # ------------------------------------------------------------------
+    # Reaching the sandbox's runtime
+    # ------------------------------------------------------------------
+
+    def function_runtime_env(self, guest_id: str) -> dict[str, str]:
+        """What a function sandbox's runtime is started with to guard itself.
+
+        Its credential, which it then requires on every call but the readiness
+        probe -- every sandbox in the guest shares one bridge, and the runtime
+        runs whatever artifact it is sent -- and the one gateway it may fetch
+        artifacts from and report to: the backend's callback address, which is
+        also what the function dispatcher names. `reach_port` hands the
+        credential to the caller the lease goes to.
+        """
+        env = {
+            "LEMMA_FUNCTION_RUNTIME_TOKEN": self._runtime_credentials.token(guest_id)
+        }
+        gateway = (
+            urlsplit(self._config.callback_url).hostname
+            if self._config.callback_url
+            else None
+        )
+        if gateway:
+            env["LEMMA_FUNCTION_GATEWAY_HOSTS"] = gateway
+        return env
+
+    async def _try_quiesce(
+        self, instance: ProviderInstance, *, deadline_at: datetime
+    ) -> None:
+        """Best effort, never a reason not to release: a workspace whose
+        runtime cannot be reached is the one most in need of stopping."""
+        client: WorkspaceRuntimeClient | None = None
+        try:
+            client = await self._runtime_client(
+                instance.provider_id, deadline_at=deadline_at
+            )
+            await client.quiesce(deadline_at=deadline_at)
+        except (
+            WorkspaceRuntimeError,
+            LocalBridgeError,
+            ProviderGone,
+            asyncio.TimeoutError,
+        ):
+            return
+        finally:
+            if client is not None:
+                await client.close()
+
+    def _ops(self, instance: ProviderInstance, deadline_at: datetime):
+        from contextlib import asynccontextmanager
+
+        from sandbox_runtime.errors import (
+            SandboxPathConflict,
+            SandboxPathNotFound,
+            SandboxProcessNotFound,
+            SandboxRejected,
+            SandboxUnauthorized,
+            SandboxUnavailable,
+        )
+        from app.modules.workspace.providers.runtime_errors import (
+            WorkspaceRuntimeFileConflict,
+            WorkspaceRuntimeFileNotFound,
+            WorkspaceRuntimeFileRejected,
+            WorkspaceRuntimeProcessGone,
+            WorkspaceRuntimeUnauthorized,
+        )
+
+        @asynccontextmanager
+        async def scope():
+            client: WorkspaceRuntimeClient | None = None
+            try:
+                client = await self._runtime_client(
+                    instance.provider_id, deadline_at=deadline_at
+                )
+                yield client
+            except WorkspaceRuntimeFileNotFound as exc:
+                raise SandboxPathNotFound(str(exc)) from exc
+            except WorkspaceRuntimeFileConflict as exc:
+                raise SandboxPathConflict(str(exc)) from exc
+            except WorkspaceRuntimeFileRejected as exc:
+                # 413, 422 and 507: too big, not a path this runtime will take,
+                # no room. Docker has mapped these to a refusal since they
+                # existed and this did not, so on Desktop alone they fell
+                # through to `SandboxUnavailable` below -- which
+                # `with_backpressure` retries until the deadline. A file that
+                # is too large, or a guest whose disk is full, became a retry
+                # loop on the machine's single vsock control channel instead of
+                # one sentence saying what was wrong.
+                raise SandboxRejected(str(exc)) from exc
+            except WorkspaceRuntimeProcessGone as exc:
+                # Definitive, and about the process rather than the sandbox.
+                # `ProviderGone` would make the client forget its handle to a
+                # workspace that is fine; `SandboxUnavailable` would retry a
+                # process that will never exist until the deadline.
+                raise SandboxProcessNotFound(str(exc)) from exc
+            except WorkspaceRuntimeUnauthorized as exc:
+                # Definitive: this credential will not become valid by waiting.
+                raise SandboxUnauthorized(str(exc)) from exc
+            except ProviderGone:
+                raise
+            except asyncio.TimeoutError as exc:
+                # The bridge stopped answering within the deadline. Retryable,
+                # but it has to arrive as a sandbox error with a sentence in it:
+                # uncaught, it left this scope as a bare `TimeoutError` and
+                # every caller rendered it as `500 INTERNAL_ERROR` with a null
+                # message, which is what a five-minute file listing looked like.
+                self._forget_runtime_url(instance.provider_id)
+                raise SandboxUnavailable(
+                    "managed runtime did not answer before the deadline"
+                ) from exc
+            except (WorkspaceRuntimeError, LocalBridgeError) as exc:
+                # Anything that failed at the transport may mean the sandbox
+                # moved. Cheaper to ask the guest again next time than to keep
+                # dialling an address that has stopped answering.
+                self._forget_runtime_url(instance.provider_id)
+                raise SandboxUnavailable(str(exc)) from exc
+            finally:
+                if client is not None:
+                    await client.close()
+
+        return scope()
 
     # ------------------------------------------------------------------
     # Operations, over the same runtime protocol Docker uses
@@ -106,6 +251,12 @@ class LemmaLocalOpsMixin:
             await client.terminate(
                 process_id, grace_seconds=grace_seconds, deadline_at=deadline_at
             )
+
+    async def runtime_state(
+        self, instance: ProviderInstance, *, deadline_at: datetime
+    ) -> RuntimeState:
+        async with self._ops(instance, deadline_at) as client:
+            return await client.runtime_state(deadline_at=deadline_at)
 
     async def list_processes(
         self, instance: ProviderInstance, *, deadline_at: datetime
@@ -190,8 +341,9 @@ class LemmaLocalOpsMixin:
         deadline_at: datetime,
     ) -> bool:
         async with self._ops(instance, deadline_at) as client:
-            await client.delete_file(path, recursive=recursive, deadline_at=deadline_at)
-            return True
+            return await client.delete_file(
+                path, recursive=recursive, deadline_at=deadline_at
+            )
 
     async def ensure_python_session(
         self, instance: ProviderInstance, request: CreatePythonSessionRequest
@@ -221,8 +373,13 @@ class LemmaLocalOpsMixin:
 
         The guest publishes only the ports declared as apps when the sandbox was
         created, so a port nobody declared is refused here rather than dialled
-        and timed out. The address is loopback inside the user's own machine:
-        no header opens it and nothing else can reach it.
+        and timed out.
+
+        A function sandbox's runtime also wants its credential. Every sandbox
+        in the guest shares one bridge, and the runtime executes what it is
+        sent, so it takes calls only with the per-sandbox token delivered to it
+        at create (`function_runtime_env`) -- and this is how the caller the
+        lease is handed to gets it.
         """
         snapshot = await self._status(instance.provider_id, deadline_at=deadline_at)
         apps = _status_object(snapshot).get("apps")
@@ -232,7 +389,17 @@ class LemmaLocalOpsMixin:
             if isinstance(value, dict) and value.get("port") == port:
                 url = value.get("private_url")
                 if isinstance(url, str) and url:
-                    return SandboxEndpoint(url=url)
+                    headers = (
+                        {
+                            "X-Lemma-Runtime-Token": self._runtime_credentials.token(
+                                instance.provider_id
+                            )
+                        }
+                        if port == FUNCTION_RUNTIME_PORT
+                        and instance.provider_id.startswith("f-")
+                        else {}
+                    )
+                    return SandboxEndpoint(url=url, headers=headers)
         raise ProviderRejected(f"managed runtime does not expose sandbox port {port}")
 
     async def deliver_secret(
@@ -244,16 +411,24 @@ class LemmaLocalOpsMixin:
         deadline_at: datetime,
     ) -> None:
         """Write it through the guest runtime, which is the same protocol Docker uses."""
+        _, _, name = path.rpartition("/")
+        if not name:
+            raise ProviderRejected(f"{path!r} does not name a file")
 
         async def _one_chunk() -> AsyncIterator[bytes]:
             yield value
 
         async with self._ops(instance, deadline_at) as client:
+            # 0600, like Docker's tar entry and E2B's chmod. Delivered through
+            # the ordinary file API, this took the runtime's umask and landed
+            # 0644 -- so on Desktop alone the browser relay token was readable
+            # by every process in the sandbox, and on no other fabric was it.
             await client.write_file(
                 path,
                 _one_chunk(),
                 expected_sha256=None,
                 deadline_at=deadline_at,
+                mode=0o600,
             )
 
 
@@ -261,4 +436,12 @@ def _status_object(snapshot: dict[str, Any]) -> dict[str, Any]:
     status = snapshot.get("status")
     if not isinstance(status, dict):
         raise ProviderRejected("managed runtime status is invalid")
+    # Every address the guest reports for a sandbox is one it can tunnel to,
+    # and this is where every such address passes through.
+    remember_guest_address(status.get("runtime_url"))
+    apps = status.get("apps")
+    if isinstance(apps, dict):
+        for app in apps.values():
+            if isinstance(app, dict):
+                remember_guest_address(app.get("private_url"))
     return status

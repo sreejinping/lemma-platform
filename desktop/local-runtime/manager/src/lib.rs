@@ -19,6 +19,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 mod clock;
 mod diagnostics;
 mod guest_image;
+#[cfg(target_os = "macos")]
+mod host_disk;
 #[cfg(any(target_os = "macos", test))]
 mod kernel_health;
 mod lifecycle;
@@ -28,6 +30,8 @@ mod request;
 mod windows;
 mod windows_data;
 mod wsl_command;
+
+pub use lifecycle::StopTimings;
 
 pub(crate) use diagnostics::*;
 pub(crate) use guest_image::*;
@@ -81,6 +85,10 @@ impl NoConsoleWindow for Command {
 /// overwriting the other's, one install's stop terminating the other's runtime,
 /// and the second install's pods running against the first install's data disk.
 pub const DEFAULT_WSL_DISTRIBUTION: &str = "LemmaRuntime";
+
+/// guestd's sandbox tunnel vsock port, bridged by `lemma-vz` like the core
+/// services. Must equal `lemma_guestd::TUNNEL_VSOCK_PORT`.
+pub const SANDBOX_TUNNEL_PORT: u16 = 42_412;
 /// The phrase that turns a runtime failure into an offer to reset local data.
 ///
 /// Duplicated from `lemma_locald::paths::DATA_RESET_MARKER` and pinned by a
@@ -163,6 +171,11 @@ pub struct ManagedRuntime {
     /// filesystem is a new disk to format or user data it must not touch.
     #[cfg(target_os = "macos")]
     data_disk_fresh_marker: PathBuf,
+    /// Present from before the data disk is created until a boot first reaches
+    /// health; see `host_disk::prepare_data_disk`. Beside `data.raw` rather
+    /// than under `run/`, because it describes the disk, not one boot.
+    #[cfg(target_os = "macos")]
+    data_disk_never_mounted: PathBuf,
     #[cfg(target_os = "macos")]
     vm: Mutex<Option<Child>>,
 }
@@ -180,6 +193,10 @@ impl ManagedRuntime {
             vm_process_marker: run_root.join("vz-process.json"),
             #[cfg(target_os = "macos")]
             data_disk_fresh_marker: run_root.join("data-disk-fresh"),
+            #[cfg(target_os = "macos")]
+            data_disk_never_mounted: config
+                .local_root
+                .join("runtime/macos/data-disk-never-mounted"),
             control_socket: config.local_root.join("run/guest.sock"),
             config,
             #[cfg(target_os = "macos")]

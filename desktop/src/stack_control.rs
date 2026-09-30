@@ -27,7 +27,12 @@ pub(crate) fn stop_impl(app: AppHandle, include_infra: Option<bool>) -> Result<(
     }
     // Stop never installs a runtime or starts a replacement daemon. In
     // particular, quitting a damaged installation must not start a download.
-    if app.state::<Shell>().locald_writer.lock().unwrap().is_none() {
+    if app
+        .state::<Shell>()
+        .locald_writer
+        .lock_or_recover()
+        .is_none()
+    {
         let connection = connect_locald()?;
         install_locald_connection(&app, connection);
     }
@@ -121,7 +126,11 @@ pub(crate) async fn open_app(app: AppHandle) -> Result<(), String> {
 }
 
 #[tauri::command(async)]
-pub(crate) fn open_logs(window: Webview) -> Result<(), String> {
-    require_local_native_window(&window)?;
+pub(crate) fn open_logs(window: Webview, app: AppHandle) -> Result<(), String> {
+    // The splash and Local settings, which reach it when nothing else works,
+    // and This Mac's Overview, which is where it is looked for otherwise.
+    if require_local_native_window(&window).is_err() {
+        require_local_settings_caller(&window, &app)?;
+    }
     open_logs_impl()
 }

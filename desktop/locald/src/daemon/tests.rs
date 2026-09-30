@@ -149,6 +149,21 @@ fn an_interrupted_update_is_reported_when_the_daemon_next_starts() {
         healed.contains("0.8.0"),
         "the interrupted update must reach the operator: {healed}"
     );
+
+    // And reaches the screens, not only the log: the shell reads it from the
+    // handshake. (`control.snapshot` carries the same field, but building one
+    // here needs the OS credential store.)
+    let hello = daemon.hello_event();
+    let warning = &hello["warnings"][0];
+    assert_eq!(warning["code"], "update-interrupted", "{hello}");
+    assert_eq!(warning["version"], "0.8.0");
+    assert!(
+        warning["message"]
+            .as_str()
+            .unwrap()
+            .contains("don't reopen"),
+        "{warning}"
+    );
 }
 
 /// And an ordinary install says nothing, so the report means something when
@@ -161,6 +176,7 @@ fn an_installation_with_no_update_history_starts_quietly() {
         "a healthy install must not mention updates: {:?}",
         daemon.healed
     );
+    assert_eq!(daemon.hello_event()["warnings"], json!([]));
 }
 
 /// A client that holds its socket open and stops reading must not be
@@ -224,6 +240,7 @@ fn operator_updates_preserve_private_runtime_endpoints() {
                 "http://192.168.64.37:3567".into(),
             ),
         ])),
+        std::path::Path::new("/runtime/agent-host/config.json"),
     );
 
     assert_eq!(environment["LEMMA_OPENAI_API_KEY"], "vault-secret");
@@ -235,6 +252,11 @@ fn operator_updates_preserve_private_runtime_endpoints() {
     assert_eq!(
         environment["SUPERTOKENS_CORE_URL"],
         "http://192.168.64.37:3567"
+    );
+    // The loopback relay's grant keys off this Mac's own Agent Host.
+    assert_eq!(
+        environment["DESKTOP_AGENT_HOST_CONFIG_PATH"],
+        "/runtime/agent-host/config.json"
     );
 }
 
@@ -304,7 +326,12 @@ fn erasing_local_data_refuses_anything_but_its_exact_confirmation() {
 fn sharing_commands_refuse_before_they_take_the_lock_a_start_needs() {
     let (_root, daemon) = daemon();
 
-    for command in ["sharing.preflight", "sharing.enable", "sharing.disable"] {
+    for command in [
+        "sharing.preflight",
+        "sharing.enable",
+        "sharing.disable",
+        "sharing.access",
+    ] {
         let replies = exchange(
             &daemon,
             json!({"cmd": command, "id": command, "payload": {}}),
@@ -433,8 +460,8 @@ fn the_supervisor_is_spawned_into_its_own_group_and_stopped_as_a_tree() {
          signal but the leader:\n{spawn}"
     );
 
-    let stack_source = include_str!("stack_ops.rs").replace("\r\n", "\n");
-    let stop = function_body(&stack_source, "fn start_daemon_shutdown(");
+    let stack_source = include_str!("shutdown.rs").replace("\r\n", "\n");
+    let stop = function_body(&stack_source, "fn stop_supervisor(");
     assert!(
         stop.contains("terminate_process_tree(&mut supervisor.child)"),
         "stopping the supervisor has to take the tree with it:\n{stop}"
@@ -443,4 +470,103 @@ fn the_supervisor_is_spawned_into_its_own_group_and_stopped_as_a_tree() {
         !stop.contains("supervisor.child.kill()"),
         "killing the leader is what orphaned uv's children:\n{stop}"
     );
+}
+
+/// Everything the daemon broadcasts from here on, as it is broadcast.
+fn listen(daemon: &std::sync::Arc<Daemon>) -> mpsc::Receiver<String> {
+    let (sender, receiver) = mpsc::sync_channel::<String>(SUBSCRIBER_BACKLOG);
+    daemon.subscribers.lock().unwrap().insert(u64::MAX, sender);
+    receiver
+}
+
+fn events_of(receiver: &mpsc::Receiver<String>) -> Vec<Value> {
+    receiver
+        .try_iter()
+        .map(|line| serde_json::from_str(&line).unwrap())
+        .collect()
+}
+
+/// A quit with nothing running is quick, and says what each step took.
+///
+/// Every quit used to announce "Waiting for the current operation to reach a
+/// safe stopping point" and then spend seventeen seconds with nothing in the
+/// log to say where. The wait is announced only when there is an operation to
+/// wait for, and every step reports its own duration.
+#[test]
+fn an_idle_stop_is_quick_and_times_every_step() {
+    let (_root, daemon) = daemon();
+    let events = listen(&daemon);
+    let started = std::time::Instant::now();
+
+    let outcomes = daemon.stop_everything(Some(&json!("quit-1")), false);
+
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "{outcomes:?}"
+    );
+    let events = events_of(&events);
+    assert!(
+        !events.iter().any(|event| event["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("safe stopping point")),
+        "nothing was in flight, so nothing was waited for: {events:?}"
+    );
+    let steps: Vec<&Value> = events
+        .iter()
+        .filter(|event| event["event"] == "shutdown.step")
+        .collect();
+    assert_eq!(
+        steps
+            .iter()
+            .map(|event| event["step"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        ["operations", "agent-host"],
+        "this daemon has no stack, so only these run"
+    );
+    for step in &steps {
+        assert!(step["duration_ms"].is_u64(), "{step}");
+        assert_eq!(step["ok"], true);
+        assert_eq!(step["operation_id"], "quit-1");
+    }
+    let stopped = events.last().expect("the stop ends with its state");
+    assert_eq!(
+        (&stopped["event"], &stopped["status"]),
+        (&json!("state"), &json!("stopped"))
+    );
+    assert!(stopped["duration_ms"].is_u64());
+}
+
+/// A stop behind a running operation waits for it, and says that is why.
+#[test]
+fn a_stop_behind_an_operation_waits_for_it_and_says_so() {
+    let (_root, daemon) = daemon();
+    let events = listen(&daemon);
+    daemon.lifecycle.begin().unwrap();
+    let stopping = std::sync::Arc::clone(&daemon);
+    let (finished, stopped) = mpsc::channel();
+    let worker = std::thread::spawn(move || {
+        let _ = finished.send(stopping.stop_everything(Some(&json!("quit-2")), true));
+    });
+
+    assert!(
+        stopped
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_err(),
+        "the stop must not overtake the operation"
+    );
+    daemon.lifecycle.finish();
+    let outcomes = stopped
+        .recv_timeout(std::time::Duration::from_secs(5))
+        .unwrap();
+    worker.join().unwrap();
+
+    // Most of the 200ms the operation held on for; the stop's thread started a
+    // moment after the clock above did.
+    assert_eq!(outcomes[0].step, "operations");
+    assert!(outcomes[0].duration.as_millis() >= 100, "{outcomes:?}");
+    assert!(events_of(&events).iter().any(|event| event["detail"]
+        .as_str()
+        .unwrap_or("")
+        .contains("safe stopping point")));
 }

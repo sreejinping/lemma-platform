@@ -25,13 +25,35 @@ pub(crate) enum Command {
         #[arg(long)]
         url: Url,
         // URL-safe random codes can begin with a hyphen.
-        #[arg(long, allow_hyphen_values = true)]
-        pairing_code: String,
+        #[arg(
+            long,
+            allow_hyphen_values = true,
+            required_unless_present = "pairing_code_stdin"
+        )]
+        pairing_code: Option<String>,
+        /// Read the pairing code from the first line of stdin instead, so it
+        /// is not in the process list for anyone on this computer to read.
+        #[arg(long, conflicts_with = "pairing_code")]
+        pairing_code_stdin: bool,
         #[arg(long, default_value = "My computer")]
         name: String,
         /// Permit plain HTTP only when the URL is loopback.
         #[arg(long)]
         allow_insecure_http: bool,
+        /// Pair even though this computer was removed from the account --
+        /// only when the person asked for exactly that.
+        #[arg(long)]
+        reenable: bool,
+    },
+    /// Who is signed in to Lemma in the app, for the pairings to `url`: those
+    /// of anyone else take no new work until their person signs in again.
+    #[command(hide = true)]
+    Session {
+        #[arg(long)]
+        url: Url,
+        /// The signed-in person's user id; absent when nobody is signed in.
+        #[arg(long)]
+        user: Option<uuid::Uuid>,
     },
     /// Show service, target connectivity, and durable queue state.
     #[command(alias = "list")]
@@ -103,6 +125,27 @@ pub(crate) enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Turn running Lemma agents' commands on this computer on or off.
+    HostExecution {
+        #[command(subcommand)]
+        action: HostExecutionAction,
+    },
+    /// Whether a coding agent on this computer loads its own skills and
+    /// settings (its instructions files, skills, plugins, hooks and MCP
+    /// servers) as well as Lemma's. Off unless turned on, per agent.
+    OwnSettings {
+        #[command(subcommand)]
+        action: OwnSettingsAction,
+    },
+    /// Internal: host execution's worker, speaking JSON lines on stdio. The
+    /// Agent Host starts one per open workspace under `sandbox-exec`; run by
+    /// hand only to debug it (see the README).
+    #[command(hide = true)]
+    ExecServer {
+        /// Default workspace roots go under `<root-base>/c/<date>/<slug>`.
+        #[arg(long)]
+        root_base: PathBuf,
+    },
     /// Internal run-scoped stdio MCP bridge used by ACP adapters.
     #[command(hide = true)]
     McpBridge {
@@ -111,4 +154,28 @@ pub(crate) enum Command {
         #[arg(long)]
         run_id: Uuid,
     },
+}
+
+#[derive(Subcommand)]
+pub(crate) enum HostExecutionAction {
+    /// Let the owner's Lemma agents run commands here, under Seatbelt.
+    Enable,
+    /// Stop them, and stop every command they are running.
+    Disable,
+    /// Show the setting and whether this computer supports it.
+    Status {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Take a fresh snapshot of the login shell's environment, for when the
+    /// owner has changed their shell profile.
+    RefreshEnvironment,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum OwnSettingsAction {
+    /// Let this agent load the person's own skills and settings.
+    Enable { harness: String },
+    /// Start this agent with only Lemma's (the default).
+    Disable { harness: String },
 }

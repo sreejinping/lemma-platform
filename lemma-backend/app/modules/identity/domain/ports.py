@@ -103,6 +103,13 @@ class OrganizationRepositoryPort(Protocol):
 
     async def count_members(self, organization_id: UUID) -> int: ...
 
+    #: Held until the transaction ends, before who is in the organization
+    #: changes, so a plan's member cap is counted one change at a time.
+    async def lock_seats(self, organization_id: UUID) -> None: ...
+
+    #: Refuses when the person owns as many organizations as their plan allows.
+    async def refuse_if_at_organization_limit(self, user_id: UUID) -> None: ...
+
     async def count_members_with_role_for_update(
         self, organization_id: UUID, role: OrganizationRole
     ) -> int: ...
@@ -202,6 +209,19 @@ class PodMembershipPort(Protocol):
     async def get_pod_invitation_details(
         self, pod_id: UUID
     ) -> Optional[tuple[str, str | None, UUID]]: ...
+
+    async def is_pod_member(self, *, pod_id: UUID, user_id: UUID) -> bool: ...
+
+    async def refuse_pod_role_beyond_inviter(
+        self,
+        *,
+        pod_id: UUID,
+        inviter_user_id: UUID,
+        inviter_is_org_owner: bool,
+        pod_role: str,
+    ) -> None:
+        """Raise unless the inviter may put someone in this pod with this role."""
+        ...
 
     async def add_member_to_pod(
         self,

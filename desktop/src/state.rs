@@ -1,5 +1,38 @@
 use super::*;
 
+/// Take a lock without letting one panic take the whole app down with it.
+///
+/// A poisoned mutex means some thread panicked while holding it. With
+/// `lock().unwrap()` -- the shell's idiom at fifty-one sites -- every later
+/// lock of the same mutex panics too, so one fault on a background thread
+/// became a crash on the next menu refresh, tray update or quit. Everything
+/// behind these locks is display state or a `Mutex<()>` used for exclusion;
+/// continuing with the last value written is always better than closing the
+/// window on the user. The agent-host has recovered this way throughout.
+pub(crate) trait LockOrRecover<T> {
+    fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockOrRecover<T> for std::sync::Mutex<T> {
+    fn lock_or_recover(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+}
+
+/// One of locald's startup warnings, as far as the shell trusts it.
+///
+/// Narrowed field by field (`daemon_warnings`) rather than forwarded as JSON:
+/// it reaches the splash and a web page, and the daemon is free to add fields
+/// neither should see.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct DaemonWarning {
+    pub(crate) code: String,
+    pub(crate) message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) version: Option<String>,
+}
+
 #[derive(Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct UiState {
@@ -26,6 +59,13 @@ pub(crate) struct UiState {
     /// `failed`.
     pub(crate) sandbox_images: String,
     pub(crate) sandbox_images_detail: String,
+    /// How far that download has got, when the guest can measure it.
+    pub(crate) sandbox_images_done_mb: Option<u64>,
+    pub(crate) sandbox_images_total_mb: Option<u64>,
+    /// What the daemon's start found that someone has to act on -- an update
+    /// that stopped mid-migration, settings writes switched off. From the
+    /// handshake, so the splash can say it before anything else loads.
+    pub(crate) warnings: Vec<DaemonWarning>,
     #[serde(skip)]
     pub(crate) active_operation_id: String,
     #[serde(skip)]
@@ -38,6 +78,13 @@ pub(crate) struct UiState {
     /// wildly different times, and a number that mixes them says nothing.
     #[serde(skip)]
     pub(crate) installed_this_launch: bool,
+    /// Whether this launch's time-to-ready has been recorded.
+    ///
+    /// Its own flag rather than `!ready`: the daemon says `state ready` just
+    /// before it says `ready`, so by the time `ready` arrived the launch
+    /// already looked ready and its time was never recorded at all.
+    #[serde(skip)]
+    pub(crate) ready_recorded: bool,
 }
 
 /// What a broken installation can still be offered.
@@ -134,6 +181,24 @@ pub(crate) struct Shell {
     /// a running one puts a "quit?" prompt in front of a user who asked to
     /// change servers.
     pub(crate) swapping_window: AtomicBool,
+    /// Set once this shell has sent the daemon `shutdown-daemon` for a quit.
+    /// "Quit Anyway" then waits on that stop and escalates it, rather than
+    /// sending a second request the daemon refuses as already in progress.
+    pub(crate) daemon_stop_requested: AtomicBool,
+    /// Local workspace origins granted the workspace capability this run.
+    ///
+    /// Granted one exact origin at a time, at runtime, because the port is
+    /// only known once locald has allocated it -- and a `:*` pattern in the
+    /// shipped file would also cover every pod-app alias port on the same
+    /// host. Remembered so each is added once.
+    pub(crate) granted_workspace_origins: Mutex<BTreeSet<String>>,
+    /// Pod-app alias ports this run has handed the workspace, and the
+    /// canonical app origin each fronts. Only these may load in a frame on the
+    /// workspace host; see `pod_app_alias.rs`.
+    pub(crate) app_aliases: Mutex<HashMap<u16, String>>,
+    /// A newer Lemma the launch-time check found, if it found one. Read when
+    /// the menus are built, so a rebuild for a mode switch keeps the entry.
+    pub(crate) available_update: Mutex<Option<String>>,
 }
 
 pub(crate) struct LocaldConnection {
@@ -168,6 +233,10 @@ impl Shell {
             sharing_mode: Mutex::new(None),
             quit_confirmed: AtomicBool::new(false),
             swapping_window: AtomicBool::new(false),
+            daemon_stop_requested: AtomicBool::new(false),
+            granted_workspace_origins: Mutex::new(BTreeSet::new()),
+            app_aliases: Mutex::new(HashMap::new()),
+            available_update: Mutex::new(None),
         }
     }
 }
@@ -192,12 +261,34 @@ pub(crate) struct ResumeTarget {
 }
 
 /// What the caller must do once the state has been folded.
-#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(crate) struct EventOutcome {
     /// A terminal error just appeared, and recovery options should be fetched.
     pub(crate) schedule_terminal_recovery: bool,
     /// The runtime finished preparing, so the stack should be started.
     pub(crate) start_after_prepare: bool,
+    /// This launch just became usable, so its time-to-ready is recorded.
+    pub(crate) became_ready: Option<ReadyReached>,
+    /// What is serving now, for the next launch to resume straight into.
+    pub(crate) resume_write: Option<ResumeWrite>,
+}
+
+/// How long a launch took to become usable, and whether it installed anything.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ReadyReached {
+    pub(crate) cached: bool,
+    pub(crate) duration_ms: u64,
+}
+
+/// A resume target to record: what is serving now, and under which generation.
+///
+/// Not [`ResumeTarget`], which is the stored shape and carries the release and
+/// route that `write_resume_target` fills in itself.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ResumeWrite {
+    pub(crate) url: String,
+    pub(crate) api_url: String,
+    pub(crate) generation: String,
 }
 
 /// What the app knows about a newer version, if anything.
@@ -219,24 +310,59 @@ pub(crate) struct AppUpdateStatus {
     /// user commits is the difference between a considered choice and a
     /// surprise.
     pub(crate) runtime_download_bytes: Option<u64>,
-    /// Known database compatibility; this alone is not upgrade qualification.
+    /// Whether installing keeps this installation's data usable. See
+    /// `LemmaUpdateMetadata::compatibility_with`.
     pub(crate) data_compatibility: &'static str,
+    /// The Postgres majors behind a `postgres-major-change`, so the UI can say
+    /// which change it is refusing rather than that it is refusing.
+    pub(crate) installed_postgres_major: Option<u64>,
+    pub(crate) candidate_postgres_major: Option<u64>,
 }
 
 /// The `lemma` block a release feed carries alongside the standard fields.
 #[derive(Default)]
 pub(crate) struct LemmaUpdateMetadata {
     pub(crate) postgres_major: Option<u64>,
+    /// Both runtime archives together: what an installation with nothing to
+    /// reuse downloads, and all a feed from before `runtime_artifacts` says.
     pub(crate) runtime_download_bytes: Option<u64>,
+    /// Each archive's digest and size, so this machine can leave out the ones
+    /// it already has. Empty when the feed does not carry them.
+    pub(crate) runtime_artifacts: Vec<(artifact_install::Component, String, u64)>,
 }
 
 impl LemmaUpdateMetadata {
-    /// Unknown compatibility blocks replacement when local runtime data exists.
+    /// What the update's first launch will actually download here.
+    ///
+    /// Counted from the archives the installed releases cannot supply, so an
+    /// update whose guest runtime did not change is announced at the size of
+    /// its host pack. Falls back to the feed's whole-release figure when the
+    /// feed does not itemise.
+    pub(crate) fn runtime_bytes_to_download(&self, install_root: &Path) -> Option<u64> {
+        if self.runtime_artifacts.is_empty() {
+            return self.runtime_download_bytes;
+        }
+        Some(artifact_install::bytes_to_download(
+            install_root,
+            &self.runtime_artifacts,
+        ))
+    }
+
+    /// Whether this update leaves the installation's data usable.
+    ///
+    /// Everything Lemma keeps is a Postgres data directory and a folder of
+    /// files, and schema changes are migrations that run on the next start.
+    /// The one change a migration cannot carry is a new Postgres *major*: it
+    /// cannot open a data directory another major wrote, and Lemma ships no
+    /// `pg_upgrade` step. So that, and only that, is refused.
+    ///
+    /// Not knowing one side is not evidence of a change, so it does not block.
+    /// Even the refused case destroys nothing: Postgres will not start on a
+    /// foreign data directory, and the previous runtime stays on disk.
     pub(crate) fn compatibility_with(&self, installed: Option<u64>) -> &'static str {
         match (installed, self.postgres_major) {
-            (Some(installed), Some(candidate)) if installed == candidate => "compatible",
-            (Some(_), Some(_)) => "migration-unavailable",
-            _ => "unknown",
+            (Some(installed), Some(candidate)) if installed != candidate => "postgres-major-change",
+            _ => "compatible",
         }
     }
 }
@@ -310,6 +436,6 @@ pub(crate) static REMEMBERED_ACCENT: Mutex<Option<(u8, u8, u8)>> = Mutex::new(No
 #[tauri::command]
 pub(crate) fn get_state(app: AppHandle) -> UiState {
     let shell: State<Shell> = app.state();
-    let snapshot = shell.ui.lock().unwrap().clone();
+    let snapshot = shell.ui.lock_or_recover().clone();
     snapshot
 }

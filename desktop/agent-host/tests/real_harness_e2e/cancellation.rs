@@ -68,6 +68,8 @@ async fn a_real_agent_stops_on_session_cancel_and_keeps_its_session() {
         let outcome = run_with_deadline(
             AcpRunRequest {
                 adapter: manifest.resolve(&agent).unwrap(),
+                agent_environment: std::collections::BTreeMap::default(),
+                own_settings: false,
                 run_spec: RunSpec {
                     agent_run_id: Uuid::new_v4(),
                     conversation_id,
@@ -102,6 +104,7 @@ async fn a_real_agent_stops_on_session_cancel_and_keeps_its_session() {
                 permission_timeout: Duration::ZERO,
                 cancel: cancel_rx,
                 cancel_grace: Duration::from_secs(30),
+                steer: lemma_agent_host::acp::SteerInbox::default(),
             },
             Arc::clone(&callbacks) as Arc<dyn AcpCallbacks>,
         )

@@ -15,6 +15,13 @@ pod is [Working with data](working-with-data.md),
 [Agents and conversations](agents-and-conversations.md). Fine-grained control
 over a single resource is [Sharing and permissions](sharing-and-permissions.md).
 
+The workspace shall always offer an Apps view, including when a teammate has no
+apps. App ideas shall be grouped by Personal, Marketing, Product, Sales and
+Engineering, with four examples visible in each category. Build actions shall
+use the current teammate name. Example previews shall be labeled as examples. Choosing an example
+shall prepare an editable request in the conversation without sending it.
+Existing apps shall remain reachable in their own tabs.
+
 ---
 
 ## Capability: Create a pod
@@ -73,6 +80,12 @@ over a single resource is [Sharing and permissions](sharing-and-permissions.md).
 
 - When a pod admin adds an organization member to the pod with a role, the
   system shall grant them that role in the pod.
+- When an organization owner adds an organization member to a pod, the system
+  shall grant them that role whether or not the owner belongs to the pod: an
+  owner reaches every pod in their organization.
+- If an organization editor who does not manage the pod attempts to add someone
+  to it, then the system shall refuse: managing the organization's people is not
+  authority inside a pod.
 - When someone joins a pod, the system shall record `pod.member_joined`.
 - If a pod admin attempts to add someone who is not a member of the pod's
   organization, then the system shall refuse — organization membership is the
@@ -151,9 +164,12 @@ over a single resource is [Sharing and permissions](sharing-and-permissions.md).
 
 - When a person requests to join a pod, the system shall record the request as
   pending and notify the people who can decide it.
-- When a pod admin approves a request, the system shall add the person to the
-  pod with the role the approver chose, adding them to the organization first if
-  they are not yet a member.
+- When a pod admin or an organization owner approves a request, the system shall
+  add the person to the pod with the role the approver chose, adding them to the
+  organization first if they are not yet a member.
+- If an organization editor who does not manage the pod attempts to list or
+  decide its requests — their own included — then the system shall refuse.
+  Deciding a request is adding a member, and answers to the same authority.
 - If a person requests to join a pod they already belong to, then the system
   shall refuse rather than creating a request that cannot do anything.
 - If someone attempts to decide a request that has already been decided, then
@@ -179,7 +195,8 @@ over a single resource is [Sharing and permissions](sharing-and-permissions.md).
   then the system shall cap the organization role they may confer at ordinary
   member.
 - If an approver attempts to grant pod roles carrying permissions they do not
-  hold, then the system shall refuse.
+  hold, then the system shall refuse. Only an organization owner is exempt, and
+  no organization role short of owner changes that.
 
 **Contracts:** `pod.join_request.approve`
 

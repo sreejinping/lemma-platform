@@ -34,17 +34,17 @@ pub(crate) fn ensure_locald(app: &AppHandle) -> Result<(), String> {
     // minutes on a first run, and holding `locald_connect` across it turned
     // every unrelated caller into a hang of the same length.
     {
-        let _install_guard = shell.runtime_install.lock().unwrap();
+        let _install_guard = shell.runtime_install.lock_or_recover();
         require_no_recovery(&shell)?;
         ensure_runtime_artifacts(app)?;
     }
-    if shell.locald_writer.lock().unwrap().is_some() {
+    if shell.locald_writer.lock_or_recover().is_some() {
         return Ok(());
     }
 
-    let _connect_guard = shell.locald_connect.lock().unwrap();
+    let _connect_guard = shell.locald_connect.lock_or_recover();
     require_no_recovery(&shell)?;
-    if shell.locald_writer.lock().unwrap().is_some() {
+    if shell.locald_writer.lock_or_recover().is_some() {
         return Ok(());
     }
 
@@ -92,12 +92,12 @@ pub(crate) fn ensure_locald(app: &AppHandle) -> Result<(), String> {
 pub(crate) fn ensure_locald_without_host_pack(app: &AppHandle) -> Result<(), String> {
     let shell: State<Shell> = app.state();
     require_no_recovery(&shell)?;
-    if shell.locald_writer.lock().unwrap().is_some() {
+    if shell.locald_writer.lock_or_recover().is_some() {
         return Ok(());
     }
-    let _connect_guard = shell.locald_connect.lock().unwrap();
+    let _connect_guard = shell.locald_connect.lock_or_recover();
     require_no_recovery(&shell)?;
-    if shell.locald_writer.lock().unwrap().is_some() {
+    if shell.locald_writer.lock_or_recover().is_some() {
         return Ok(());
     }
 
@@ -193,6 +193,15 @@ pub(crate) fn spawn_locald() -> Result<Child, String> {
             "LEMMA_LOCALD_VZ_BIN",
             bundled_vz().ok_or("bundled lemma-vz helper is missing")?,
         );
+    }
+    // Its own process group. The daemon outlives the app by design, but a
+    // launch by the Start-at-Login LaunchAgent puts the app at the head of a
+    // launchd job, and launchd reaps the job's whole process group when the
+    // app exits -- as does a terminal's Ctrl-C in a dev run.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
     }
     command
         .no_console_window()
@@ -324,6 +333,19 @@ pub(crate) fn stop_locald(
         .ok_or("the previous local service manager did not report its process identity")?;
     request_locald_replacement(&mut connection)?;
     drop(connection);
+    finish_locald_stop(original_pid, reason, graceful_attempts)
+}
+
+/// Wait for a daemon that has already been asked to stop, then force it.
+///
+/// Split from `stop_locald` so a quit that already sent `shutdown-daemon` --
+/// the "Quit Anyway" path -- escalates that stop instead of racing it with a
+/// second request the daemon refuses as "already stopping".
+pub(crate) fn finish_locald_stop(
+    original_pid: u64,
+    reason: &str,
+    graceful_attempts: usize,
+) -> Result<(), String> {
     if wait_for_locald_exit(graceful_attempts, reason).is_ok() {
         return Ok(());
     }
@@ -471,7 +493,7 @@ pub(crate) fn stop_locald_for_runtime_maintenance(app: &AppHandle) -> Result<(),
         }
     }
     let shell: State<Shell> = app.state();
-    *shell.locald_writer.lock().unwrap() = None;
+    *shell.locald_writer.lock_or_recover() = None;
     Ok(())
 }
 
@@ -490,5 +512,5 @@ pub(crate) fn disconnect_locald(app: &AppHandle) {
     // `leave_nothing_running`.
     let _ = send_to_locald(app, json!({"cmd": "disconnect", "id": "shell-exit"}));
     let shell: State<Shell> = app.state();
-    *shell.locald_writer.lock().unwrap() = None;
+    *shell.locald_writer.lock_or_recover() = None;
 }

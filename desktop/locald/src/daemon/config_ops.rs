@@ -1,5 +1,33 @@
 use super::*;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// The connector catalog's setup id in the host pack.
+const CONNECTOR_CATALOG_SETUP: &str = "connector-catalog";
+
+/// Whether a catalog refresh started by a settings save is still running.
+static CATALOG_REFRESH_RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// Import the connector catalog again if the key it depends on changed.
+///
+/// A saved Composio key used to wait for the next start of the whole stack
+/// before its apps appeared. The setup's stamp covers the key it runs with,
+/// so this is a no-op for every save that did not change it -- and it runs
+/// beside the backend rather than in front of the save, because a catalog
+/// import reaches the network and is allowed minutes. Optional like the
+/// setup itself: a failure is logged and retried on the next start.
+fn refresh_connector_catalog(manager: Arc<HostProcessManager>) {
+    if CATALOG_REFRESH_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    thread::spawn(move || {
+        if let Err(error) = manager.run_setup_if_stale(CONNECTOR_CATALOG_SETUP) {
+            eprintln!("locald: refreshing the connector catalog failed: {error}");
+        }
+        CATALOG_REFRESH_RUNNING.store(false, Ordering::SeqCst);
+    });
+}
+
 impl Daemon {
     pub(super) fn apply_operator_config(
         self: &Arc<Self>,
@@ -48,8 +76,10 @@ impl Daemon {
         );
         let daemon = Arc::clone(self);
         thread::spawn(move || {
+            // Taken first, so a write that panics still releases admission.
+            let finish = daemon.lifecycle.finish_on_drop();
             let result = daemon.write_operator_config(|store| store.update(apply));
-            daemon.finish_config_write(result, id.as_ref());
+            daemon.finish_config_write(finish, result, id.as_ref());
         });
     }
 
@@ -85,6 +115,14 @@ impl Daemon {
                         if backend_restart_available {
                             manager.set_backend_environment(daemon.backend_environment()?);
                             manager.restart_backend()?;
+                            refresh_connector_catalog(Arc::clone(manager));
+                            // Only a change to the voice-call keys touches the
+                            // frontend, and only then is it restarted.
+                            if manager.set_frontend_environment(
+                                daemon.operator_config.frontend_environment()?,
+                            ) {
+                                manager.restart_frontend()?;
+                            }
                         }
                     }
                     Ok(snapshot)
@@ -97,6 +135,11 @@ impl Daemon {
                                 if backend_restart_available {
                                     manager.set_backend_environment(daemon.backend_environment()?);
                                     manager.restart_backend()?;
+                                    if manager.set_frontend_environment(
+                                        daemon.operator_config.frontend_environment()?,
+                                    ) {
+                                        manager.restart_frontend()?;
+                                    }
                                 }
                             }
                             Ok(())
@@ -117,8 +160,14 @@ impl Daemon {
 
     /// Announce the outcome of an operator-config write and release the guard.
     /// Announce the outcome of an operator-config write and release the guard.
+    /// Record the outcome, release admission, then announce it -- in that order.
+    ///
+    /// `finish` is dropped explicitly rather than at the end of scope: the
+    /// broadcast below can make the client send the next section's save at
+    /// once, and a lifecycle still held at that moment refuses it as busy.
     pub(super) fn finish_config_write(
         self: &Arc<Self>,
+        finish: crate::lifecycle::Finish<'_>,
         result: io::Result<Value>,
         id: Option<&Value>,
     ) {
@@ -142,12 +191,12 @@ impl Daemon {
         if let (Some(journal), Some(id)) = (&self.config_operations, id.and_then(Value::as_str)) {
             if let Err(error) = journal.finish(id, outcome) {
                 self.broadcast(error_event("config-outcome-unknown", format!("settings may have been applied, but completion could not be recorded: {error}; review settings before retrying"), Some(&json!(id))));
-                self.lifecycle.finish();
+                drop(finish);
                 return;
             }
         }
         // A completion can immediately trigger the next section's save.
-        self.lifecycle.finish();
+        drop(finish);
         match result {
             Ok(snapshot) => self.broadcast(json!({
                 "v": PROTOCOL_VERSION,
@@ -223,23 +272,13 @@ impl Daemon {
         );
         let daemon = Arc::clone(self);
         thread::spawn(move || {
+            // Taken first, so a write that panics still releases admission.
+            let finish = daemon.lifecycle.finish_on_drop();
             let result = daemon.write_operator_config(|store| store.set_ai(payload));
-            daemon.finish_config_write(result, id.as_ref());
+            daemon.finish_config_write(finish, result, id.as_ref());
         });
     }
 
-    /// Ask a provider what it can run, without committing to anything.
-    ///
-    /// `config.apply` already probes, but it probes as one step of a write that
-    /// restarts the backend — so the only way to find out a provider's model
-    /// names was to guess one, apply, and read the error. That is why both the
-    /// onboarding step and Local settings asked people to type model ids from
-    /// memory. This is the same probe with no write behind it: connect, list,
-    /// then let the user pick before anything is saved.
-    ///
-    /// Deliberately not guarded by `lifecycle` — it mutates
-    /// nothing, and making a read-only lookup wait behind an unrelated start is
-    /// how a model picker ends up feeling broken.
     /// Ask a provider what it can run, without committing to anything.
     ///
     /// `config.apply` already probes, but it probes as one step of a write that
@@ -277,6 +316,29 @@ impl Daemon {
                     error_event("config-discover-failed", error.to_string(), id.as_ref()),
                 ),
             };
+        });
+    }
+
+    /// Server setup's Test: one read-only request to the service, off the
+    /// daemon's thread and outside `lifecycle`, for the reason model discovery
+    /// is -- it changes nothing, and must not wait behind a start.
+    pub(super) fn test_setup(self: &Arc<Self>, request: Value, client: &mpsc::SyncSender<String>) {
+        let id = request.get("id").cloned();
+        let payload = request.get("payload").cloned().unwrap_or(Value::Null);
+        let daemon = Arc::clone(self);
+        let client = client.clone();
+        thread::spawn(move || {
+            let event = match daemon.operator_config.test_setup(payload) {
+                Ok(outcome) => json!({
+                    "v": PROTOCOL_VERSION,
+                    "event": "config.tested",
+                    "id": id.as_ref(),
+                    "detail": outcome.get("detail").cloned().unwrap_or(Value::Null),
+                    "models": outcome.get("models").cloned().unwrap_or(Value::Null),
+                }),
+                Err(error) => error_event("config-test-failed", error.to_string(), id.as_ref()),
+            };
+            daemon.send_direct(&client, event);
         });
     }
 }

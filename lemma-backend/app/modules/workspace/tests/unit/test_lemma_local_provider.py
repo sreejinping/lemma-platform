@@ -9,6 +9,7 @@ exercised rather than mocked away.
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 import os
 import stat
 from datetime import datetime, timedelta, timezone
@@ -96,15 +97,18 @@ if op == "sandbox.ensure":
         "state": "running",
         "created": (existing or {}).get("created", 0) + 1,
         "apps": params.get("apps"),
+        "host_access": params.get("host_access", "unsent"),
+        "host_loopback": params.get("host_loopback", "unsent"),
+        "env": params.get("env"),
     }
-    ok({"status": {"state": "running", "runtime_url": "http://127.0.0.1:9999",
+    ok({"status": {"state": "running", "runtime_url": os.environ.get("RUNTIME_URL", "http://127.0.0.1:9999"),
                    "apps": _apps(params.get("apps"))},
         "provider_id": sandbox_id})
 if op == "sandbox.status":
     entry = state["sandboxes"].get(sandbox_id)
     if entry is None:
         fail("not_found", "no such sandbox", retryable=False)
-    ok({"status": {"state": entry["state"], "runtime_url": "http://127.0.0.1:9999",
+    ok({"status": {"state": entry["state"], "runtime_url": os.environ.get("RUNTIME_URL", "http://127.0.0.1:9999"),
                    "apps": _apps(entry.get("apps"))},
         "provider_id": sandbox_id})
 if op == "sandbox.release":
@@ -225,6 +229,45 @@ async def test_ensure_is_idempotent(provider: LemmaLocalSandboxProvider) -> None
     assert len(_state(provider)["sandboxes"]) == 1
 
 
+async def test_host_access_is_sent_only_when_it_narrows_the_default(
+    provider: LemmaLocalSandboxProvider,
+) -> None:
+    """The guest rejects keys it does not know, so the default stays unsent.
+
+    A guest from before the flag parses `sandbox.ensure` with
+    `deny_unknown_fields`; sending `host_access: true` to it would fail every
+    ensure for a value that means "what you already do".
+    """
+    default = uuid4()
+    narrowed = uuid4()
+    await provider.create(_spec(default))
+    await provider.create(replace(_spec(narrowed), host_access=False))
+
+    sandboxes = _state(provider)["sandboxes"]
+    assert sandboxes[f"w-{default.hex}"]["host_access"] == "unsent"
+    assert sandboxes[f"w-{narrowed.hex}"]["host_access"] is False
+
+
+async def test_the_loopback_relay_is_sent_only_for_the_sandbox_granted_it(
+    provider: LemmaLocalSandboxProvider,
+) -> None:
+    """Only the owner's workspace is granted the relay, and only it says so.
+
+    Unsent is "no relay" to the guest, so every other sandbox -- and every
+    sandbox an older guest is asked for -- is ensured exactly as before.
+    """
+    ordinary = uuid4()
+    owners = uuid4()
+    await provider.create(_spec(ordinary))
+    await provider.create(replace(_spec(owners), host_loopback=True))
+
+    sandboxes = _state(provider)["sandboxes"]
+    assert sandboxes[f"w-{ordinary.hex}"]["host_loopback"] == "unsent"
+    assert sandboxes[f"w-{owners.hex}"]["host_loopback"] is True
+    # A separate grant from the host alias, which both keep.
+    assert sandboxes[f"w-{owners.hex}"]["host_access"] == "unsent"
+
+
 async def test_unpinned_images_are_refused(
     provider: LemmaLocalSandboxProvider,
 ) -> None:
@@ -252,6 +295,55 @@ async def test_release_stops_without_deleting(
     assert entry["state"] == "stopped"
     # Still there, so the next ensure resumes rather than rebuilds.
     assert instance.provider_id in _state(provider)["sandboxes"]
+
+
+async def test_a_workspace_is_quiesced_before_it_is_released(
+    provider: LemmaLocalSandboxProvider, monkeypatch
+) -> None:
+    """Chrome's profile -- the sign-ins a person made in the agent's browser
+    -- is flushed before the container stops, as Docker's release does. A
+    function has no browser, and is only stopped."""
+    import http.server
+    import threading
+
+    seen: list[str] = []
+
+    class Runtime(http.server.BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            state = json.loads(Path(os.environ["BRIDGE_STATE"]).read_text())
+            states = sorted(entry["state"] for entry in state["sandboxes"].values())
+            seen.append(f"{self.path} while {','.join(states)}")
+            body = b'{"terminated_processes": 0, "terminated_python_sessions": 0}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args: object) -> None:
+            return
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Runtime)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    monkeypatch.setenv("RUNTIME_URL", f"http://127.0.0.1:{server.server_address[1]}")
+    try:
+        workspace = await provider.create(_spec(uuid4()))
+        await provider.release(
+            workspace, kind=SandboxKind.WORKSPACE, deadline_at=_deadline()
+        )
+        assert seen == ["/quiesce while running"]
+        assert _state(provider)["sandboxes"][workspace.provider_id]["state"] == (
+            "stopped"
+        )
+
+        function = await provider.create(_spec(uuid4(), kind=SandboxKind.FUNCTION))
+        await provider.release(
+            function, kind=SandboxKind.FUNCTION, deadline_at=_deadline()
+        )
+        assert seen == ["/quiesce while running"]
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 async def test_inspect_reports_absence_rather_than_failing(
@@ -384,6 +476,23 @@ async def test_the_sweep_identifies_its_own_sandboxes(
     assert objects[0].provider_id == objects[0].name
     assert objects[0].running is True
 
+    # And destroy() does act on it: the sweep reclaims an orphan by exactly
+    # this name, and a no-op here is a sandbox logged as reclaimed that runs on.
+    assert await provider.inspect(objects[0].name, deadline_at=_deadline()) is not None
+    await provider.destroy(objects[0].name, deadline_at=_deadline())
+    assert f"w-{sandbox_id.hex}" not in _state(provider)["sandboxes"]
+    assert await provider.list_objects(deadline_at=_deadline()) == ()
+
+
+async def test_a_name_that_is_neither_spelling_is_not_destroyed(
+    provider: LemmaLocalSandboxProvider,
+) -> None:
+    sandbox_id = uuid4()
+    await provider.create(_spec(sandbox_id))
+    for foreign in (f"x-{sandbox_id.hex}", f"w-{sandbox_id}", "w-", "postgres"):
+        await provider.destroy(foreign, deadline_at=_deadline())
+    assert f"w-{sandbox_id.hex}" in _state(provider)["sandboxes"]
+
 
 async def test_a_pre_consolidation_guest_sandbox_is_still_identifiable(
     provider: LemmaLocalSandboxProvider, tmp_path: Path
@@ -458,4 +567,81 @@ async def test_a_refused_filesystem_operation_is_definitive_not_retryable(
                 )
         assert not isinstance(raised.value, SandboxUnavailable), (
             f"{status_code} reads as retryable, so the caller loops on it"
+        )
+
+
+# ---------------------------------------------------------------------------
+# The function runtime's credential
+# ---------------------------------------------------------------------------
+
+
+async def test_a_function_sandbox_is_started_with_its_credential_and_gateway(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Every sandbox in the guest shares a bridge, and the function runtime
+    runs whatever it is sent, so it is started knowing the only credential it
+    will take and the only gateway it will fetch artifacts from."""
+    bridge = _bridge(tmp_path, _RECORDING_BRIDGE)
+    monkeypatch.setenv("BRIDGE_STATE", str(tmp_path / "state.json"))
+    signer = RuntimeCredentialSigner(key=b"k" * 32)
+    provider = LemmaLocalSandboxProvider(
+        LemmaLocalProviderConfig(
+            executable=str(bridge),
+            callback_url="http://host.lemma.internal:8711",
+        ),
+        signer,
+    )
+    pod_id = uuid4()
+    function = await provider.create(_spec(pod_id, kind=SandboxKind.FUNCTION))
+    workspace = await provider.create(_spec(uuid4()))
+
+    sandboxes = _state(provider)["sandboxes"]
+    assert sandboxes[function.provider_id]["env"] == {
+        "LEMMA_FUNCTION_RUNTIME_TOKEN": signer.token(function.provider_id),
+        "LEMMA_FUNCTION_GATEWAY_HOSTS": "host.lemma.internal",
+    }
+    assert sandboxes[workspace.provider_id]["env"] == {}
+    # Per sandbox: one pod's credential opens no other pod's runtime.
+    other = await provider.create(_spec(uuid4(), kind=SandboxKind.FUNCTION))
+    assert _state(provider)["sandboxes"][other.provider_id]["env"][
+        "LEMMA_FUNCTION_RUNTIME_TOKEN"
+    ] != signer.token(function.provider_id)
+
+    endpoint = await provider.reach_port(function, port=8090, deadline_at=_deadline())
+    assert endpoint.headers == {
+        "X-Lemma-Runtime-Token": signer.token(function.provider_id)
+    }
+    # Only the runtime, and only a function's: nothing else is handed it.
+    workspace_endpoint = await provider.reach_port(
+        workspace, port=8080, deadline_at=_deadline()
+    )
+    assert workspace_endpoint.headers == {}
+
+
+async def test_a_guest_that_does_not_answer_is_not_a_guest_with_nothing_in_it(
+    tmp_path: Path,
+) -> None:
+    """Asking whether a sandbox exists and getting no answer used to read as
+    "it does not": create reported the user's disk as new -- which moves the
+    storage generation on -- and inspect told the service to rebuild."""
+    bridge = _bridge(
+        tmp_path,
+        "import json,sys; request = json.loads(sys.stdin.read())\n"
+        "if request['operation'] == 'sandbox.status':\n"
+        "    print(json.dumps({'ok': False, 'error': {'code': 'busy',"
+        " 'message': 'guest is busy', 'retryable': True}})); sys.exit(1)\n"
+        "print(json.dumps({'ok': True, 'result': {'status': {'state': 'running'},"
+        " 'provider_id': request['parameters']['sandbox_id']}}))\n",
+    )
+    provider = LemmaLocalSandboxProvider(
+        LemmaLocalProviderConfig(executable=str(bridge)),
+        RuntimeCredentialSigner(key=b"k" * 32),
+    )
+    sandbox_id = uuid4()
+    with pytest.raises(ProviderCreateAmbiguous):
+        await provider.create(_spec(sandbox_id))
+    with pytest.raises(ProviderRejected):
+        await provider.inspect(
+            naming.container_name(sandbox_id, SandboxKind.WORKSPACE, 1),
+            deadline_at=_deadline(),
         )

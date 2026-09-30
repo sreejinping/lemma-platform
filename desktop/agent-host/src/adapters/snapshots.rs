@@ -35,7 +35,7 @@ impl ResolvedAdapter {
 
     #[must_use]
     pub fn environment(&self) -> BTreeMap<String, String> {
-        let mut environment = BTreeMap::new();
+        let mut environment = self.spec.environment.clone();
         let paths = adapter_search_paths(&self.command, &self.upstream_command);
         if let Ok(joined) = env::join_paths(paths) {
             environment.insert("PATH".to_owned(), joined.to_string_lossy().into_owned());
@@ -129,8 +129,8 @@ pub(crate) fn snapshot_unavailable(spec: &AdapterSpec, reason: &str) -> HarnessS
 
 /// Whether this reason describes a moment rather than an installation.
 ///
-/// Read by the poll loop to choose between trying again in seconds and waiting
-/// out the ordinary refresh. An agent that is simply not installed must answer
+/// Read by the worker loop to choose between trying again in seconds and
+/// waiting out the ordinary refresh. An agent that is simply not installed must answer
 /// `false`, or the host re-probes it forever: on a machine without Cursor that
 /// is every refresh for the life of the process.
 #[must_use]

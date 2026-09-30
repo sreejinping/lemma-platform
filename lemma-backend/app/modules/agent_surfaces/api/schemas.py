@@ -89,7 +89,15 @@ class SurfaceBehaviorConfigInput(BaseModel):
         default_factory=SurfaceIdentityConfigInput
     )
     channels: list[SurfaceChannelRouteInput] = Field(default_factory=list)
-    dm_conversation_reset_after_hours: int = 24
+    dm_conversation_reset_after_hours: int | None = Field(
+        default=None,
+        deprecated=True,
+        description=(
+            "Ignored. The DM reset window is a deployment-wide setting "
+            "(SURFACE_DM_CONVERSATION_RESET_AFTER_HOURS). Still accepted so "
+            "existing pod bundles and clients keep working."
+        ),
+    )
     send_policy: SurfaceSendPolicyConfig = Field(
         default_factory=SurfaceSendPolicyConfig
     )
@@ -130,7 +138,6 @@ class SurfaceConfigResponse(BaseModel):
         default_factory=SurfaceIdentityConfigResponse
     )
     channels: list[SurfaceChannelRouteResponse] = Field(default_factory=list)
-    dm_conversation_reset_after_hours: int = 24
     send_policy: SurfaceSendPolicyConfig = Field(
         default_factory=SurfaceSendPolicyConfig
     )
@@ -153,7 +160,6 @@ def surface_config_from_input(
 ) -> SurfaceConfig:
     """Build the domain config from API input."""
     return SurfaceConfig(
-        dm_conversation_reset_after_hours=config_input.dm_conversation_reset_after_hours,
         identity=SurfaceIdentityPolicy(
             allowed_domains=config_input.identity.allowed_domains,
             allowed_email_addresses=config_input.identity.allowed_email_addresses,
@@ -397,6 +403,23 @@ class SurfaceSystemClaim(BaseModel):
     claimed_by_surface_name: str | None = None
 
 
+class SurfaceUnavailableReason(StrEnum):
+    """Why a platform cannot be connected on this server right now.
+
+    Published so a setup screen can say what to do instead of offering a
+    Connect button whose only outcome is a refusal. Each value names the thing
+    that is missing, not the setting that supplies it: the setting is the
+    operator's word, and on Desktop the person reading is the operator but
+    configures it through a form, not an environment variable.
+    """
+
+    # Nowhere on the internet for the platform to deliver to, and no pull
+    # receiver for it in this runtime (WhatsApp and Teams never have one).
+    NEEDS_PUBLIC_LINK = "NEEDS_PUBLIC_LINK"
+    # Email: no inbound domain to give addresses out on.
+    NEEDS_EMAIL_DOMAIN = "NEEDS_EMAIL_DOMAIN"
+
+
 class AvailableSurface(BaseModel):
     """One connectable surface platform. ``supported_credential_modes`` is the
     single source of truth for how it can be set up: ``[CUSTOM]`` means an account
@@ -426,6 +449,9 @@ class AvailableSurface(BaseModel):
     # deployment configuration. With it the builder can show someone the address
     # their agent is about to get, instead of promising one.
     email_domain: str | None = None
+    # Set when no credential mode can work here, whatever the modes above say:
+    # the same check the create path refuses on, published ahead of the click.
+    unavailable_reason: SurfaceUnavailableReason | None = None
 
 
 class AvailableSurfacesResponse(BaseModel):

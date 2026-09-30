@@ -20,36 +20,11 @@ from typing import AsyncIterator
 
 from app.core.authorization.context import Context
 from app.core.authorization.current import reset_current_context, set_current_context
-from app.core.authorization.delegation import DEFAULT_POD_AGENT_ID
 from app.core.infrastructure.db.session import async_session_maker
 from app.core.infrastructure.db.uow import SqlAlchemyUnitOfWork
 from app.core.infrastructure.db.uow_factory import SessionUnitOfWorkFactory
-from app.core.authorization.factory import create_authorization_data_service
+from app.modules.agent.tools.authority import tool_authorization_context
 from app.modules.agent.tools.context import BaseAgentContext
-
-
-async def build_delegated_context(
-    uow: SqlAlchemyUnitOfWork, deps: BaseAgentContext
-) -> Context:
-    """Build the delegated-workload authorization context for an agent tool call.
-
-    Shared by every in-process caller that needs to make the same "does this
-    workload have the grant it's using" decision `AccountResolutionService`
-    makes -- currently connector operation execution and the workspace
-    GitHub-credential bridge -- so there is one implementation of the
-    delegation shape, not several that can drift.
-    """
-    return await create_authorization_data_service(
-        uow
-    ).build_delegated_workload_context(
-        user_id=deps.user_id,
-        principal_type="AGENT",
-        principal_id=deps.workload_id or DEFAULT_POD_AGENT_ID,
-        pod_id=deps.pod_id,
-        is_default_pod_agent=deps.is_pod_default_agent,
-        delegation_actor_name=deps.agent_name,
-        delegation_session_id=str(deps.conversation_id),
-    )
 
 
 @dataclass(slots=True)
@@ -58,6 +33,8 @@ class ConnectorServices:
     operations: object
     ctx: Context
     uow: SqlAlchemyUnitOfWork
+    #: Reads an attachment and lands a download, as this agent in its pod.
+    files: object
 
 
 def _connector_dependencies():
@@ -70,6 +47,15 @@ def _connector_dependencies():
     from app.modules.connectors.api import dependencies
 
     return dependencies
+
+
+async def find_file_result(response: object) -> object | None:
+    """The file an operation result carries, fetched -- outside any session.
+
+    It walks and base64-decodes the whole provider response and may download
+    a URL, so it runs before the session that persists the file is opened.
+    """
+    return await _connector_dependencies().find_file_result(response)
 
 
 @asynccontextmanager
@@ -101,7 +87,7 @@ async def connector_services(
     dependencies = _connector_dependencies()
 
     async with SessionUnitOfWorkFactory(async_session_maker)() as uow:
-        auth_ctx = await build_delegated_context(uow, deps)
+        auth_ctx = await tool_authorization_context(uow, deps)
         token = set_current_context(auth_ctx)
         try:
             yield ConnectorServices(
@@ -109,6 +95,9 @@ async def connector_services(
                 operations=dependencies.build_connector_operation_service(uow),
                 ctx=auth_ctx,
                 uow=uow,
+                files=dependencies.build_operation_files(
+                    uow, pod_id=deps.pod_id, ctx=auth_ctx
+                ),
             )
             await uow.commit()
         finally:

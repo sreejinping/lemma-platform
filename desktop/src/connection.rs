@@ -89,7 +89,7 @@ pub(crate) fn choose_connection_mode_impl(app: AppHandle) -> Result<String, Stri
 
 pub(crate) fn current_mode(app: &AppHandle) -> String {
     let shell: State<Shell> = app.state();
-    let ui = shell.ui.lock().unwrap();
+    let ui = shell.ui.lock_or_recover();
     ui.mode.clone()
 }
 
@@ -106,7 +106,7 @@ pub(crate) fn set_mode(app: &AppHandle, mode: &str) -> Result<(), String> {
     refresh_menus_for_connection_mode(app);
     let changed = {
         let shell: State<Shell> = app.state();
-        let mut ui = shell.ui.lock().unwrap();
+        let mut ui = shell.ui.lock_or_recover();
         let changed = ui.mode != mode;
         if changed && mode == "local" {
             ui.url.clear();
@@ -162,7 +162,7 @@ pub(crate) fn confirm_then_switch_connection(app: AppHandle) {
     }
     let running = {
         let shell: State<Shell> = app.state();
-        let ui = shell.ui.lock().unwrap();
+        let ui = shell.ui.lock_or_recover();
         ui.running
     };
     let (title, body, confirm) = connection_switch_prompt(&current, running);
@@ -185,7 +185,7 @@ pub(crate) fn confirm_then_switch_connection(app: AppHandle) {
 pub(crate) fn app_base_url(app: &AppHandle) -> Result<String, String> {
     let (mode, url, api_url) = {
         let shell: State<Shell> = app.state();
-        let ui = shell.ui.lock().unwrap();
+        let ui = shell.ui.lock_or_recover();
         (ui.mode.clone(), ui.url.clone(), ui.api_url.clone())
     };
     if mode == "hosted" {
@@ -299,4 +299,78 @@ pub(crate) async fn login(app: AppHandle, mode: Option<String>) -> Result<(), St
         desktop_auth_url(&base, auth_mode)
     };
     open_app_window(&app, &url)
+}
+
+/// Whether a page may send this app back to the Cloud-or-Local chooser.
+///
+/// Narrow on purpose: the command is granted to the workspace origins, and
+/// "forget which server this app uses" is not something any page there should
+/// be able to ask. Only the hosted site's own sign-in screens -- where a person
+/// who picked Lemma Cloud and pressed Cancel is standing -- in the main window,
+/// while this app is in hosted mode. `/auth/desktop` is excluded: it is the
+/// *browser's* half of the handoff and never runs in the app. A signed-in
+/// workspace page is not on these paths, so nothing in the workspace can.
+pub(crate) fn mode_chooser_return_allowed(
+    label: &str,
+    mode: &str,
+    page: &tauri::Url,
+    hosted: &str,
+) -> Result<(), String> {
+    if label != "main" {
+        return Err("only Lemma's main window can go back to choosing how to run Lemma".into());
+    }
+    if mode != "hosted" {
+        return Err("Lemma is not using Lemma Cloud, so there is no sign-in to cancel".into());
+    }
+    let hosted = tauri::Url::parse(hosted).map_err(|error| error.to_string())?;
+    if page.origin() != hosted.origin() {
+        return Err(
+            "only Lemma Cloud's sign-in page can go back to choosing how to run Lemma".into(),
+        );
+    }
+    let path = page.path();
+    let sign_in = path == "/auth" || path.starts_with("/auth/");
+    let browser_half = path == "/auth/desktop" || path.starts_with("/auth/desktop/");
+    if !sign_in || browser_half {
+        return Err(
+            "only Lemma Cloud's sign-in page can go back to choosing how to run Lemma".into(),
+        );
+    }
+    Ok(())
+}
+
+/// Forget the Lemma Cloud choice and show the chooser again.
+///
+/// The config goes back to having no mode, which is exactly what a first
+/// launch reads as "undecided" -- so a quit here reopens on the chooser too,
+/// rather than on the sign-in the person just cancelled. The window is
+/// rebuilt on the splash (`rebuild_main_window_for_mode`), which shows the
+/// chooser for an undecided mode. Nothing else changes: an Agent Host already
+/// running for this computer keeps running.
+pub(crate) fn return_to_mode_chooser_impl(app: AppHandle) -> Result<(), String> {
+    write_config(|config| {
+        if let Some(config) = config.as_object_mut() {
+            config.remove("connectionMode");
+        }
+    })?;
+    {
+        let shell: State<Shell> = app.state();
+        shell.ui.lock_or_recover().mode = "undecided".into();
+    }
+    refresh_menus_for_connection_mode(&app);
+    rebuild_main_window_for_mode(&app, "undecided");
+    Ok(())
+}
+
+#[tauri::command]
+/// Off the UI thread: rebuilding the main window waits for the old one's label
+/// to be released by the event loop, which cannot happen while this blocks it.
+pub(crate) async fn return_to_mode_chooser(window: Webview, app: AppHandle) -> Result<(), String> {
+    let page = window
+        .url()
+        .map_err(|error| format!("could not inspect the sign-in page: {error}"))?;
+    mode_chooser_return_allowed(window.label(), &current_mode(&app), &page, &hosted_url())?;
+    tauri::async_runtime::spawn_blocking(move || return_to_mode_chooser_impl(app))
+        .await
+        .map_err(|error| error.to_string())?
 }

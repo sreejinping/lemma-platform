@@ -8,8 +8,10 @@ run `uv run python scripts/generate_route_inventory.py`.
 | Method | Path | Operation ID | Summary |
 | --- | --- | --- | --- |
 | DELETE | `/me/runtime/agent-hosts/{host_id}` | `agent.host.revoke` | Revoke Agent Host |
+| DELETE | `/organizations/{organization_id}/agent-runtime/default` | `agent.runtime.default.clear` | Clear the Organization's Default Model |
 | DELETE | `/organizations/{organization_id}/agent-runtime/profiles/{profile_id}` | `agent.runtime.profiles.archive` | Archive Agent Runtime Profile |
 | DELETE | `/pods/{pod_id}/agents/{agent_name}` | `agent.delete` | Delete Agent |
+| DELETE | `/pods/{pod_id}/conversations/{conversation_id}/messages/{message_id}` | `agent.conversation.message.withdraw` | Withdraw Queued Conversation Message |
 | GET | `/me/runtime/agent-hosts` | `agent.host.list` | List Agent Hosts |
 | GET | `/me/runtime/agent-hosts/{host_id}/harnesses` | `agent.host.harnesses.list` | List Agent Host Harnesses |
 | GET | `/organizations/{organization_id}/agent-runtime/profiles` | `agent.runtime.profiles.list` | List Available Agent Runtime Profiles |
@@ -25,13 +27,10 @@ run `uv run python scripts/generate_route_inventory.py`.
 | PATCH | `/organizations/{organization_id}/agent-runtime/profiles/{profile_id}` | `agent.runtime.profiles.update` | Update Agent Runtime Profile |
 | PATCH | `/pods/{pod_id}/agents/{agent_name}` | `agent.update` | Update Agent |
 | PATCH | `/pods/{pod_id}/conversations/{conversation_id}` | `agent.conversation.update` | Update Pod Conversation |
-| POST | `/agent-host/events/append` | `agent.host.events.append` | Append Agent Host Events |
-| POST | `/agent-host/pairings/complete` | `agent.host.pairing.complete` | Complete Agent Host Pairing |
-| POST | `/agent-host/poll` | `agent.host.poll` | Poll Agent Host Commands |
-| POST | `/agent-host/revoke` | `agent.host.self_revoke` | Self Revoke Agent Host |
 | POST | `/me/runtime/agent-host-pairings` | `agent.host.pairing.create` | Create Agent Host Pairing |
 | POST | `/organizations/{organization_id}/agent-runtime/profiles` | `agent.runtime.profiles.create` | Create Agent Runtime Profile |
 | POST | `/organizations/{organization_id}/agent-runtime/profiles/{profile_id}/restore` | `agent.runtime.profiles.restore` | Restore Agent Runtime Profile |
+| POST | `/organizations/{organization_id}/agent-runtime/profiles/{profile_id}/test` | `agent.runtime.profiles.test` | Test a Saved Model Provider |
 | POST | `/pods/{pod_id}/agents` | `agent.create` | Create Agent |
 | POST | `/pods/{pod_id}/conversations` | `agent.conversation.create` | Create Pod Agent Conversation |
 | POST | `/pods/{pod_id}/conversations/{conversation_id}/approvals/{approval_id}/decision` | `agent.conversation.approval.resolve` | Resolve User Approval |
@@ -42,7 +41,7 @@ run `uv run python scripts/generate_route_inventory.py`.
 | POST | `/pods/{pod_id}/widgets/{conversation_id}/{tool_call_id}/embed-token` | `widget.embed_token` | Mint Widget Embed URL |
 | POST | `/tools/report-feedback` | `agent.tool.report_feedback` | Agent Report Feedback |
 | POST | `/tools/web-search` | `agent.tool.web_search` | Agent Web Search |
-| PUT | `/agent-host/harnesses` | `agent.host.harnesses.publish` | Publish Agent Host Harnesses |
+| PUT | `/organizations/{organization_id}/agent-runtime/default` | `agent.runtime.default.set` | Set the Organization's Default Model |
 | PUT | `/pods/{pod_id}/agents/{agent_name}/permissions` | `agent.permissions.replace` | Replace Agent Resource Permissions |
 
 ## agent_surfaces
@@ -157,6 +156,7 @@ run `uv run python scripts/generate_route_inventory.py`.
 | PATCH | `/pods/{pod_id}/datastore/tables/{table_name}` | `table.update` | Update Table |
 | PATCH | `/pods/{pod_id}/datastore/tables/{table_name}/records/{record_id}` | `record.update` | Update Record |
 | POST | `/pods/{pod_id}/datastore/files` | `file.upload` | Upload File |
+| POST | `/pods/{pod_id}/datastore/files/by-path/retry-processing` | `file.retry_processing` | Retry File Processing |
 | POST | `/pods/{pod_id}/datastore/files/folders` | `file.folder.create` | Create Folder |
 | POST | `/pods/{pod_id}/datastore/files/search` | `file.search` | Search Files |
 | POST | `/pods/{pod_id}/datastore/files/signed-url` | `file.signed_url` | Create a public, hit-capped signed URL for a file |
@@ -212,6 +212,7 @@ run `uv run python scripts/generate_route_inventory.py`.
 | GET | `/organizations/{organization_id}/invitations` | `org.invitation.list` | List Organization Invitations |
 | GET | `/organizations/{organization_id}/members` | `org.member.list` | List Organization Members |
 | GET | `/users/me` | `user.current.get` | Get Current User |
+| GET | `/users/me/email-delivery` | `user.email_delivery.get` | Get Email Delivery Status |
 | GET | `/users/me/profile` | `user.profile.get` | Get User Profile |
 | PATCH | `/organizations/{organization_id}` | `org.update` | Update Organization |
 | PATCH | `/organizations/{organization_id}/members/{member_id}/role` | `org.member.update_role` | Update Member Role |
@@ -219,6 +220,7 @@ run `uv run python scripts/generate_route_inventory.py`.
 | POST | `/organizations/invitations/{invitation_id}/accept` | `org.invitation.accept` | Accept Invitation |
 | POST | `/organizations/{organization_id}/invitations` | `org.invitation.invite` | Invite Member |
 | POST | `/organizations/{organization_id}/join` | `org.join_auto_join` | Join Auto-Join Organization |
+| POST | `/users/me/email-delivery/test` | `user.email_delivery.test` | Send A Test Email |
 | POST | `/users/me/first-workspace` | `users.ensure_first_workspace` | Ensure The Current User Has A Workspace |
 | POST | `/users/me/profile` | `user.profile.upsert` | Create or Update Profile |
 
@@ -339,5 +341,6 @@ run `uv run python scripts/generate_route_inventory.py`.
 | GET | `/workspace/files` | `workspace.files.list` | List workspace files |
 | GET | `/workspace/files:content` | `workspace.files.content` | Read workspace file content |
 | GET | `/workspace/files:stat` | `workspace.files.stat` | Stat one workspace file |
+| GET | `/workspace/status` | `workspace.status` | Whether your computer is ready |
 | POST | `/workspace/apps/browser/access` | `workspace.browser.access` | Create workspace browser access URL |
 | POST | `/workspace/browser/display-size` | `workspace.browser.resize_display` | Fit the workspace display to the pane showing it |

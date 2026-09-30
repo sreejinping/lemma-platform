@@ -158,9 +158,11 @@ fn host_processes_use_private_guest_services_without_published_infra_ports() {
         clock_keeper: Mutex::new(None),
         last_clock_error: Mutex::new(None),
         sandbox_images: Mutex::new(SandboxImageStatus::default()),
+        prepared_images: root.path().join("sandbox-images.json"),
         pending_auth: Mutex::new(None),
         pending_images: Mutex::new(None),
         cancellation: lemma_desktop_process::Cancellation::default(),
+        host_loopback: HostLoopbackState::default(),
         status: Mutex::new(Some(ManagedRuntimeStatus {
             endpoint_host: Some("192.168.64.10".into()),
             host_gateway: "192.168.64.1".into(),
@@ -187,8 +189,58 @@ fn host_processes_use_private_guest_services_without_published_infra_ports() {
         environment["LEMMA_WSL_DISTRIBUTION"],
         "LemmaRuntime-separate-installation"
     );
+    // Sandbox ports go over vsock on macOS, never over the guest's address,
+    // which needs a Local Network permission the backend is never prompted for.
+    match environment.get("WORKSPACE_LOCAL_TUNNEL_SOCKET") {
+        Some(socket) if cfg!(target_os = "macos") => {
+            assert!(
+                Path::new(socket).ends_with("local/run/service-42412.sock"),
+                "{socket}"
+            );
+        }
+        None if !cfg!(target_os = "macos") => {}
+        other => panic!("tunnel socket on the wrong platform: {other:?}"),
+    }
     assert_eq!(
         environment.values().any(|value| value.contains(":55432")),
         cfg!(target_os = "macos")
     );
+}
+
+/// The loopback relay refuses the runtime's own ports without being told, and
+/// whatever else the daemon names -- read afresh, so a port that became
+/// Lemma's after the relay started (a sharing gateway) is refused too.
+#[test]
+fn the_loopback_relay_refuses_runtime_ports_and_what_the_daemon_adds_later() {
+    let (_root, controller) = super::test_controller();
+    let ports = controller.lemma_ports();
+    let expected: std::collections::BTreeSet<u16> =
+        [8711, 3711, 55432, 56379, 53567].into_iter().collect();
+    assert_eq!(ports(), expected);
+
+    controller.set_lemma_ports(std::sync::Arc::new(|| [61000].into_iter().collect()));
+    let now = ports();
+    assert!(now.contains(&61000), "{now:?}");
+    assert!(expected.is_subset(&now));
+}
+
+/// The relay admits nothing until the daemon supplies the host-execution
+/// switch, and then follows it.
+#[test]
+fn the_loopback_relay_follows_the_host_execution_switch_and_defaults_off() {
+    let (_root, controller) = super::test_controller();
+    let enabled = controller.host_execution();
+    assert!(!enabled(), "unset must read as off");
+
+    let switch = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let read = std::sync::Arc::clone(&switch);
+    controller.set_host_execution(std::sync::Arc::new(move || {
+        read.load(std::sync::atomic::Ordering::SeqCst)
+    }));
+    assert!(
+        enabled(),
+        "a gate set after the relay was built is still read"
+    );
+    switch.store(false, std::sync::atomic::Ordering::SeqCst);
+    assert!(!enabled());
 }

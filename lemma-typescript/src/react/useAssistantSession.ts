@@ -55,6 +55,16 @@ export interface UseAssistantSessionOptions {
   /** The conversation was renamed mid-stream by the server's title generator. */
   onTitle?: (title: string, conversationId: string | null) => void;
   onError?: (error: unknown) => void;
+  /**
+   * Something the runtime wants a person to read that is neither an error nor
+   * a run status -- a model a harness no longer offers, a provider session
+   * that was lost and restarted, an image that could not be saved.
+   *
+   * The host writes these with a human sentence in them and the backend
+   * forwards them as status frames. Nothing read them, so they were written
+   * and dropped at this boundary.
+   */
+  onNotice?: (notice: string, kind: string | undefined) => void;
 }
 
 export interface CreateConversationInput {
@@ -399,6 +409,7 @@ export function useAssistantSession(options: UseAssistantSessionOptions): UseAss
     onMessage,
     onTitle,
     onError,
+    onNotice,
   } = options;
 
   const [conversationId, setConversationIdState] = useState<string | null>(externalConversationId);
@@ -431,6 +442,7 @@ export function useAssistantSession(options: UseAssistantSessionOptions): UseAss
   const onMessageRef = useRef(onMessage);
   const onTitleRef = useRef(onTitle);
   const onErrorRef = useRef(onError);
+  const onNoticeRef = useRef(onNotice);
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const consumeRef = useRef<(opts: any) => Promise<void>>(null!);
   const streamReconnectCountRef = useRef(0);
@@ -523,6 +535,10 @@ export function useAssistantSession(options: UseAssistantSessionOptions): UseAss
   useEffect(() => {
     onErrorRef.current = onError;
   }, [onError]);
+
+  useEffect(() => {
+    onNoticeRef.current = onNotice;
+  }, [onNotice]);
 
   useEffect(() => {
     statusRef.current = status;
@@ -809,6 +825,11 @@ export function useAssistantSession(options: UseAssistantSessionOptions): UseAss
     // Set where the buffer is cleared, read where the turn is reconciled.
     let unclaimedAnswer = false;
     let streamFailure: unknown = null;
+    // Whether this stream said anything. The reconnect backoff resets on it,
+    // not on the connection opening: a stream that opens and closes with
+    // nothing in it is a failure, and resetting on open retried that every
+    // second for as long as the conversation read RUNNING.
+    let deliveredEvent = false;
 
     try {
       for await (const event of readSSE(stream)) {
@@ -827,6 +848,7 @@ export function useAssistantSession(options: UseAssistantSessionOptions): UseAss
           // below, which is what the server asked for by sending this.
           continue;
         }
+        deliveredEvent = true;
         if (parsed.error) {
           const streamError = new AssistantRunError(parsed.error, parsed.errorCode, parsed.errorReason);
           setError(streamError);
@@ -888,6 +910,11 @@ export function useAssistantSession(options: UseAssistantSessionOptions): UseAss
           }
           onTitleRef.current?.(parsed.title, renamedConversationId ?? null);
         }
+        if (parsed.notice) {
+          // Not an error and not a status: the run carries on, and the person
+          // is told what happened to it.
+          onNoticeRef.current?.(parsed.notice, parsed.noticeKind);
+        }
         if (parsed.status) {
           setConversationStatus(parsed.status);
           if (!isConversationRunningStatus(parsed.status)) {
@@ -915,7 +942,12 @@ export function useAssistantSession(options: UseAssistantSessionOptions): UseAss
       if (!controller.signal.aborted) {
         const syncConversationId = streamConversationId ?? conversationId;
         if (!sawTerminalStatus && syncConversationId) {
+          if (deliveredEvent) streamReconnectCountRef.current = 0;
           while (!controller.signal.aborted) {
+            // A 401 anywhere marks the shared session signed out. Nothing this
+            // loop does can succeed after that, and it would otherwise go on
+            // asking every ten seconds for as long as the view stayed open.
+            if (client.auth?.getState().status === "unauthenticated") break;
             const latestConversation = await refreshConversation(syncConversationId);
             await loadMessages({ conversationId: syncConversationId, limit: 100 });
             if (controller.signal.aborted) break;
@@ -943,7 +975,6 @@ export function useAssistantSession(options: UseAssistantSessionOptions): UseAss
                 signal: controller.signal,
                 agent_run_id: agentRunId,
               });
-              streamReconnectCountRef.current = 0;
               return await consumeRef.current({
                 stream: newStream,
                 controller,

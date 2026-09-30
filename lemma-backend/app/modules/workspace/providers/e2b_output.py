@@ -21,9 +21,11 @@ lose output the agent had not read yet.
 
 from __future__ import annotations
 
+import asyncio
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
+from sandbox_runtime.errors import SandboxProcessNotFound
 from sandbox_runtime.protocol import (
     ProcessOutputChannel,
     ProcessOutputChunk,
@@ -41,6 +43,38 @@ _RETENTION_SECONDS = 60 * 60
 # and the reader is told, so an agent sees "output was truncated" rather than
 # silently believing it read everything.
 _MAX_CHUNKS = 4096
+#: Characters per stored chunk before its size is checked.
+_MAX_CHUNK_CHARS = 16_384
+#: Serialized bytes per stored chunk. Characters alone are not a size: JSON
+#: escapes control characters to six bytes each, and UTF-8 spends up to four on
+#: one character. With `_MAX_CHUNKS` this bounds a process's buffered output at
+#: about 80MB whatever it prints.
+_MAX_CHUNK_BYTES = 20_000
+
+
+def _encode_chunk(channel: str, text: str, sequence: int) -> str:
+    return json.dumps({"c": channel, "d": text, "n": sequence}, ensure_ascii=False)
+
+
+def _bounded_pieces(text: str) -> list[str]:
+    """``text`` split into pieces whose encoded chunk stays under the byte cap."""
+    pieces: list[str] = []
+    pending = [
+        text[start : start + _MAX_CHUNK_CHARS]
+        for start in range(0, len(text), _MAX_CHUNK_CHARS)
+    ]
+    pending.reverse()
+    while pending:
+        piece = pending.pop()
+        # Sequence 0 stands in for the real one: it is at most a few digits
+        # shorter, which the cap's slack above a full ASCII chunk absorbs.
+        oversized = len(_encode_chunk("stdout", piece, 0).encode()) > _MAX_CHUNK_BYTES
+        if oversized and len(piece) > 1:
+            middle = len(piece) // 2
+            pending.extend((piece[middle:], piece[:middle]))
+        else:
+            pieces.append(piece)
+    return pieces
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +82,14 @@ class E2BOutputBuffer:
     """Sequenced output for one process, shared across pollers and replicas."""
 
     key_prefix: str = "workspace:e2b:output:v1"
+    #: Reserving a sequence range and pushing its chunks are two round trips.
+    #: Two callbacks interleaving between them would push higher sequences
+    #: before lower ones, and a reader's cursor would step past the late ones.
+    #: Every callback for a process runs in the process holding its SDK
+    #: connection, through this buffer, so an in-process lock is enough.
+    _append_lock: asyncio.Lock = field(
+        default_factory=asyncio.Lock, compare=False, repr=False
+    )
 
     @property
     def _redis(self):
@@ -75,22 +117,32 @@ class E2BOutputBuffer:
         # index therefore skipped exactly as many chunks as were dropped, and
         # once its cursor reached the cap it matched nothing at all and the
         # process went silent to that reader for the rest of its life.
-        sequence = int(await redis.incr(self._sequence_key(process_id)))
-        payload = json.dumps(
-            {
-                "c": channel.value,
-                "d": data.decode("utf-8", errors="replace"),
-                "n": sequence,
-            }
-        )
-        pipe = redis.pipeline()
-        pipe.rpush(key, payload)
-        # Trimming here rather than on read keeps the memory bound honest even
-        # if nobody ever reads this process's output.
-        pipe.ltrim(key, -_MAX_CHUNKS, -1)
-        pipe.expire(key, _RETENTION_SECONDS)
-        pipe.expire(self._sequence_key(process_id), _RETENTION_SECONDS)
-        await pipe.execute()
+        #
+        # Split to a bounded size first. `_MAX_CHUNKS` bounds the list's length,
+        # and a length is only a memory bound if each entry is bounded too: the
+        # SDK hands over whatever it received, so one noisy process could hold
+        # 4,096 arbitrarily large chunks for as long as it kept being polled.
+        pieces = _bounded_pieces(data.decode("utf-8", errors="replace"))
+        async with self._append_lock:
+            last = int(await redis.incrby(self._sequence_key(process_id), len(pieces)))
+            # Sequences are reserved for everything, but only what the list can
+            # keep is sent: pushing more than `_MAX_CHUNKS` only for `ltrim` to
+            # drop it would make one huge callback a huge Redis write. A reader
+            # sees the dropped ones as truncation, exactly as if `ltrim` had.
+            kept = pieces[-_MAX_CHUNKS:]
+            first_kept = last - len(kept) + 1
+            payloads = [
+                _encode_chunk(channel.value, piece, first_kept + offset)
+                for offset, piece in enumerate(kept)
+            ]
+            pipe = redis.pipeline()
+            pipe.rpush(key, *payloads)
+            # Trimming here rather than on read keeps the memory bound honest
+            # even if nobody ever reads this process's output.
+            pipe.ltrim(key, -_MAX_CHUNKS, -1)
+            pipe.expire(key, _RETENTION_SECONDS)
+            pipe.expire(self._sequence_key(process_id), _RETENTION_SECONDS)
+            await pipe.execute()
 
     async def record_start(self, process_id: str) -> None:
         await self._write_state(process_id, state=ProcessState.RUNNING, exit_code=None)
@@ -142,13 +194,34 @@ class E2BOutputBuffer:
         """
         redis = self._redis
         key = self._chunks_key(process_id)
+        state_key = self._state_key(process_id)
         total = await redis.llen(key)
+        raw_state = await redis.get(state_key)
+
+        if total == 0 and raw_state is None:
+            # Nothing was ever recorded under this id. The default below is
+            # `RUNNING`, which is right for a process that has started and not
+            # yet written anything -- and wrong for one that does not exist,
+            # which it reported as running, with no output, forever. A caller
+            # polling a bad id never learned anything was wrong.
+            raise SandboxProcessNotFound(f"no process {process_id} in this sandbox")
+
+        # Being read is being wanted. The retention window is otherwise renewed
+        # only when output arrives or the state changes, so a process that ran
+        # for over an hour without printing lost both keys and read as never
+        # having existed -- a live background server reported as unknown.
+        # Renewed here, a polled process stays known for as long as someone is
+        # still asking about it.
+        pipe = redis.pipeline()
+        pipe.expire(state_key, _RETENTION_SECONDS)
+        pipe.expire(key, _RETENTION_SECONDS)
+        pipe.expire(self._sequence_key(process_id), _RETENTION_SECONDS)
+        await pipe.execute()
 
         # The list is trimmed from the left, so the absolute sequence of the
         # oldest retained chunk is however many were dropped. Tracking total
         # appends separately would be more precise; this errs toward telling
         # the reader that truncation happened.
-        raw_state = await redis.get(self._state_key(process_id))
         state, exit_code = ProcessState.RUNNING, None
         if raw_state:
             try:

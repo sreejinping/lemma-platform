@@ -11,7 +11,8 @@ would only let the two drift apart.
 | Directory | What it is |
 |---|---|
 | `lemma-backend/` | The API, the worker, and every module. Python, FastAPI, Postgres |
-| `lemma-frontend/` | The web workspace |
+| `lemma-frontend/` | The user-facing workspace |
+| `lemma-harness/` | Operator tools, auth portal and desktop web runtime |
 | `lemma-cli/`, `lemma-python/`, `lemma-typescript/` | The clients we ship |
 | `desktop/` | The desktop app and the agent host |
 | `docs/` | Documentation, indexed by [docs/README.md](docs/README.md) |
@@ -52,6 +53,21 @@ wrong interpreter does not fail with "module not found", it reports a
   product is *meant* to do, not what the code currently does.
 - **[docs/testing.md](docs/testing.md)** — the three suites, which one your
   change needs, and what gates what.
+- **Cutting a release** — [docs/versioning.md](docs/versioning.md): every
+  component moves together, the changelog entry, and the release notes in
+  `docs/release-notes/v<version>.md` that become the GitHub Release page
+  people download the app from.
+- **Desktop and the Agent Host** — the
+  [Desktop test matrix](CONTRIBUTING.md#desktop-test-matrix) says which lane a
+  change extends and which document it updates. The documents:
+  [desktop.md](docs/architecture/desktop.md) (processes, lifecycle, IPC),
+  [desktop-security.md](docs/architecture/desktop-security.md) (who counts as
+  the person at this Mac, sharing, origins, the loopback relay),
+  [desktop-host-execution.md](docs/architecture/desktop-host-execution.md)
+  (a user's commands on their own Mac, by Agent Host pairing, under Seatbelt),
+  [agent-host.md](docs/architecture/agent-host.md) (supervision, pairing, the
+  link) and [agent-host-events.md](docs/architecture/agent-host-events.md)
+  (normalized run events and golden transcripts).
 
 ## The six that get broken most
 
@@ -102,16 +118,45 @@ provider's JSON, an untyped third-party library — and then say so in a comment
 and narrow it once the data is checked. `make architecture` ratchets the count
 per module; it may fall, not rise.
 
+## Boot hooks must not scale with data
+
+A module's `api_lifespans` and `worker_lifespans` run on every replica, on
+every restart, before anything is served. Work there that walks stored data —
+a backfill over every pod schema, a repair over every row — grows with every
+pod ever created until it owns the boot, and a boot past the liveness deadline
+restarts into the same boot. Backfills go in a migration or a worker job;
+repairs happen lazily, where the thing is used. Every hook is listed with its
+reason in `lemma-backend/app/core/tests/unit/test_boot_hooks.py`, and
+`test_boot_budget_e2e.py` holds module boot to a budget against a thousand pod
+schemas.
+
+## Tools to run
+
+Through `make`, rather than calling ruff, eslint or cargo yourself: the targets
+run the version and config CI does, on the right paths.
+[CONTRIBUTING.md](CONTRIBUTING.md#local-development) has the details.
+
+| While working | Before a pull request |
+|---|---|
+| `make fix` — every safe auto-fixer, on what changed | `make quality` |
+| `make lint` — every fast linter, on what changed (`ALL=1` for everything) | `make quality-frontend` if you touched a frontend package or the SDK |
+| `make lint-python` / `-frontend` / `-rust` / `-shell` / `-ci` / `-docker` / `-docs` / `-config` | |
+
+`make help` lists every target. CodeQL runs in CI, not locally, and posts its
+findings on the pull request.
+
 ## Before opening a pull request
 
 ```bash
 make quality
 ```
 
-`make quality` is Python only, all the way down. If you touched the frontend or
-the TypeScript SDK, add `make quality-frontend` — eslint, `tsc`, the
-design-system audit and the education anchors, the four gates CI runs that
-`quality` cannot see. (`make check` is both, plus CodeQL.)
+`make quality` is Python, plus the repository-wide shell, workflow, Dockerfile,
+spelling and config lints. If you touched the frontend or the TypeScript SDK,
+add `make quality-frontend` — eslint, `tsc`, the design-system audit and the
+education anchors, the four gates CI runs that `quality` cannot see. (`make
+check` is both. CodeQL is not in it: CI runs it on the pull request and
+comments with what it found on the lines you changed.)
 
 Then the checks for the component you touched, from the table in
 `CONTRIBUTING.md`. The pull request template lists what the description needs —

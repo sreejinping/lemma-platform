@@ -14,7 +14,7 @@ both are claims about I/O that no amount of reading the code can settle.
 from __future__ import annotations
 
 import asyncio
-from collections import OrderedDict
+from app.core.bounded import BoundedDict
 from pathlib import Path
 from typing import Any
 from uuid import UUID, uuid4
@@ -94,7 +94,7 @@ class _Service(WorkspaceRuntimeBundleMixin):
         # Per-instance, so one test's remembered install cannot leak into the
         # next through the class-level cache the real service shares. Same
         # type as the subject's: the eviction it does is ordering-dependent.
-        self._installed_bundles = OrderedDict()
+        self._installed_bundles = BoundedDict(_REMEMBERED_SANDBOXES)
         self._inflight_bundles = {}
 
     def _get_manager_client(self) -> _Client:
@@ -311,13 +311,15 @@ async def test_a_deployment_with_no_bundle_does_nothing() -> None:
 
 
 async def test_the_delivery_does_not_claim_a_precondition_it_cannot_mean() -> None:
-    """`expected_sha256` is not portable, so the delivery does not use it.
+    """A first upload cannot satisfy a precondition, so it does not pass one.
 
-    The workspace runtime reads that argument as a precondition on the file
-    already at the path and answers 409 when nothing is there; E2B reads it as
-    a checksum of the outgoing bytes. Passing the digest satisfied E2B and made
-    the very first install on Docker and `lemma_local` impossible. The archive
-    is verified in the sandbox by the installer instead.
+    `expected_sha256` means the same thing on every fabric now -- a
+    precondition on the file already at the path -- but that is precisely what
+    a first install has no way to meet, because nothing is there yet. When the
+    fabrics disagreed this was worse: the digest satisfied E2B and made the
+    very first install on Docker and `lemma_local` impossible. The archive is
+    verified in the sandbox by the installer instead, which checks the bytes
+    that landed rather than the ones we believe we sent.
     """
     seen: dict[str, Any] = {}
 

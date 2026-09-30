@@ -15,6 +15,11 @@ Design notes
   session machinery without an HTTP response), so the session is resolved here
   manually — from a bearer ``Authorization`` header (CLI/SDK), the SuperTokens
   access-token cookie (browser), or an ``access_token`` query param fallback.
+* **Rejections.** The handshake is accepted *before* auth runs, and every
+  rejection is a close after accept. A close before ``accept()`` never reaches
+  a browser as a close frame — it sees the failed upgrade as 1006 and cannot
+  tell an expired session from a network drop. Auth failures close with
+  ``CLOSE_UNAUTHENTICATED`` (4401) so the client knows to refresh its token.
 * **Visibility.** At connect we snapshot the set of tables the user can read
   (``list_tables`` already filters to visible tables). RLS row scoping needs no
   database read on the hot path: each event carries ``owner_user_id`` (the row
@@ -45,7 +50,7 @@ from app.core.log.log import get_logger
 from app.core.request_context import create_inherited_task
 from app.core.pubsub.subscriber import RedisStreamReader
 from app.modules.datastore.api.dependencies import build_table_service
-from app.modules.datastore.domain.errors import DatastoreDomainError
+from app.core.domain.errors import DomainError
 from app.modules.datastore.domain.events import DATASTORE_EVENTS_STREAM
 
 logger = get_logger(__name__)
@@ -57,6 +62,10 @@ _RECORD_EVENT_PREFIX = "datastore.record."
 # Path used by ``verify_auth`` to allowlist this websocket. Kept here so the two
 # stay in sync; the security layer matches ``/pods/{uuid}/datastore/changes``.
 DATASTORE_CHANGES_WS_SUFFIX = "/datastore/changes"
+
+# The session is missing, invalid or expired: refresh the token and reconnect.
+# Same code as the browser-view socket and the SDK's datastore-changes client.
+CLOSE_UNAUTHENTICATED = 4401
 
 
 async def _resolve_session(websocket: WebSocket):
@@ -196,11 +205,19 @@ async def datastore_changes_ws(
         ),
     ),
 ) -> None:
+    # Accept before authenticating: only a close sent after accept reaches the
+    # client with its code, and the client needs 4401 to know to refresh.
+    try:
+        await websocket.accept()
+    except RuntimeError:
+        # Client disconnected before we could accept (race on connect).
+        return
+
     try:
         session = await _resolve_session(websocket)
     except TryRefreshTokenError:
         await websocket.close(
-            code=status.WS_1008_POLICY_VIOLATION,
+            code=CLOSE_UNAUTHENTICATED,
             reason="Access token expired. Refresh your session and reconnect.",
         )
         return
@@ -210,7 +227,7 @@ async def datastore_changes_ws(
             exc_info=True,
         )
         await websocket.close(
-            code=status.WS_1008_POLICY_VIOLATION,
+            code=CLOSE_UNAUTHENTICATED,
             reason="Unauthorized datastore changes websocket.",
         )
         return
@@ -236,7 +253,12 @@ async def datastore_changes_ws(
                     Permissions.DATASTORE_TABLE_READ, ResourceRef.pod(pod_id)
                 )
                 allowed_tables = await _visible_table_names(table_service, pod_id, ctx)
-    except DatastoreDomainError as exc:
+    # The base class, not DatastoreDomainError: a missing pod permission is
+    # raised by core authorization as a plain 403 DomainError. Caught as the
+    # datastore subclass only, it fell to the 1011 branch below -- a close
+    # every client retries -- so a browser watching a pod it cannot access
+    # reconnected forever instead of stopping on 4403.
+    except DomainError as exc:
         await websocket.close(
             code=_close_code_for(exc.status_code),
             reason=exc.message,
@@ -253,12 +275,6 @@ async def datastore_changes_ws(
             code=status.WS_1011_INTERNAL_ERROR,
             reason="Internal error while authorizing datastore changes websocket.",
         )
-        return
-
-    try:
-        await websocket.accept()
-    except RuntimeError:
-        # Client disconnected before we could accept (race on connect).
         return
 
     forwarder = create_inherited_task(

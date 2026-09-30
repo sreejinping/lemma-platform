@@ -42,6 +42,11 @@ pub(crate) fn readiness(config: &OperatorConfig, secrets: &BTreeMap<String, bool
             || !config.surfaces.teams_app_id.is_empty()
             || !config.surfaces.whatsapp_phone_number_id.is_empty()
         { "configured" } else { "optional" },
+        "email": if email_ready(
+            &config.email,
+            secrets.get("surfaces.resend_api_key").copied().unwrap_or(false),
+            secrets.get("email.smtp_password").copied().unwrap_or(false),
+        ) { "ready" } else { "optional" },
         "overall": if ai_ready { "ready" } else { "needs_ai_setup" },
     })
 }
@@ -87,16 +92,29 @@ impl OperatorConfigStore {
 
         let request: DiscoverRequest = serde_json::from_value(request)
             .map_err(|error| invalid(format!("invalid provider probe request: {error}")))?;
-        if request.ai.protocol == "unconfigured" {
+        let api_key = self.probe_key(&request.ai, request.api_key)?;
+        self.provider_probe
+            .discover(&request.ai, api_key.as_deref())
+    }
+
+    /// The key a probe of `ai` is sent with: the one the caller typed, none
+    /// when it sent an empty one, or the stored one when it sent nothing --
+    /// and the stored one only to the destination it was saved for.
+    pub(crate) fn probe_key(
+        &self,
+        ai: &AiProfile,
+        typed: Option<String>,
+    ) -> io::Result<Option<String>> {
+        if ai.protocol == "unconfigured" {
             return Err(invalid("choose a provider protocol first"));
         }
-        validate_ai_shape(&request.ai)?;
+        validate_ai_shape(ai)?;
 
         // The write lock pairs the destination with the vault read, off one
         // committed revision -- and that is all it is for. It used to be held
-        // across the probe below, which is an HTTP round trip to a provider
-        // the caller chose, with a timeout measured in seconds: every settings
-        // save waited behind a model list.
+        // across the probe that follows, which is an HTTP round trip to a
+        // provider the caller chose, with a timeout measured in seconds: every
+        // settings save waited behind a model list.
         let api_key = {
             let _write = self.writes.lock().expect("operator writes poisoned");
             let saved = self
@@ -104,20 +122,19 @@ impl OperatorConfigStore {
                 .lock()
                 .expect("operator config poisoned")
                 .clone();
-            match request.api_key {
+            match typed {
                 Some(value) if !value.is_empty() => Some(value),
                 // An empty string is the page saying "no key", which is
                 // legitimate for a loopback provider. Absent means "use
                 // whatever is stored".
                 Some(_) => None,
-                None => self.saved_provider_key(&saved, &request.ai)?,
+                None => self.saved_provider_key(&saved, ai)?,
             }
         };
-        if !local_no_auth(&request.ai.base_url) && api_key.is_none() {
+        if !local_no_auth(&ai.base_url) && api_key.is_none() {
             return Err(invalid("this AI provider requires an API key"));
         }
-        self.provider_probe
-            .discover(&request.ai, api_key.as_deref())
+        Ok(api_key)
     }
 
     /// Replace only the AI profile, leaving everything else exactly as it is.
@@ -167,52 +184,84 @@ impl OperatorConfigStore {
         let mut request = match update {
             OperatorConfigUpdate::Legacy(request) => *request,
             OperatorConfigUpdate::Section(patch) => {
-                let mut config = self
-                    .config
-                    .lock()
-                    .expect("operator config poisoned")
-                    .clone();
-                config.revision = patch.expected_revision;
-                let prefix = match patch.section {
-                    ConfigSection::Ai(ai) => {
-                        config.ai = ai;
-                        "ai."
-                    }
-                    ConfigSection::Integrations(integrations) => {
-                        config.integrations = integrations;
-                        "integrations."
-                    }
-                    ConfigSection::Surfaces(surfaces) => {
-                        config.surfaces = surfaces;
-                        "surfaces."
-                    }
-                };
-                let mut secrets = BTreeMap::new();
-                for (name, action) in patch.secrets {
-                    if !name.starts_with(prefix) || !SECRET_NAMES.contains(&name.as_str()) {
-                        return Err(invalid(
-                            "credential does not belong to the selected section",
-                        ));
-                    }
-                    match action {
-                        CredentialAction::Keep => {}
-                        CredentialAction::Replace { value } if value.is_empty() => {
-                            return Err(invalid(
-                                "replacement credential must not be empty; use remove",
-                            ));
-                        }
-                        CredentialAction::Replace { value } => {
-                            secrets.insert(name, Some(value));
-                        }
-                        CredentialAction::Remove => {
-                            secrets.insert(name, None);
-                        }
-                    }
+                let patch = *patch;
+                self.section_request(patch.expected_revision, vec![patch.section], patch.secrets)?
+            }
+            OperatorConfigUpdate::Sections(patch) => {
+                let patch = *patch;
+                if patch.sections.is_empty() {
+                    return Err(invalid("a settings change names at least one section"));
                 }
-                ApplyOperatorConfig { config, secrets }
+                self.section_request(patch.expected_revision, patch.sections, patch.secrets)?
             }
         };
         self.apply_locked(&mut request)
+    }
+
+    /// The whole configuration these sections produce, with each credential
+    /// held to the sections actually being saved.
+    fn section_request(
+        &self,
+        expected_revision: u64,
+        sections: Vec<ConfigSection>,
+        credentials: BTreeMap<String, CredentialAction>,
+    ) -> io::Result<ApplyOperatorConfig> {
+        let mut config = self
+            .config
+            .lock()
+            .expect("operator config poisoned")
+            .clone();
+        config.revision = expected_revision;
+        let mut prefixes = Vec::new();
+        for section in sections {
+            let prefix = match section {
+                ConfigSection::Ai(ai) => {
+                    config.ai = ai;
+                    "ai."
+                }
+                ConfigSection::Integrations(integrations) => {
+                    config.integrations = integrations;
+                    "integrations."
+                }
+                ConfigSection::Surfaces(surfaces) => {
+                    config.surfaces = surfaces;
+                    "surfaces."
+                }
+                ConfigSection::Email(email) => {
+                    config.email = email;
+                    "email."
+                }
+            };
+            if prefixes.contains(&prefix) {
+                return Err(invalid("a section can be saved only once per change"));
+            }
+            prefixes.push(prefix);
+        }
+        let mut secrets = BTreeMap::new();
+        for (name, action) in credentials {
+            if !prefixes.iter().any(|prefix| name.starts_with(prefix))
+                || !SECRET_NAMES.contains(&name.as_str())
+            {
+                return Err(invalid(
+                    "credential does not belong to the selected section",
+                ));
+            }
+            match action {
+                CredentialAction::Keep => {}
+                CredentialAction::Replace { value } if value.is_empty() => {
+                    return Err(invalid(
+                        "replacement credential must not be empty; use remove",
+                    ));
+                }
+                CredentialAction::Replace { value } => {
+                    secrets.insert(name, Some(value));
+                }
+                CredentialAction::Remove => {
+                    secrets.insert(name, None);
+                }
+            }
+        }
+        Ok(ApplyOperatorConfig { config, secrets })
     }
 
     pub(crate) fn saved_provider_key(
@@ -274,6 +323,18 @@ impl OperatorConfigStore {
             if request.config.ai.default_model.is_empty() {
                 request.config.ai.default_model = models[0].clone();
             }
+            // Only names the provider actually lists stay chosen; a model it
+            // stopped serving is simply no longer the fast or image model.
+            for chosen in [
+                &mut request.config.ai.image_model,
+                &mut request.config.ai.fast_model,
+            ] {
+                if !chosen.is_empty() && !models.contains(chosen) {
+                    return Err(invalid(format!(
+                        "model {chosen:?} was not returned by the provider"
+                    )));
+                }
+            }
             if !models.contains(&request.config.ai.default_model) {
                 return Err(invalid(format!(
                     "default model {:?} was not returned by the provider",
@@ -284,7 +345,11 @@ impl OperatorConfigStore {
             request.config.ai.last_validated_at_unix_ms = Some(current_unix_ms()?);
         } else {
             request.config.ai.last_validated_at_unix_ms = old_config.ai.last_validated_at_unix_ms;
+            // Not re-probed, so the list is the one the last probe returned,
+            // not whatever the page sent back.
+            request.config.ai.models = old_config.ai.models.clone();
         }
+        declare_image_model(&mut request.config.ai);
         validate_config(&request.config)?;
 
         let old_secrets =

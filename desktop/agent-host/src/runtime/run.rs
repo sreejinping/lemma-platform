@@ -4,7 +4,7 @@ use super::{
     AcpRunRequest, ActiveRun, Arc, AtomicBool, CANCEL_GRACE, Checkpoint, ConfigOption, Duration,
     EnvVariable, EventType, JournalCallbacks, JsonMap, McpServer, McpServerStdio, Ordering,
     OwnedSemaphorePermit, OwnedTask, PERMISSION_DECISION_TIMEOUT, ResolvedAdapter, RunSpec,
-    RunState, StreamSegments, TargetWorker, Utc, Value, adapter_failure_message,
+    RunState, SteerInbox, StreamSegments, TargetWorker, Utc, Value, adapter_failure_message,
     authentication_hint, host_directory_instructions, prepare_run_directory,
     publish_generated_images, redact_error, terminal_failure, terminal_failure_detail, watch,
 };
@@ -24,13 +24,17 @@ impl TargetWorker {
         let mcp_bridge_executable = self.mcp_bridge_executable.clone();
         let paths = self.paths.clone();
         let permissions = self.permissions.clone();
-        let events_ready = Arc::clone(&self.events_ready);
+        let events_ready = self.events_ready.clone();
         let reprobe_requested = Arc::clone(&self.reprobe_requested);
+        let clock_offset = self.clock_offset;
         let run_id = spec.agent_run_id;
+        let credential = crate::runtime::credentials::RunCredential::new(&paths.root, run_id);
+        let retire_credential = crate::runtime::credentials::RetireOnDrop(Arc::clone(&credential));
         // Captured before the task takes ownership of `adapter`, so a failure
         // can name the agent rather than describing it as an internal error.
         let adapter_name = adapter.spec.display_name.clone();
         let (cancel_tx, cancel_rx) = watch::channel(false);
+        let (steer_tx, steer_inbox) = SteerInbox::channel();
         let handle = tokio::spawn(async move {
             let _permit = permit;
             let lease_epoch = journal
@@ -44,10 +48,7 @@ impl TargetWorker {
                 RunState::Accepted,
                 &JsonMap::new(),
             )?;
-            // `poll_target` snapshots the control batch when it builds the
-            // request, so a checkpoint written a moment later waits out the
-            // whole 25s long poll. Measured at 10-24s between a command being
-            // delivered and the host reporting it accepted.
+            // Report the acceptance now rather than on the next heartbeat.
             events_ready.notify_one();
             if !spec.mcp.is_object() {
                 terminal_failure(
@@ -59,8 +60,7 @@ impl TargetWorker {
                     "the start command did not carry a run-scoped MCP configuration",
                 )?;
                 // Like the sibling failure below and the normal exit at the
-                // end. Without it this run's terminal checkpoint waits out the
-                // whole long poll -- the delay the comment above measures.
+                // end: the terminal checkpoint goes out now.
                 events_ready.notify_one();
                 return Ok(());
             }
@@ -122,18 +122,28 @@ impl TargetWorker {
                 provider_seen: AtomicBool::new(false),
                 dispatched: AtomicBool::new(false),
                 stream_segments: std::sync::Mutex::new(StreamSegments::default()),
-                events_ready: Arc::clone(&events_ready),
+                events_ready: events_ready.clone(),
             });
-            let remaining = (spec.run_deadline - Utc::now())
+            let remaining = (spec.run_deadline - (Utc::now() + clock_offset))
                 .to_std()
                 .unwrap_or(Duration::ZERO);
             // Kept behind, so the failure path below can still ask whether the
             // user pressed Stop.
             let asked_to_stop = cancel_rx.clone();
+            let agent_environment = crate::runtime::credentials::agent_environment(
+                &retire_credential.0,
+                &spec.mcp,
+                crate::acp::run_environment(&spec.mcp),
+            );
+            // Read per run, so a change in Settings applies to the next turn.
+            let own_settings = crate::config::HostConfig::load_or_create(&paths)
+                .is_ok_and(|config| config.own_settings.contains(&adapter.spec.key));
             let request = AcpRunRequest {
                 adapter,
                 run_spec: spec,
                 scratch_directory: scratch.clone(),
+                agent_environment,
+                own_settings,
                 mcp_server: Some(mcp_server),
                 can_load_session,
                 published_config_options,
@@ -141,6 +151,7 @@ impl TargetWorker {
                 permission_timeout: PERMISSION_DECISION_TIMEOUT,
                 cancel: cancel_rx,
                 cancel_grace: CANCEL_GRACE,
+                steer: steer_inbox,
             };
             let outcome =
                 tokio::time::timeout(remaining, driver.run(request, callbacks.clone())).await;
@@ -252,8 +263,8 @@ impl TargetWorker {
                 }
             }
             // However this run ended - success, failure, deadline - its
-            // terminal checkpoint is upstream-bound and must not wait for the
-            // current long poll either.
+            // terminal checkpoint is upstream-bound: wake event delivery and
+            // the link's control frame so it goes now.
             events_ready.notify_one();
             Ok(())
         });
@@ -263,6 +274,8 @@ impl TargetWorker {
                 handle: OwnedTask(handle),
                 cancel: cancel_tx,
                 kill_at: None,
+                credential,
+                steer: steer_tx,
             },
         );
     }

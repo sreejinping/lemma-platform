@@ -172,6 +172,9 @@ class ConversationResponse(BaseModel):
     output: JsonValue | None = None
     metadata: JsonObject | None = None
     is_archived: bool = False
+    #: When a person last wrote, a notification landed, or a run started or
+    #: finished here; the history list is ordered by it.
+    last_activity_at: datetime
     last_run_status: AgentRunStatus | None = None
     last_run_error: str | None = None
     last_run_error_code: str | None = None
@@ -388,6 +391,22 @@ class AgentRuntimeProfileResponse(BaseModel):
 class AgentRuntimeProfileListResponse(BaseModel):
     items: list[AgentRuntimeProfileResponse]
     default_runtime: AgentRuntimeConfig
+    # The model an owner chose for every teammate, or None when nobody has.
+    # Separate from default_runtime, which is what a run gets either way and
+    # may be a guess (the first provider) or the system model.
+    organization_default_runtime: AgentRuntimeConfig | None = None
+
+
+class SetOrganizationDefaultRuntimeRequest(BaseModel):
+    profile_id: str = Field(min_length=1)
+    # None follows the provider's own default model as it changes.
+    model_name: str | None = Field(default=None, min_length=1)
+
+
+class AgentRuntimeProfileTestResponse(BaseModel):
+    ok: bool
+    message: str
+    models: list[str] | None = None
 
 
 class CreateAgentHostRuntimeProfileRequest(BaseModel):
@@ -415,6 +434,10 @@ class CreateOpenAICompatibleRuntimeProfileRequest(BaseModel):
     description: str | None = None
     default_model_name: str | None = Field(default=None, min_length=1)
     model_names: list[str] = Field(default_factory=list)
+    # An OpenAI-compatible `/models` list rarely says which models take image
+    # input, and the catalog treats silence as "cannot"; this is how the person
+    # adding the provider says otherwise.
+    vision_model_names: list[str] = Field(default_factory=list)
     headers: dict[str, str] = Field(default_factory=dict)
     model_settings: JsonObject = Field(default_factory=dict)
 

@@ -49,7 +49,9 @@ from app.modules.agent.services.runtime_profile_creation import (
 )
 from app.modules.agent.services.runtime_system_profiles import (
     DEFAULT_SYSTEM_AGENT_RUNTIME_PROFILE_ID as DEFAULT_SYSTEM_AGENT_RUNTIME_PROFILE_ID,
+    SERVER_NO_MODEL_OPERATOR_HINT,
     SYSTEM_LEMMA_PROFILE_ID as SYSTEM_LEMMA_PROFILE_ID,
+    model_not_configured_error,
     system_lemma_profile,
     system_profile_by_id,
 )
@@ -336,13 +338,14 @@ class AgentRuntimeProfileService:
         )
         if profile is None:
             if profile_id == SYSTEM_LEMMA_PROFILE_ID:
-                raise DomainError(
-                    "No LLM model is configured on this server. "
-                    "Set LEMMA_OPENAI_API_KEY (plus LEMMA_OPENAI_BASE_URL if not OpenAI) "
-                    "or LEMMA_ANTHROPIC_API_KEY with LEMMA_DEFAULT_MODEL_TYPE=anthropic_compat.",
-                    code="model_not_configured",
-                    status_code=503,
+                # The environment variables that would fix this, for the
+                # operator; the person whose run failed is told where models
+                # are added instead.
+                logger.info(
+                    "agent.runtime_profile.model_not_configured.observed",
+                    operator_hint=SERVER_NO_MODEL_OPERATOR_HINT,
                 )
+                raise model_not_configured_error()
             archived = await self._archived_profile(
                 profile_id=profile_id,
                 organization_id=organization_id,
@@ -353,8 +356,8 @@ class AgentRuntimeProfileService:
                 # and pod defaults still pinned to this profile must say what
                 # happened instead of surfacing an opaque 500.
                 raise DomainError(
-                    f"The model {archived.name!r} was removed from this workspace. "
-                    "Pick another one, or restore it in Models settings.",
+                    f"{archived.name} was retired. Pick another model for this "
+                    "teammate, or bring it back in Settings \u2192 Models.",
                     code="runtime_profile_archived",
                     status_code=409,
                 )
@@ -509,6 +512,20 @@ def _selected_model(
     # model was later deprecated, or a swapped BYO key). Degrade gracefully to
     # the profile's own default — and then the first catalog entry — rather than
     # hard-failing every run that relies on this profile.
+    #
+    # Except for a coding agent on someone's computer. That agent has a default
+    # of its own, which is what an unpinned profile already runs on, and it is
+    # the honest fallback: the first entry of its published list is an
+    # arbitrary model the person never chose, and pinning it explicitly
+    # replaced "whatever the agent would use" with a model nobody picked.
+    if profile.harness_id is not None:
+        logger.warning(
+            "agent.runtime_profile.model_substituted.degraded",
+            profile_id=profile.id,
+            requested_model_name=model_name,
+            selected_model_name=None,
+        )
+        return None
     substitute: RuntimeModelCatalogEntry | None = None
     if requested_model_name and profile.default_model_name:
         substitute = next(

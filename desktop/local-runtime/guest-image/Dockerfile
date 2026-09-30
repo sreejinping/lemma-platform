@@ -16,6 +16,9 @@ ARG GUEST_PLATFORM=macos-aarch64
 ARG UBUNTU_KERNEL_RELEASE=6.8.0-138-generic
 
 ENV DEBIAN_FRONTEND=noninteractive
+# util-linux supplies `/usr/sbin/fstrim`, which guestd's `core.trim` runs;
+# checked below so a base image that dropped it fails here, not on a Mac.
+#
 # Keep Ubuntu's kernel, modules and generated initramfs together. WSL supplies
 # its own kernel and does not need Linux boot packages in the distribution.
 RUN apt-get update \
@@ -36,8 +39,13 @@ RUN apt-get update \
         util-linux \
     && update-alternatives --set iptables /usr/sbin/iptables-legacy \
     && update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy \
+    && test -x /usr/sbin/fstrim \
     && rm -rf /var/lib/apt/lists/*
 
+# The second module loop is what guestd's sandbox firewall loads or matches on
+# (br_netfilter, conntrack, REJECT, ip6tables). Missing, the firewall fails
+# closed and no sandbox ever starts -- better found here, at build time, than
+# on somebody's Mac.
 RUN if [ "$GUEST_PLATFORM" = macos-aarch64 ]; then \
       apt-get update \
       && apt-get install -y --no-install-recommends initramfs-tools kmod \
@@ -46,6 +54,9 @@ RUN if [ "$GUEST_PLATFORM" = macos-aarch64 ]; then \
       && printf '%s\n' rtc-pl031 virtiofs vmw_vsock_virtio_transport \
           >> /etc/initramfs-tools/modules \
       && for module in rtc-pl031 virtiofs vmw_vsock_virtio_transport; do \
+           modinfo -k "$UBUNTU_KERNEL_RELEASE" "$module" >/dev/null || exit 1; \
+         done \
+      && for module in br_netfilter xt_conntrack ipt_REJECT ip6table_filter; do \
            modinfo -k "$UBUNTU_KERNEL_RELEASE" "$module" >/dev/null || exit 1; \
          done \
       && update-initramfs -u -k "$UBUNTU_KERNEL_RELEASE" \

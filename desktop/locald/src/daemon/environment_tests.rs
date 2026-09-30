@@ -7,12 +7,15 @@
 
 use super::environment::exact_origin_regex;
 use super::sharing_environment;
-use crate::sharing::SharingMode;
+use crate::sharing::{SharingMode, WhoCanJoin};
 
 #[test]
 fn public_canonical_environment_uses_one_prefixed_secure_origin() {
-    let (backend, frontend) =
-        sharing_environment("https://lemma.example.com/", SharingMode::Public);
+    let (backend, frontend) = sharing_environment(
+        "https://lemma.example.com/",
+        SharingMode::Public,
+        WhoCanJoin::InviteOnly,
+    );
     assert_eq!(backend["API_URL"], "https://lemma.example.com/_lemma/api");
     // A tunnel serves one origin and no app host, so the deployment must
     // stop advertising one. Left set, every app's URL pointed at
@@ -44,8 +47,11 @@ fn public_canonical_environment_uses_one_prefixed_secure_origin() {
 
 #[test]
 fn lan_canonical_environment_keeps_host_only_nonsecure_cookies() {
-    let (backend, frontend) =
-        sharing_environment("http://192.168.1.20:51234", SharingMode::LocalNetwork);
+    let (backend, frontend) = sharing_environment(
+        "http://192.168.1.20:51234",
+        SharingMode::LocalNetwork,
+        WhoCanJoin::InviteOnly,
+    );
     assert_eq!(backend["SESSION_COOKIE_SECURE"], "false");
     assert_eq!(backend["SESSION_COOKIE_DOMAIN"], "");
     assert_eq!(frontend["NEXT_PUBLIC_SESSION_TOKEN_DOMAIN"], "");
@@ -69,7 +75,7 @@ fn sharing_raises_the_abuse_controls_the_local_pack_turns_off() {
         ("https://lemma.example.com", SharingMode::Public),
         ("http://192.168.1.20:51234", SharingMode::LocalNetwork),
     ] {
-        let (backend, _) = sharing_environment(origin, mode);
+        let (backend, _) = sharing_environment(origin, mode, WhoCanJoin::InviteOnly);
         assert_eq!(
             backend["AUTH_ABUSE_PROTECTION_ENABLED"], "true",
             "{origin} is reachable by someone other than this Mac"
@@ -91,4 +97,62 @@ fn sharing_raises_the_abuse_controls_the_local_pack_turns_off() {
             "{origin} must not answer strangers with tracebacks"
         );
     }
+}
+
+/// The join policy reaches the backend as `SIGNUP_MODE`, in both directions.
+///
+/// Invite-only is also the backend's own default on Desktop, so leaving the
+/// key out for that case would look equivalent -- until the default moved.
+/// Written explicitly either way, so the overlay is the one place that decides.
+#[test]
+fn sharing_tells_the_backend_who_may_create_an_account() {
+    for mode in [SharingMode::Public, SharingMode::LocalNetwork] {
+        let (invite_only, _) =
+            sharing_environment("https://lemma.example.com", mode, WhoCanJoin::InviteOnly);
+        assert_eq!(invite_only["SIGNUP_MODE"], "invite_only", "{mode:?}");
+        let (open, _) = sharing_environment("https://lemma.example.com", mode, WhoCanJoin::Open);
+        assert_eq!(open["SIGNUP_MODE"], "open", "{mode:?}");
+    }
+}
+
+/// `ENVIRONMENT` stays `local` while shared, so the backend is told outright.
+#[test]
+fn every_shared_mode_tells_the_backend_it_is_shared() {
+    for (origin, mode) in [
+        ("http://192.168.1.20:51234", SharingMode::LocalNetwork),
+        ("https://lemma.example.com", SharingMode::Public),
+    ] {
+        for who in [WhoCanJoin::InviteOnly, WhoCanJoin::Open] {
+            let (backend, _) = sharing_environment(origin, mode, who);
+            assert_eq!(
+                backend.get("INSTALLATION_SHARED").map(String::as_str),
+                Some("true")
+            );
+        }
+    }
+}
+
+/// Activation commits only once a sign-in could actually start.
+#[test]
+fn activation_requires_the_api_and_a_live_altcha_challenge() {
+    use super::environment::{activation_probe_passed, ACTIVATION_PROBES};
+    let [page, api] = ACTIVATION_PROBES;
+    assert!(api.starts_with("/_lemma/api/auth/altcha/challenge"));
+    assert!(activation_probe_passed(page, 200, "window.__LEMMA__ = {}"));
+    assert!(!activation_probe_passed(page, 503, ""));
+    assert!(activation_probe_passed(
+        api,
+        200,
+        r#"{"enabled":true,"challenge":"x"}"#
+    ));
+    // The failure C1 produced: a challenge endpoint that refuses for want of a key.
+    assert!(!activation_probe_passed(
+        api,
+        503,
+        r#"{"detail":"unavailable"}"#
+    ));
+    // A backend that never picked the overlay up.
+    assert!(!activation_probe_passed(api, 200, r#"{"enabled":false}"#));
+    // An ngrok interstitial is HTML, not a challenge.
+    assert!(!activation_probe_passed(api, 200, "<!DOCTYPE html><html>"));
 }

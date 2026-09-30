@@ -93,12 +93,22 @@ class AgentHostModel(UUIDAuditBase):
     )
     protocol_version: Mapped[int | None] = mapped_column(nullable=True)
     host_release: Mapped[str] = mapped_column(String(128), nullable=False)
+    # The host's run slots, and under ``host_execution`` whether it runs its
+    # owner's Lemma commands on the machine itself. See
+    # docs/architecture/desktop-host-execution.md §2.
     capacity: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
     last_seen_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     revoked_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
+    )
+    # Which link owns this host. Every accepted ``hello`` takes the next value,
+    # and a link closes 4409 once it learns a greater one exists -- so two
+    # handshakes racing on different replicas agree on a winner instead of
+    # each reading the other's announcement as newer and both closing.
+    link_generation: Mapped[int] = mapped_column(
+        BigInteger, nullable=False, default=0, server_default=text("0")
     )
 
     user: Mapped[Any] = relationship("User", foreign_keys=[user_id])
@@ -126,7 +136,9 @@ class AgentHostHarnessModel(UUIDAuditBase):
     adapter_version: Mapped[str] = mapped_column(String(128), nullable=False)
     upstream_version: Mapped[str | None] = mapped_column(String(128), nullable=True)
     health: Mapped[str] = mapped_column(String(64), nullable=False)
-    capabilities: Mapped[dict] = mapped_column(JSONB, nullable=False, default=dict)
+    capabilities: Mapped[dict[str, object]] = mapped_column(
+        JSONB, nullable=False, default=dict
+    )
     config_revision: Mapped[str] = mapped_column(String(255), nullable=False)
     config_options: Mapped[list] = mapped_column(JSONB, nullable=False, default=list)
     stale_after: Mapped[datetime] = mapped_column(

@@ -16,6 +16,7 @@ from sqlalchemy import func, select
 
 from app.core.api.dependencies import get_uow_factory
 from app.core.config import settings
+from app.core.email.email_sender import email_delivery_state
 from app.core.infrastructure.db.uow_factory import UnitOfWorkFactory
 from app.core.log.log import get_logger
 from app.modules.identity.contracts.onboarding import email_challenge_service
@@ -44,6 +45,11 @@ from app.modules.identity.services.email_challenges import (
 from app.modules.identity.services.verified_accounts import complete_verified_account
 
 logger = get_logger(__name__)
+
+EMAIL_CODE_NOT_CONFIGURED_MESSAGE = (
+    "Email isn't set up on this Lemma, so a sign-in code can't be sent. "
+    "Use a password instead."
+)
 
 router = APIRouter(prefix="/auth/email-code", tags=["Auth"], include_in_schema=False)
 _COOKIE = "lemma_email_login_nonce"
@@ -137,17 +143,44 @@ ContinueResponse = Annotated[
 
 
 def _require_origin(request: Request) -> None:
+    def canonical_origin(value: str) -> str | None:
+        try:
+            parsed = urlsplit(value)
+            if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+                return None
+            port = parsed.port
+        except ValueError:
+            return None
+        scheme = parsed.scheme.lower()
+        if port == (443 if scheme == "https" else 80 if scheme == "http" else None):
+            port = None
+        hostname = parsed.hostname.lower()
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
+        authority = hostname if port is None else f"{hostname}:{port}"
+        return f"{scheme}://{authority}"
+
     allowed = {
-        f"{parsed.scheme}://{parsed.netloc}"
+        origin
         for value in (settings.auth_frontend_url, settings.frontend_url)
-        if (parsed := urlsplit(value)).scheme and parsed.netloc
+        if (origin := canonical_origin(value)) is not None
     }
-    if request.headers.get("origin") not in allowed:
+    if canonical_origin(request.headers.get("origin", "")) not in allowed:
         raise HTTPException(
-            status_code=403, detail="Open email login from Lemma's auth page"
+            status_code=403,
+            detail={
+                "code": "EMAIL_LOGIN_ORIGIN_NOT_ALLOWED",
+                "message": "This email sign-in page is not configured for this service. Open Lemma's auth page and try again.",
+            },
         )
     if request.headers.get("content-type", "").split(";", 1)[0] != "application/json":
-        raise HTTPException(status_code=415, detail="JSON is required")
+        raise HTTPException(
+            status_code=415,
+            detail={
+                "code": "EMAIL_LOGIN_CONTENT_TYPE_REQUIRED",
+                "message": "Email sign-in requires a JSON request.",
+            },
+        )
 
 
 def _binding(request: Request, nonce: str) -> str:
@@ -155,7 +188,11 @@ def _binding(request: Request, nonce: str) -> str:
     cookie = request.cookies.get(_COOKIE, "")
     if not cookie or not hmac.compare_digest(cookie, nonce):
         raise HTTPException(
-            status_code=403, detail="Login expired; start again in this browser"
+            status_code=403,
+            detail={
+                "code": "EMAIL_LOGIN_EXPIRED",
+                "message": "Login expired; start again in this browser.",
+            },
         )
     return cookie
 
@@ -164,10 +201,16 @@ def _challenge_error(error: ChallengeRejected | RateLimitExceeded) -> HTTPExcept
     if isinstance(error, RateLimitExceeded):
         return HTTPException(
             status_code=429,
-            detail="Too many code requests; try again later",
+            detail={
+                "code": "EMAIL_CODE_RATE_LIMITED",
+                "message": "Too many code requests; try again later",
+            },
             headers={"Retry-After": str(error.retry_after_seconds)},
         )
-    return HTTPException(status_code=400, detail=error.message)
+    return HTTPException(
+        status_code=400,
+        detail={"code": error.code, "message": error.message},
+    )
 
 
 async def meter_method_lookup(request: Request, email: str) -> None:
@@ -272,6 +315,14 @@ async def _method_for(
             # correcting a typo. If a live challenge really is still in the way,
             # `start_challenge` refuses next and says it in words they can act on.
             logger.info("identity.email_login.abandon_ignored")
+    # Before a challenge is minted, so nobody is left waiting for a code that
+    # has nowhere to go -- a Lemma Desktop nobody has set email up on. The
+    # answer is the same for every address that reaches here, so it says
+    # nothing about accounts.
+    if email_delivery_state() == "not_configured":
+        raise ChallengeRejected(
+            EMAIL_CODE_NOT_CONFIGURED_MESSAGE, code="EMAIL_NOT_CONFIGURED"
+        )
     receipt = await challenges.start_challenge(
         email=email,
         binding=binding,
@@ -303,14 +354,24 @@ async def continue_email_login(
         # About the address itself, not about any account behind it -- so this
         # is a syntax answer and discloses nothing.
         raise HTTPException(
-            status_code=400, detail="Enter a valid email address"
+            status_code=400,
+            detail={
+                "code": "EMAIL_LOGIN_INVALID_EMAIL",
+                "message": "Enter a valid email address",
+            },
         ) from error
     try:
         await limits(request, email)
     except RateLimitExceeded as error:
         raise _challenge_error(error) from error
     except AltchaRejected as error:
-        raise HTTPException(status_code=400, detail=str(error)) from error
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "code": "EMAIL_LOGIN_PROOF_REJECTED",
+                "message": str(error),
+            },
+        ) from error
 
     try:
         answer = await _method_for(

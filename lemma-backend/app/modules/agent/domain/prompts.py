@@ -31,6 +31,9 @@ _AGENT_BASE_PROMPT_PATH = _PROMPT_DIR / "agent_base.md"
 _CONNECTORS_PROMPT_PATH = _PROMPT_DIR / "connectors.md"
 _REPLIES_PROMPT_PATH = _PROMPT_DIR / "replies.md"
 _WORKSPACE_CLI_PROMPT_PATH = _PROMPT_DIR / "workspace_cli.md"
+_WORKSPACE_CLI_HOST_EXECUTION_PROMPT_PATH = (
+    _PROMPT_DIR / "workspace_cli_host_execution.md"
+)
 _POD_PROMPT_PATH = _PROMPT_DIR / "pod.md"
 _SKILLS_PROMPT_PATH = _PROMPT_DIR / "skills.md"
 _WEB_SEARCH_PROMPT_PATH = _PROMPT_DIR / "web_search.md"
@@ -40,6 +43,7 @@ _SPEECH_PROMPT_PATH = _PROMPT_DIR / "speech.md"
 _MESSAGING_PROMPT_PATH = _PROMPT_DIR / "messaging.md"
 _USER_INTERACTION_PROMPT_PATH = _PROMPT_DIR / "user_interaction.md"
 _AGENT_HOST_RUNTIME_PROMPT_PATH = _PROMPT_DIR / "agent_host_runtime.md"
+_AGENT_HOST_HOST_EXECUTION_PROMPT_PATH = _PROMPT_DIR / "agent_host_host_execution.md"
 
 # Per-toolset prompt fragments, in the order they should appear in the system
 # prompt. A toolset is listed here if it carries usage guidance, whether or not
@@ -123,8 +127,26 @@ def load_replies_prompt() -> str:
     return _read_required_prompt(_REPLIES_PROMPT_PATH)
 
 
-def load_workspace_cli_prompt() -> str:
-    return _read_required_prompt(_WORKSPACE_CLI_PROMPT_PATH)
+def load_workspace_cli_prompt(*, host_execution: bool = False) -> str:
+    """The workspace tools' contract, for the machine the commands run on.
+
+    With ``host_execution`` the sections that describe the VM -- a persistent
+    home, `/tmp`, the preinstalled libraries and `lit` -- are replaced by the
+    ones in ``workspace_cli_host_execution.md``, which describe the user's Mac
+    under host execution (docs/architecture/desktop-host-execution.md §6).
+    Sections the two share are kept once, so they cannot drift apart.
+    """
+    base = _read_required_prompt(_WORKSPACE_CLI_PROMPT_PATH)
+    if not host_execution:
+        return base
+    replacements = _prompt_sections(
+        _read_required_prompt(_WORKSPACE_CLI_HOST_EXECUTION_PROMPT_PATH),
+        heading="## ",
+    )
+    return "\n\n".join(
+        replacements.get(title, body).strip()
+        for title, body in _prompt_sections(base, heading="## ").items()
+    )
 
 
 def load_pod_prompt() -> str:
@@ -174,9 +196,36 @@ def load_memory_prompt() -> str:
     return _read_required_prompt(_MEMORY_PROMPT_PATH)
 
 
-def load_agent_host_runtime_prompt() -> str:
-    """Runtime guidance for a run driven through Agent Host (remote harness)."""
-    return _read_required_prompt(_AGENT_HOST_RUNTIME_PROMPT_PATH)
+def load_agent_host_runtime_prompt(*, host_execution: bool = False) -> str:
+    """Runtime guidance for a run driven through Agent Host (remote harness).
+
+    With ``host_execution`` the ``# Runtime`` and ``# Browser`` sections are
+    replaced by the ones in ``agent_host_host_execution.md``: that run has no
+    Lemma command tools (docs/architecture/desktop-host-execution.md §7), so
+    the sections telling it to use them would send it to tools that are not
+    there. Every other section is shared, so the two cannot drift apart.
+    """
+    base = _read_required_prompt(_AGENT_HOST_RUNTIME_PROMPT_PATH)
+    if not host_execution:
+        return base
+    replacements = _prompt_sections(
+        _read_required_prompt(_AGENT_HOST_HOST_EXECUTION_PROMPT_PATH)
+    )
+    return "\n\n".join(
+        replacements.get(title, body).strip()
+        for title, body in _prompt_sections(base).items()
+    )
+
+
+def _prompt_sections(text: str, *, heading: str = "# ") -> dict[str, str]:
+    """A Markdown prompt's sections at one heading level, by title, in order."""
+    sections: dict[str, str] = {}
+    title = ""
+    for line in text.splitlines(keepends=True):
+        if line.startswith(heading):
+            title = line[len(heading) :].strip()
+        sections[title] = sections.get(title, "") + line
+    return sections
 
 
 def load_toolset_fragment(toolset: AgentToolset) -> str | None:
@@ -193,11 +242,39 @@ def build_agent_instructions(
     include_toolset_prompts: bool = True,
     runs_as_remote_process: bool = False,
 ) -> str:
+    """The whole system prompt as one string; see `build_agent_instruction_parts`."""
+    stable, per_conversation = build_agent_instruction_parts(
+        agent=agent,
+        conversation=conversation,
+        ctx=ctx,
+        include_toolset_prompts=include_toolset_prompts,
+        runs_as_remote_process=runs_as_remote_process,
+    )
+    return _SEPARATOR.join(part for part in (stable, per_conversation) if part)
+
+
+_SEPARATOR = "\n\n---\n\n"
+
+
+def build_agent_instruction_parts(
+    *,
+    agent: Agent,
+    conversation: Conversation,
+    ctx: AgentContext,
+    include_toolset_prompts: bool = True,
+    runs_as_remote_process: bool = False,
+) -> tuple[str, str]:
     """Compose the full system prompt for an agent run.
 
-    Layering: base prompt (pod-default vs user-agent) → reply discipline →
-    per-toolset fragments → agent instruction → conversation instructions →
-    runtime context brief.
+    Returned in two parts: what is the same for every conversation with this
+    agent (base prompt, reply discipline, per-toolset fragments, the agent's
+    own instruction), and what belongs to this conversation and this run
+    (working directory, conversation instructions, runtime brief, the open
+    doc, the task list). A provider caches the literal prefix, so the split is
+    the cache boundary: the in-process harness puts the capability guidance
+    between the two, which keeps that large and unchanging block inside the
+    prefix a new conversation can reuse, rather than behind a working
+    directory that differs in every conversation.
 
     ``include_toolset_prompts`` controls whether the per-toolset fragments are
     folded in here. The in-process LEMMA harness passes ``False`` because those
@@ -220,7 +297,7 @@ def build_agent_instructions(
         sections.append(load_agent_base_prompt())
 
     # Unconditional, on both harness paths: reply discipline is not a toolset.
-    # A surface run narrows this further -- ``platform_agent_guidance`` appends
+    # A surface run narrows this further -- ``surface_platform_guidance`` appends
     # its own ``soft_char_limit`` below -- but a run with no surface platform
     # would otherwise be told nothing at all about length or narration.
     sections.append(load_replies_prompt())
@@ -234,17 +311,17 @@ def build_agent_instructions(
 
         # Per-platform surface guidance for remote harnesses (which have no
         # capability layer). The in-process LEMMA harness passes
-        # include_toolset_prompts=False and gets this from SurfacePlatformCapability
-        # instead, so this never double-injects. Imported where it is used so the
-        # prompt layer, which every run loads, does not carry the platform tables
-        # a surface run needs.
+        # include_toolset_prompts=False and gets the same text from
+        # SurfacePlatformCapability instead, so this never double-injects.
+        # Imported where it is used so the prompt layer, which every run loads,
+        # does not carry the platform tables a surface run needs.
         surface_platform = getattr(ctx, "surface_platform", None)
         if surface_platform:
-            from app.modules.agent_surfaces.contracts.platforms import (
-                platform_agent_guidance,
+            from app.modules.agent.domain.surface_prompts import (
+                surface_platform_guidance,
             )
 
-            fragment = platform_agent_guidance(surface_platform)
+            fragment = surface_platform_guidance(surface_platform)
             if fragment:
                 sections.append(fragment)
 
@@ -256,7 +333,11 @@ def build_agent_instructions(
     # Native agents also have a host cwd, resolved by Agent Host at dispatch.
     # Keep the sandbox path scoped to its tools so neither path masquerades as
     # a mount that does not exist.
-    sections.extend(
+    if agent.instruction.strip():
+        sections.append("# Agent Instructions\n" + agent.instruction.strip())
+
+    stable = sections
+    sections = list(
         _directory_sections(
             ctx=ctx,
             conversation=conversation,
@@ -264,9 +345,6 @@ def build_agent_instructions(
             runs_as_remote_process=runs_as_remote_process,
         )
     )
-
-    if agent.instruction.strip():
-        sections.append("# Agent Instructions\n" + agent.instruction.strip())
     if conversation.instructions and conversation.instructions.strip():
         sections.append(
             "# Conversation Instructions\n" + conversation.instructions.strip()
@@ -276,6 +354,11 @@ def build_agent_instructions(
     context_brief = getattr(ctx, "context_brief", None)
     if isinstance(context_brief, str) and context_brief.strip():
         sections.append(context_brief.strip())
+    # The doc this conversation is attached to, read fresh this run. After the
+    # brief because it changes whenever the doc does, which is most turns.
+    attached_document = getattr(ctx, "attached_document", None)
+    if isinstance(attached_document, str) and attached_document.strip():
+        sections.append(attached_document.strip())
 
     # The task list the conversation already has, if any. Without this a run
     # starts blind: the list lives in conversation metadata, and the tool return
@@ -290,8 +373,9 @@ def build_agent_instructions(
     # update; anything behind it would not. Appended unconditionally; the join
     # below drops it when it is empty.
     sections.append(_task_list_section(conversation, enabled=enabled))
-    return "\n\n---\n\n".join(
-        section.strip() for section in sections if section.strip()
+    return (
+        _SEPARATOR.join(section.strip() for section in stable if section.strip()),
+        _SEPARATOR.join(section.strip() for section in sections if section.strip()),
     )
 
 

@@ -17,6 +17,10 @@ from app.modules.agent.domain.agent_host_selections import (
     validate_agent_host_model,
     validate_agent_host_selections,
 )
+from app.modules.agent.domain.organization_default import (
+    is_marked_default,
+    without_default_mark,
+)
 from app.modules.agent.domain.sentinels import UNSET, UnsetType
 from app.modules.agent.domain.runtime_profiles import (
     AgentRuntimeProfile,
@@ -399,26 +403,30 @@ class AgentRuntimeProfileEditor:
         """
         secret = patch.api_secret()
         discovery_url = str(patch.base_url or "https://api.anthropic.com")
-        async with connection_released(self._session()):
-            discovered = (
-                await discovery._discover_anthropic_compatible_models(
-                    base_url=discovery_url,
-                    api_key=str(secret or ""),
-                    headers=patch.headers,
+        try:
+            async with connection_released(self._session()):
+                discovered = (
+                    await discovery._discover_anthropic_compatible_models(
+                        base_url=discovery_url,
+                        api_key=str(secret or ""),
+                        headers=patch.headers,
+                    )
+                    if is_anthropic
+                    else await discovery._discover_openai_compatible_models(
+                        base_url=discovery_url,
+                        api_key=secret,
+                        headers=patch.headers,
+                    )
                 )
-                if is_anthropic
-                else await discovery._discover_openai_compatible_models(
-                    base_url=discovery_url,
-                    api_key=secret,
-                    headers=patch.headers,
-                )
-            )
+        except discovery.ProviderKeyRejectedError as exc:
+            raise ValueError(discovery.key_rejected_message(profile.name)) from exc
         return discovery._provider_model_catalog(
             discovered_models=discovered,
             fallback_model_names=resolve_catalog_names(
                 profile, model_names, discovered
             ),
             default_vision=is_anthropic,
+            provider_name=profile.name,
         )
 
     async def archive_profile(
@@ -473,6 +481,11 @@ class AgentRuntimeProfileEditor:
         assert self._service.repository is not None
         if profile.status is status:
             return profile
+        if status is not RuntimeProfileStatus.ACTIVE and is_marked_default(profile):
+            # An archived profile is no longer what teammates run on. Dropping
+            # the mark in the same transaction means restoring it later does
+            # not silently make it the default again.
+            await self._service.repository.update(without_default_mark(profile))
         updated = await self._service.repository.set_status(
             profile_id=profile_id,
             organization_id=organization_id,

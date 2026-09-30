@@ -24,7 +24,7 @@ impl HostProcess {
         let paths = lemma_agent_host::config::HostPaths::under(root);
         paths.ensure().unwrap();
         let installation_id = Uuid::new_v4().to_string();
-        let target = lemma_agent_host::api::TargetClient::pair(
+        let target = lemma_agent_host::link::pair(
             control.base_url.clone(),
             "hermetic-pairing-code-with-entropy",
             "Hermetic host",
@@ -34,6 +34,8 @@ impl HostProcess {
         .await
         .unwrap();
         lemma_agent_host::config::HostConfig {
+            legacy_host_execution: false,
+            own_settings: std::collections::BTreeSet::default(),
             installation_id,
             targets: vec![target],
             max_runs: 1,
@@ -128,7 +130,7 @@ impl InProcessHost {
             std::os::unix::fs::symlink(adapter_source, &paths.adapters).unwrap();
         }
         let installation_id = Uuid::new_v4().to_string();
-        let target = lemma_agent_host::api::TargetClient::pair(
+        let target = lemma_agent_host::link::pair(
             control.base_url.clone(),
             "real-pairing-code-with-entropy",
             "Real host",
@@ -138,6 +140,8 @@ impl InProcessHost {
         .await
         .unwrap();
         let config = lemma_agent_host::config::HostConfig {
+            legacy_host_execution: false,
+            own_settings: std::collections::BTreeSet::default(),
             installation_id,
             targets: vec![target],
             max_runs: 1,

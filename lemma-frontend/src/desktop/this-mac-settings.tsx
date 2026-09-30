@@ -1,0 +1,400 @@
+"use client";
+
+import "@/styles/desktop.css";
+import { useEffect, useState, type ReactNode } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { isLocalDeployment } from "@/site/config";
+import { ComputerIcon, DownloadIcon, RefreshIcon, TerminalIcon, WarningIcon } from "@/ui/icons";
+import { useDesktopBridge } from "./bridge";
+import { openExternal } from "./open-external";
+import { openSettings } from "./open-settings";
+import { capitalised, useThisComputer } from "./this-computer";
+import { ThisComputerAgents, ThisComputerCard } from "./this-computer-card";
+import { readStatus, useAgentHost } from "./agent-host";
+import { hostExecutionError, hostExecutionSwitch } from "./this-mac";
+import {
+    RELEASES_PAGE, channelLine, friendlyError, healthDetail, stuckStarting, healthLine, healthState, onLocalWorkspaceOrigin, updateProblem,
+    sandboxWording, updateOffer, sharingBusy, startupWarningLine, thisMac, thisMacAvailability,
+    type StartupWarning, type ThisMacAvailability, type ThisMacSnapshot,
+} from "./this-mac";
+import { ThisMacSharing } from "./this-mac-sharing";
+import { ThisMacServerSetup } from "./this-mac-setup";
+import { SearchReadinessRow } from "./search-readiness";
+import { DiskUsageRows } from "./disk-usage";
+import { downloadedSoFar } from "./sandbox-images";
+import { needsSetup, capabilityStatus, CAPABILITIES } from "./server-setup";
+
+/** Settings → This Mac: the settings a person changes about their own
+ *  computer, in the same Settings as everything else.
+ *
+ *  They used to be a separate window with its own look and its own words —
+ *  "System AI profile", "Channels", environment names — reached from a menu
+ *  most people never opened. What is left of that window is what has to work
+ *  when this page cannot load: health, recovery and diagnostics.
+ *
+ *  Shown only in the app's own window, on a local install's loopback origin.
+ *  The shell checks where every command comes from anyway
+ *  (`workspace_settings.rs`); the gate here is so nobody is shown a machine's
+ *  settings they cannot use. */
+
+export type ThisMacSection = "this-mac" | "this-mac-setup" | "this-mac-agents" | "this-mac-sharing" | "this-mac-updates" | "this-mac-advanced";
+
+export const THIS_MAC_SECTIONS: readonly ThisMacSection[] = [
+    "this-mac", "this-mac-setup", "this-mac-agents", "this-mac-sharing", "this-mac-updates", "this-mac-advanced",
+];
+
+export function isThisMacSection(section: string): section is ThisMacSection {
+    return (THIS_MAC_SECTIONS as readonly string[]).includes(section);
+}
+
+export function useThisMacAvailability(): ThisMacAvailability {
+    const bridge = useDesktopBridge();
+    /* Read after mount: the server has no hostname to compare, and a group
+       that appears one commit later is better than one the server invented. */
+    const [localOrigin, setLocalOrigin] = useState<boolean | null>(null);
+    useEffect(() => setLocalOrigin(onLocalWorkspaceOrigin()), []);
+    return thisMacAvailability({ bridge, localDeployment: isLocalDeployment(), localOrigin });
+}
+
+/** The daemon's picture of this installation. Polled quickly while sharing is
+ *  changing — the enable returns at its first progress report and carries on
+ *  — and slowly otherwise, so health on the Overview stays true. */
+export function useThisMacSnapshot() {
+    return useQuery({
+        queryKey: ["this-mac"],
+        queryFn: () => thisMac.snapshot(),
+        refetchInterval: (query) => (sharingBusy(query.state.data?.sharing ?? null) ? 1_500 : 15_000),
+        retry: 1,
+    });
+}
+
+function Loading({ snapshot, children }: { snapshot: ReturnType<typeof useThisMacSnapshot>; children: (data: ThisMacSnapshot) => ReactNode }) {
+    if (snapshot.isPending) return <p className="empty-row" role="status">Reading this computer’s settings…</p>;
+    if (snapshot.isError) {
+        return (
+            <div className="thismac-problem" role="alert">
+                <p>{friendlyError(snapshot.error)}</p>
+                <button className="btn" onClick={() => void snapshot.refetch()}><RefreshIcon size={13} /> Try again</button>
+            </div>
+        );
+    }
+    return <>{children(snapshot.data)}</>;
+}
+
+/** One setting: its name, its one line of consequence, and its control. */
+export function SettingRow({ name, consequence, children, id }: { name: string; consequence?: ReactNode; children?: ReactNode; id?: string }) {
+    return (
+        <div className="thismac-row" id={id}>
+            <div className="thismac-row__text">
+                <span className="thismac-row__name">{name}</span>
+                {consequence && <span className="thismac-row__said">{consequence}</span>}
+            </div>
+            {children && <div className="thismac-row__control">{children}</div>}
+        </div>
+    );
+}
+
+/* ── overview ──────────────────────────────────────────────────────── */
+
+function Overview() {
+    const noun = useThisComputer();
+    const queryClient = useQueryClient();
+    const snapshot = useThisMacSnapshot();
+    const update = useQuery({ queryKey: ["this-mac-update"], queryFn: () => thisMac.checkUpdate(), staleTime: 10 * 60_000, retry: 0 });
+    const [said, setSaid] = useState<string | null>(null);
+
+    const login = useMutation({
+        mutationFn: (enabled: boolean) => thisMac.setStartAtLogin(enabled),
+        onSuccess: (enabled) => queryClient.setQueryData<ThisMacSnapshot>(["this-mac"], (was) => was && { ...was, app: { ...was.app, start_at_login: enabled } }),
+        onError: (problem) => setSaid(friendlyError(problem)),
+    });
+    const repair = useMutation({
+        mutationFn: () => thisMac.repair(),
+        onSuccess: (ran) => setSaid(ran ? "Lemma is downloading its runtime again and will restart when it is done." : null),
+        onError: (problem) => setSaid(friendlyError(problem)),
+    });
+    const logs = useMutation({ mutationFn: () => thisMac.openLogs(), onError: (problem) => setSaid(friendlyError(problem)) });
+    const startingSince = useStartingSince(snapshot.data ?? null);
+
+    return (
+        <Loading snapshot={snapshot}>
+            {(data) => {
+                const state = healthState(data);
+                return (
+                    <div className="thismac">
+                        <p className={"thismac-health thismac-health--" + state} role="status">
+                            <i aria-hidden="true" />
+                            {healthLine(data, update.data ?? null)}
+                        </p>
+                        <StartupWarnings warnings={data.warnings ?? []} onLogs={() => { setSaid(null); logs.mutate(); }} />
+                        {stuckStarting(data, startingSince, Date.now()) && (
+                            <p className="thismac-said thismac-said--bad" role="alert">
+                                {stuckStarting(data, startingSince, Date.now())} Open the logs to see why, or quit and reopen Lemma.
+                            </p>
+                        )}
+                        {healthDetail(data) && (
+                            <p className="thismac-said thismac-said--bad" role="alert">
+                                {healthDetail(data)} Quit and reopen Lemma to restart it, or use Lemma → Recovery… in the menu bar.
+                            </p>
+                        )}
+                        <SettingRow name="Start at login" consequence={`Lemma opens when you sign in to ${noun}, so conversations and channels keep answering.`}>
+                            <input
+                                type="checkbox"
+                                className="thismac-switch"
+                                role="switch"
+                                aria-label="Start at login"
+                                checked={data.app.start_at_login}
+                                disabled={login.isPending}
+                                onChange={(event) => { setSaid(null); login.mutate(event.target.checked); }}
+                            />
+                        </SettingRow>
+                        {/* Only where the shell can do it: a bundled or older runtime
+                            has nothing it could download to replace itself with. */}
+                        {data.app.repair_available && (
+                            <SettingRow name="Repair" consequence="Downloads Lemma’s runtime again (this needs internet) and restarts Lemma. Your pods, files and accounts are not touched.">
+                                <button className="btn" disabled={repair.isPending} onClick={() => { setSaid(null); repair.mutate(); }}>
+                                    {repair.isPending ? "Repairing…" : "Verify & repair"}
+                                </button>
+                            </SettingRow>
+                        )}
+                        <SettingRow name="Logs" consequence="What Lemma wrote while it ran, for when something needs explaining.">
+                            <button className="linkish" onClick={() => { setSaid(null); logs.mutate(); }}><TerminalIcon size={13} /> Open logs</button>
+                        </SettingRow>
+                        <SettingRow name="Server setup" consequence={setupSummary(data)}>
+                            <button className="btn" onClick={() => openSettings("this-mac-setup")}>
+                                {needsSetup(data).length ? "Set up" : "Open"}
+                            </button>
+                        </SettingRow>
+                        <SearchReadinessRow />
+                        <DiskUsageRows />
+                        {said && <p className="thismac-said" role="status">{said}</p>}
+                        <p className="thismac-foot">
+                            Erasing data and restarting into Recovery stay in the menu bar: Lemma → Recovery…
+                        </p>
+                    </div>
+                );
+            }}
+        </Loading>
+    );
+}
+
+/** What the background service's start found, as attention lines: its
+ *  sentence, and the one place to go next. */
+function StartupWarnings({ warnings, onLogs }: { warnings: StartupWarning[]; onLogs: () => void }) {
+    if (!warnings.length) return null;
+    return (
+        <>
+            {warnings.map((warning, index) => {
+                const line = startupWarningLine(warning);
+                return (
+                    <p key={warning.code + index} className="thismac-said thismac-said--bad" role="alert" data-warning-code={warning.code}>
+                        <strong>{line.title}</strong> {warning.message}{" "}
+                        {line.next === "updates"
+                            ? <button className="linkish" onClick={() => openSettings("this-mac-updates")}>Check for updates</button>
+                            : <button className="linkish" onClick={onLogs}>Open logs</button>}
+                    </p>
+                );
+            })}
+        </>
+    );
+}
+
+/** One line for Overview: what is still needed, or how much is set up. */
+export function setupSummary(snapshot: ThisMacSnapshot): string {
+    if (needsSetup(snapshot).length) return "Needs an AI model before any work can start.";
+    const ready = CAPABILITIES.filter((one) => capabilityStatus(snapshot, one.id).state === "ready").length;
+    return `AI model ready · ${ready} of ${CAPABILITIES.length} capabilities set up.`;
+}
+
+/** When this page first saw the stack starting, cleared once it is not.
+ *  The snapshot refetches on its own, so the page re-renders past the
+ *  patience window without a timer of its own. */
+function useStartingSince(snapshot: ThisMacSnapshot | null): number | null {
+    const [since, setSince] = useState<number | null>(null);
+    const starting = snapshot ? healthState(snapshot) === "starting" : false;
+    useEffect(() => {
+        setSince((was) => (starting ? was ?? Date.now() : null));
+    }, [starting]);
+    return since;
+}
+
+/* ── coding agents ─────────────────────────────────────────────────── */
+
+function CodingAgents() {
+    const noun = useThisComputer();
+    const snapshot = useThisMacSnapshot();
+    const queryClient = useQueryClient();
+    const [problem, setProblem] = useState<string | null>(null);
+    const prepare = useMutation({
+        mutationFn: () => thisMac.prepareSandbox(),
+        onSuccess: () => {
+            queryClient.setQueryData<ThisMacSnapshot>(["this-mac"], (was) => was && { ...was, sandbox_images: { state: "downloading", detail: "" } });
+        },
+        onError: (cause) => setProblem(friendlyError(cause)),
+    });
+    return (
+        <div className="thismac">
+            {/* The same card the Models page leads with, so this computer
+                reads the same in both places, with what it found: each
+                agent, its release, and what to type to update it. Adding
+                them for teammates to pick is an organization decision and
+                stays on Models. */}
+            <ThisComputerCard>
+                <ThisComputerAgents />
+            </ThisComputerCard>
+            <p className="thismac-foot">
+                Choose which of its agents to allow in{" "}
+                <button className="linkish" onClick={() => openSettings("models")}>Models</button>.
+            </p>
+            <HostExecution />
+            <Loading snapshot={snapshot}>
+                {(data) => {
+                    const images = data.sandbox_images;
+                    const wording = sandboxWording(
+                        images?.state,
+                        noun,
+                        images ? downloadedSoFar({ doneMb: images.done_mb, totalMb: images.total_mb }) : null,
+                    );
+                    return (
+                        <SettingRow name="Workspace sandbox" consequence={wording.text}>
+                            {wording.offer && (
+                                <button className="btn" disabled={prepare.isPending} onClick={() => { setProblem(null); prepare.mutate(); }}>
+                                    <DownloadIcon size={13} /> {data.sandbox_images?.state === "failed" ? "Try again" : "Download"}
+                                </button>
+                            )}
+                        </SettingRow>
+                    );
+                }}
+            </Loading>
+            {problem && <p className="thismac-said thismac-said--bad" role="alert">{problem}</p>}
+        </div>
+    );
+}
+
+/** "Run commands on this Mac". Owner's runs only: the backend keeps every
+ *  teammate's run in the VM whatever this says. */
+function HostExecution() {
+    const noun = useThisComputer();
+    const host = useAgentHost();
+    const [problem, setProblem] = useState<string | null>(null);
+    const change = useMutation({
+        mutationFn: (enabled: boolean) => thisMac.setHostExecution(enabled),
+        /* The shell answers with the host's fresh status; the poll catches up
+           with it on its next tick anyway. */
+        onSuccess: (answer) => { if (readStatus(answer)) void host.refetch(); },
+        onError: (cause) => setProblem(hostExecutionError(cause, noun)),
+    });
+    const row = hostExecutionSwitch(host.status, { error: host.error, noun });
+    return (
+        <>
+            <SettingRow name={"Run commands on " + noun} consequence={row.blocked ?? row.consequence}>
+                <input
+                    type="checkbox"
+                    className="thismac-switch"
+                    role="switch"
+                    aria-label={"Run commands on " + noun}
+                    checked={change.isPending ? change.variables === true : row.checked}
+                    disabled={row.blocked !== null || change.isPending}
+                    title={row.blocked ?? undefined}
+                    onChange={(event) => { setProblem(null); change.mutate(event.target.checked); }}
+                />
+            </SettingRow>
+            {problem && <p className="thismac-said thismac-said--bad" role="alert">{problem}</p>}
+        </>
+    );
+}
+
+/* ── updates ───────────────────────────────────────────────────────── */
+
+function Updates() {
+    const snapshot = useThisMacSnapshot();
+    const update = useQuery({ queryKey: ["this-mac-update"], queryFn: () => thisMac.checkUpdate(), staleTime: 10 * 60_000, retry: 0 });
+    const [problem, setProblem] = useState<string | null>(null);
+    const [note, setNote] = useState<string | null>(null);
+    const install = useMutation({
+        mutationFn: (version: string) => thisMac.installUpdate(version),
+        onSuccess: () => void update.refetch(),
+        onError: (cause) => {
+            const said = updateProblem(cause);
+            if (said.neutral) setNote(said.text); else setProblem(said.text);
+        },
+    });
+    const status = update.data ?? null;
+    const offer = updateOffer(status);
+    const channel = snapshot.data?.app.channel ?? status?.channel ?? "unknown";
+    const unfinished = (snapshot.data?.warnings ?? []).filter((warning) => startupWarningLine(warning).next === "updates");
+    return (
+        <div className="thismac">
+            {unfinished.map((warning, index) => (
+                <p key={warning.code + index} className="thismac-said thismac-said--bad" role="alert">
+                    <strong>{startupWarningLine(warning).title}</strong> {warning.message}
+                </p>
+            ))}
+            <SettingRow
+                name={status ? "Lemma " + status.currentVersion : "Lemma"}
+                consequence={update.isFetching ? "Checking for updates…"
+                    : update.isError ? updateProblem(update.error).text
+                        : !status ? ""
+                            : !status.updatesSupported ? "This build doesn’t update itself."
+                                : status.availableVersion ? `Lemma ${status.availableVersion} is available.` : "Up to date."}
+            >
+                <button className="btn" disabled={update.isFetching} onClick={() => { setProblem(null); setNote(null); void update.refetch(); }}>
+                    <RefreshIcon size={13} className={update.isFetching ? "spin" : undefined} /> Check now
+                </button>
+            </SettingRow>
+            {status?.availableVersion && (
+                <SettingRow name={"Install " + status.availableVersion} consequence={offer.blocked ?? offer.cost}>
+                    <button
+                        className="btn btn--primary"
+                        disabled={Boolean(offer.blocked) || install.isPending}
+                        /* The version shown, so the shell can refuse if the
+                           feed moved on since; it asks natively first. */
+                        onClick={() => { setProblem(null); setNote(null); install.mutate(status.availableVersion!); }}
+                    >
+                        {install.isPending ? "Downloading…" : "Download and install"}
+                    </button>
+                </SettingRow>
+            )}
+            <SettingRow name="Channel" consequence={channelLine(status, channel)}>
+                <span className="pill">{channel}</span>
+                {!status?.updatesSupported && (
+                    <button className="linkish" onClick={() => openExternal(RELEASES_PAGE)}>Releases page</button>
+                )}
+            </SettingRow>
+            {note && <p className="thismac-said" role="status">{note}</p>}
+            {problem && <p className="thismac-said thismac-said--bad" role="alert">{problem}</p>}
+        </div>
+    );
+}
+
+/* ── the pane ──────────────────────────────────────────────────────── */
+
+/** Said instead of controls when the window is on a shared address. */
+function Elsewhere() {
+    const noun = capitalised(useThisComputer());
+    return (
+        <div className="thismac-problem" role="status">
+            <p>
+                <WarningIcon size={14} /> Lemma is shared right now, and this window is on the shared address.
+                {" "}{noun}’s settings open from the menu bar there: Lemma → Desktop settings…, where sharing can be turned off.
+            </p>
+        </div>
+    );
+}
+
+export function ThisMacPane({ section, focus }: { section: ThisMacSection; focus?: string | null }) {
+    const availability = useThisMacAvailability();
+    if (availability === "pending") return <p className="empty-row" role="status">Checking…</p>;
+    if (availability === "elsewhere") return <Elsewhere />;
+    if (availability === "hidden") return null;
+    if (section === "this-mac-agents") return <CodingAgents />;
+    if (section === "this-mac-sharing") return <ThisMacSharing />;
+    if (section === "this-mac-updates") return <Updates />;
+    if (section === "this-mac-setup") return <ThisMacServerSetup focus={focus ?? null} />;
+    /* Advanced's diagnostics are the last part of Server setup now, and
+       its credentials are Server setup's cards; old links land there. */
+    if (section === "this-mac-advanced") return <ThisMacServerSetup focus={focus ?? "advanced"} />;
+    return <Overview />;
+}
+
+export { ComputerIcon as ThisMacIcon };

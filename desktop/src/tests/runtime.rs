@@ -13,7 +13,7 @@ fn no_lock_is_held_across_the_runtime_install() {
         .find("ensure_runtime_artifacts(app)")
         .expect("ensure_locald installs the runtime");
     let connect = body
-        .find("locald_connect.lock()")
+        .find("locald_connect.lock_or_recover()")
         .expect("ensure_locald takes the connect guard");
     assert!(
         install < connect,
@@ -21,7 +21,7 @@ fn no_lock_is_held_across_the_runtime_install() {
          not inside it"
     );
     assert!(
-        body.contains("runtime_install.lock()"),
+        body.contains("runtime_install.lock_or_recover()"),
         "the install still needs its own single-flight so two callers cannot \
          download at once"
     );
@@ -98,62 +98,86 @@ fn nothing_in_setup_installs_the_runtime_on_the_main_thread() {
     //
     // Both launch paths, resume and cold start, must hand that to a worker.
     let source = shell_source();
-    let setup = {
-        let start = source.find(".setup(move |app| {").expect("setup exists");
-        let end = source[start..]
-            .find("\n        .build(")
-            .or_else(|| source[start..].find("\n        .run("))
-            .map_or(source.len(), |offset| start + offset);
-        &source[start..end]
-    };
-    for (index, _) in setup.match_indices("ensure_locald(&handle)") {
-        let preceding = &setup[..index];
-        let spawned = preceding.rfind("std::thread::spawn");
-        let closed = preceding.rfind("});");
+    let setup = function_body(&source, "fn setup(\n    app: &mut tauri::App");
+    for slow in ["ensure_locald(", "start_impl("] {
         assert!(
-            spawned.is_some() && spawned > closed,
-            "an ensure_locald in setup is not inside a spawned thread"
+            !setup.contains(slow),
+            "setup calls {slow} itself instead of handing it to a worker"
+        );
+    }
+    // The two launch paths are the functions that do; each is only ever
+    // entered as the body of a spawned thread.
+    for worker in ["reconnect_after_resume(", "connect_on_launch("] {
+        let line = setup
+            .lines()
+            .find(|line| line.contains(worker))
+            .unwrap_or_else(|| panic!("setup no longer starts {worker}"));
+        assert!(
+            line.contains("std::thread::spawn(move ||"),
+            "{worker} must run on a spawned thread, not in setup: {line}"
+        );
+        assert!(
+            function_body(&source, &format!("fn {worker}")).contains("ensure_locald(handle)"),
+            "{worker} is the path that connects to the daemon"
         );
     }
 }
 
-/// The feed's compatibility block decides before anything is downloaded.
+/// Only a known change of Postgres major is refused.
+///
+/// Everything else Lemma changes between releases is carried by migrations
+/// on the next start. A new major is the one thing that cannot be: it will
+/// not open the old major's data directory.
 #[test]
-fn an_update_that_would_strand_local_data_says_so_first() {
-    let same = LemmaUpdateMetadata {
+fn only_a_known_postgres_major_change_refuses_an_update() {
+    let eighteen = LemmaUpdateMetadata {
         postgres_major: Some(18),
         runtime_download_bytes: Some(531_000_000),
+        ..Default::default()
     };
-    assert_eq!(same.compatibility_with(Some(18)), "compatible");
+    assert_eq!(eighteen.compatibility_with(Some(18)), "compatible");
     assert_eq!(
-        same.compatibility_with(Some(16)),
-        "migration-unavailable",
-        "a Postgres major bump cannot open the existing cluster"
+        eighteen.compatibility_with(Some(17)),
+        "postgres-major-change",
+        "a new major cannot open the existing data directory"
     );
-
-    // The caller blocks an unknown pairing if an installed runtime has data.
-    assert_eq!(same.compatibility_with(None), "unknown");
+    // Not knowing a side is not evidence of a change.
+    assert_eq!(eighteen.compatibility_with(None), "compatible");
     assert_eq!(
         LemmaUpdateMetadata::default().compatibility_with(Some(18)),
-        "unknown"
+        "compatible"
     );
 }
 
 #[test]
-fn update_preflight_rejects_data_reset_and_unsupported_migrations() {
-    for windows in [false, true] {
-        for has_runtime in [false, true] {
-            assert!(
-                ensure_update_preserves_data(true, has_runtime, "compatible", windows).is_err()
-            );
-        }
+fn the_install_gate_refuses_a_reset_and_a_major_change_and_nothing_else() {
+    for has_runtime in [false, true] {
+        assert!(
+            ensure_update_preserves_data(true, has_runtime, Some(18), Some(18)).is_err(),
+            "an update never resets data"
+        );
     }
-    for compatibility in ["unknown", "requires-reset", "migration-unavailable"] {
-        assert!(ensure_update_preserves_data(false, true, compatibility, false).is_err());
+    let refused = ensure_update_preserves_data(false, true, Some(18), Some(19))
+        .expect_err("a major change is refused");
+    assert!(
+        refused.contains("Postgres 18") && refused.contains("Postgres 19"),
+        "the refusal names the change it is refusing: {refused}"
+    );
+    for (installed, candidate) in [
+        (Some(18), Some(18)),
+        (None, Some(18)),
+        (Some(18), None),
+        (None, None),
+    ] {
+        assert!(
+            ensure_update_preserves_data(false, true, installed, candidate).is_ok(),
+            "{installed:?} -> {candidate:?} is an ordinary update"
+        );
     }
-    assert!(ensure_update_preserves_data(false, true, "compatible", true).is_err());
-    assert!(ensure_update_preserves_data(false, true, "compatible", false).is_ok());
-    assert!(ensure_update_preserves_data(false, false, "unknown", true).is_ok());
+    assert!(
+        ensure_update_preserves_data(false, false, Some(18), Some(19)).is_ok(),
+        "with no local data there is no data directory to strand"
+    );
 }
 
 /// A feed without the block, or with junk in it, is read safely.
@@ -198,6 +222,35 @@ fn update_metadata_uses_the_selected_platform_and_never_another_platforms_fallba
     );
 }
 
+/// An itemised feed is read only whole: a sum over half the archives would
+/// be announced as the whole download.
+#[test]
+fn update_metadata_reads_runtime_artifacts_all_or_nothing() {
+    let entry = |sha: &str| json!({"sha256": sha.repeat(64), "size": 5});
+    let whole = lemma_update_metadata_for(
+        &json!({"lemma": {"runtime_download_bytes": 10, "runtime_artifacts": {
+            "host": entry("a"), "guest": entry("b")
+        }}}),
+        "darwin-aarch64",
+    );
+    assert_eq!(whole.runtime_artifacts.len(), 2);
+    let nowhere = std::path::Path::new("/nonexistent/lemma-runtime");
+    assert_eq!(whole.runtime_bytes_to_download(nowhere), Some(10));
+
+    for partial in [
+        json!({"host": entry("a")}),
+        json!({"host": entry("a"), "guest": {"sha256": "short", "size": 5}}),
+        json!({"host": entry("a"), "guest": {"sha256": "b".repeat(64)}}),
+    ] {
+        let metadata = lemma_update_metadata_for(
+            &json!({"lemma": {"runtime_download_bytes": 10, "runtime_artifacts": partial}}),
+            "darwin-aarch64",
+        );
+        assert!(metadata.runtime_artifacts.is_empty());
+        assert_eq!(metadata.runtime_bytes_to_download(nowhere), Some(10));
+    }
+}
+
 /// The updater is never reachable from a remote origin.
 ///
 /// `workspace.json` grants commands to the locald-served app URL and to
@@ -225,11 +278,41 @@ fn no_capability_exposes_the_updater_to_a_remote_origin() {
             "{name} must not grant process control",
         );
     }
-    let workspace = include_str!("../../capabilities/workspace.json").replace("\r\n", "\n");
-    for command in ["allow-check-for-app-update", "allow-install-app-update"] {
+    // This Mac → Updates reaches the two app commands from the workspace
+    // capability, which also lists the hosted site. What keeps a remote origin
+    // from replacing the application is the Rust check -- this installation's
+    // own workspace on its loopback origin, or Local settings -- and the
+    // native confirmation install asks before it downloads anything.
+    let updates = include_str!("../app_update.rs").replace("\r\n", "\n");
+    for signature in [
+        "pub(crate) async fn check_for_app_update(",
+        "pub(crate) async fn install_app_update(",
+    ] {
         assert!(
-            !workspace.contains(command),
-            "a remote origin must not be able to replace the application",
+            function_body(&updates, signature).contains("require_settings_caller(&window, &app)?;"),
+            "{signature} must refuse a caller that is not this installation",
+        );
+    }
+    let install = function_body(&updates, "pub(crate) async fn install_app_update(");
+    // Consent comes first: before the download, before the stack is stopped
+    // and before anything is installed -- and on every platform, which is why
+    // it is also before the Windows early return.
+    let consent = install
+        .find("confirm_destructive_action_impl(")
+        .expect("install asks natively");
+    let agreed = install.find("if !agreed").expect("a refusal aborts");
+    for later in [
+        ".download(",
+        "stop_locald_for_runtime_maintenance",
+        ".install(bytes)",
+        "if cfg!(windows)",
+    ] {
+        let at = install
+            .find(later)
+            .unwrap_or_else(|| panic!("{later} is missing"));
+        assert!(
+            consent < agreed && agreed < at,
+            "native consent must precede {later}: consent@{consent} abort@{agreed} {later}@{at}",
         );
     }
     assert!(include_str!("../../capabilities/control.json").contains("allow-install-app-update"));
@@ -429,7 +512,7 @@ fn unpublished_online_runtime_error_is_actionable_and_logged_in_app() {
     assert!(!message.contains("Publish"), "{message}");
     assert!(!message.contains("PR test DMG"), "{message}");
 
-    let splash = include_str!("../../ui/index.html").replace("\r\n", "\n");
+    let splash = SPLASH.replace("\r\n", "\n");
     assert!(splash.contains("diagnosticLogs: (source, cursor = null)"));
     assert!(splash.contains("refreshDiagnosticLog"));
     assert!(splash.contains("id=\"log-tabs\""));
@@ -439,26 +522,21 @@ fn unpublished_online_runtime_error_is_actionable_and_logged_in_app() {
 #[test]
 fn local_settings_exposes_honest_runtime_repair_and_rollback_boundaries() {
     let html = include_str!("../../ui/control.html").replace("\r\n", "\n");
-    let script = include_str!("../../ui/control.js").replace("\r\n", "\n");
+    let script = CONTROL.replace("\r\n", "\n");
 
-    assert!(html.contains("Signed release lifecycle"));
     assert!(script.contains("repair_runtime"));
     assert!(script.contains("open_developer_tools"));
     assert!(html.contains("Developer tools"));
     assert!(html.contains("id=\"network-contract\""));
-    assert!(html.contains("id=\"connector-callback\""));
     assert!(script.contains("snapshot.state?.api_url"));
     assert!(!html.contains("http://app.lemma.localhost:8711/api/v1/connectors"));
     // The rollback notice used to be here, toggled `hidden = rollbackAvailable`
     // against a value hardcoded `false` -- so it was *permanently* on
-    // screen, explaining a feature that does not exist. A standing
-    // paragraph about something that has never happened is a bug, not a
-    // flag, and the Previous runtime card now says what is actually true.
+    // screen, explaining a feature that does not exist.
     assert!(
         !html.contains("Rollback stays unavailable"),
         "a notice that can never be dismissed is not a boundary, it is noise",
     );
-    assert!(html.contains("Reinstalling an earlier Lemma from the release page"));
     assert!(html.contains("Databases, files, and workspaces are preserved"));
 }
 

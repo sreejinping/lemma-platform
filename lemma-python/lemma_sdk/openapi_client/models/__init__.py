@@ -27,40 +27,14 @@ _NAME_TO_MODULE = {
     'AgentDetailResponseInputSchemaType0': 'agent_detail_response_input_schema_type_0',
     'AgentDetailResponseMetadataType0': 'agent_detail_response_metadata_type_0',
     'AgentDetailResponseOutputSchemaType0': 'agent_detail_response_output_schema_type_0',
-    'AgentHostCapacity': 'agent_host_capacity',
-    'AgentHostCommand': 'agent_host_command',
-    'AgentHostCommandKind': 'agent_host_command_kind',
-    'AgentHostCommandPayload': 'agent_host_command_payload',
-    'AgentHostCommandRejection': 'agent_host_command_rejection',
-    'AgentHostConfigOption': 'agent_host_config_option',
-    'AgentHostConfigOptionMetadata': 'agent_host_config_option_metadata',
-    'AgentHostConfigOptionOptionsItem': 'agent_host_config_option_options_item',
-    'AgentHostEvent': 'agent_host_event',
-    'AgentHostEventAck': 'agent_host_event_ack',
-    'AgentHostEventBatch': 'agent_host_event_batch',
-    'AgentHostEventPayload': 'agent_host_event_payload',
-    'AgentHostEventType': 'agent_host_event_type',
-    'AgentHostHarnessCapabilities': 'agent_host_harness_capabilities',
-    'AgentHostHarnessHealth': 'agent_host_harness_health',
     'AgentHostHarnessListResponse': 'agent_host_harness_list_response',
-    'AgentHostHarnessPublishRequest': 'agent_host_harness_publish_request',
-    'AgentHostHarnessPublishResponse': 'agent_host_harness_publish_response',
     'AgentHostHarnessResponse': 'agent_host_harness_response',
     'AgentHostHarnessResponseCapabilities': 'agent_host_harness_response_capabilities',
-    'AgentHostHarnessSnapshot': 'agent_host_harness_snapshot',
     'AgentHostListResponse': 'agent_host_list_response',
-    'AgentHostPairingComplete': 'agent_host_pairing_complete',
-    'AgentHostPairingCompleted': 'agent_host_pairing_completed',
     'AgentHostPairingCreate': 'agent_host_pairing_create',
     'AgentHostPairingCreated': 'agent_host_pairing_created',
-    'AgentHostPollRequest': 'agent_host_poll_request',
-    'AgentHostPollResponse': 'agent_host_poll_response',
-    'AgentHostRejectionCode': 'agent_host_rejection_code',
     'AgentHostResponse': 'agent_host_response',
     'AgentHostResponseCapacity': 'agent_host_response_capacity',
-    'AgentHostRunCheckpoint': 'agent_host_run_checkpoint',
-    'AgentHostRunCheckpointDetail': 'agent_host_run_checkpoint_detail',
-    'AgentHostRunState': 'agent_host_run_state',
     'AgentHostStatus': 'agent_host_status',
     'AgentKind': 'agent_kind',
     'AgentListResponse': 'agent_list_response',
@@ -86,6 +60,7 @@ _NAME_TO_MODULE = {
     'AgentRuntimeProfileResponse': 'agent_runtime_profile_response',
     'AgentRuntimeProfileResponseConfig': 'agent_runtime_profile_response_config',
     'AgentRuntimeProfileResponseMetadata': 'agent_runtime_profile_response_metadata',
+    'AgentRuntimeProfileTestResponse': 'agent_runtime_profile_test_response',
     'AgentSummaryResponse': 'agent_summary_response',
     'AgentSummaryResponseMetadataType0': 'agent_summary_response_metadata_type_0',
     'AgentSurfaceListResponse': 'agent_surface_list_response',
@@ -137,6 +112,7 @@ _NAME_TO_MODULE = {
     'ColumnSchema': 'column_schema',
     'ColumnSchemaTypeParamsType0': 'column_schema_type_params_type_0',
     'ConnectRequestInitiateSchema': 'connect_request_initiate_schema',
+    'ConnectRequestInitiateSchemaConnectionFieldsType0': 'connect_request_initiate_schema_connection_fields_type_0',
     'ConnectRequestResponseSchema': 'connect_request_response_schema',
     'ConnectedAccountSummary': 'connected_account_summary',
     'ConnectorAuthConfigDeleteResponseConnectorAuthConfigDelete': 'connector_auth_config_delete_response_connector_auth_config_delete',
@@ -203,6 +179,8 @@ _NAME_TO_MODULE = {
     'DirectoryTreeResponse': 'directory_tree_response',
     'DisplaySizeRequest': 'display_size_request',
     'DisplaySizeResponse': 'display_size_response',
+    'EmailDeliveryStatusResponse': 'email_delivery_status_response',
+    'EmailDeliveryTestResponse': 'email_delivery_test_response',
     'EndNode': 'end_node',
     'EndNodeConfig': 'end_node_config',
     'EndNodePositionType0': 'end_node_position_type_0',
@@ -277,7 +255,6 @@ _NAME_TO_MODULE = {
     'HomeAgentResponse': 'home_agent_response',
     'HomeAppResponse': 'home_app_response',
     'HomePodResponse': 'home_pod_response',
-    'HostHello': 'host_hello',
     'IconUploadRequest': 'icon_upload_request',
     'IconUploadResponse': 'icon_upload_response',
     'ImportPlanResponse': 'import_plan_response',
@@ -431,6 +408,7 @@ _NAME_TO_MODULE = {
     'SendMessageRequest': 'send_message_request',
     'SendMessageRequestMetadataType0': 'send_message_request_metadata_type_0',
     'SetDefaultSurfaceRequest': 'set_default_surface_request',
+    'SetOrganizationDefaultRuntimeRequest': 'set_organization_default_runtime_request',
     'SignInOutcomeResponse': 'sign_in_outcome_response',
     'SignedUrlListResponse': 'signed_url_list_response',
     'SignedUrlRevokeResponse': 'signed_url_revoke_response',
@@ -471,6 +449,7 @@ _NAME_TO_MODULE = {
     'SurfaceSlackConfigResponse': 'surface_slack_config_response',
     'SurfaceSystemClaim': 'surface_system_claim',
     'SurfaceTelegramConfigInput': 'surface_telegram_config_input',
+    'SurfaceUnavailableReason': 'surface_unavailable_reason',
     'SurfaceUpdateRequest': 'surface_update_request',
     'TableDetailResponse': 'table_detail_response',
     'TableDetailResponseConfigType0': 'table_detail_response_config_type_0',
@@ -561,6 +540,8 @@ _NAME_TO_MODULE = {
     'WorkspaceFileEntry': 'workspace_file_entry',
     'WorkspaceFileEntryKind': 'workspace_file_entry_kind',
     'WorkspaceFileListResponse': 'workspace_file_list_response',
+    'WorkspaceStatusResponse': 'workspace_status_response',
+    'WorkspaceStatusResponseState': 'workspace_status_response_state',
 }
 
 if TYPE_CHECKING:
@@ -582,40 +563,14 @@ if TYPE_CHECKING:
     from .agent_detail_response_input_schema_type_0 import AgentDetailResponseInputSchemaType0
     from .agent_detail_response_metadata_type_0 import AgentDetailResponseMetadataType0
     from .agent_detail_response_output_schema_type_0 import AgentDetailResponseOutputSchemaType0
-    from .agent_host_capacity import AgentHostCapacity
-    from .agent_host_command import AgentHostCommand
-    from .agent_host_command_kind import AgentHostCommandKind
-    from .agent_host_command_payload import AgentHostCommandPayload
-    from .agent_host_command_rejection import AgentHostCommandRejection
-    from .agent_host_config_option import AgentHostConfigOption
-    from .agent_host_config_option_metadata import AgentHostConfigOptionMetadata
-    from .agent_host_config_option_options_item import AgentHostConfigOptionOptionsItem
-    from .agent_host_event import AgentHostEvent
-    from .agent_host_event_ack import AgentHostEventAck
-    from .agent_host_event_batch import AgentHostEventBatch
-    from .agent_host_event_payload import AgentHostEventPayload
-    from .agent_host_event_type import AgentHostEventType
-    from .agent_host_harness_capabilities import AgentHostHarnessCapabilities
-    from .agent_host_harness_health import AgentHostHarnessHealth
     from .agent_host_harness_list_response import AgentHostHarnessListResponse
-    from .agent_host_harness_publish_request import AgentHostHarnessPublishRequest
-    from .agent_host_harness_publish_response import AgentHostHarnessPublishResponse
     from .agent_host_harness_response import AgentHostHarnessResponse
     from .agent_host_harness_response_capabilities import AgentHostHarnessResponseCapabilities
-    from .agent_host_harness_snapshot import AgentHostHarnessSnapshot
     from .agent_host_list_response import AgentHostListResponse
-    from .agent_host_pairing_complete import AgentHostPairingComplete
-    from .agent_host_pairing_completed import AgentHostPairingCompleted
     from .agent_host_pairing_create import AgentHostPairingCreate
     from .agent_host_pairing_created import AgentHostPairingCreated
-    from .agent_host_poll_request import AgentHostPollRequest
-    from .agent_host_poll_response import AgentHostPollResponse
-    from .agent_host_rejection_code import AgentHostRejectionCode
     from .agent_host_response import AgentHostResponse
     from .agent_host_response_capacity import AgentHostResponseCapacity
-    from .agent_host_run_checkpoint import AgentHostRunCheckpoint
-    from .agent_host_run_checkpoint_detail import AgentHostRunCheckpointDetail
-    from .agent_host_run_state import AgentHostRunState
     from .agent_host_status import AgentHostStatus
     from .agent_kind import AgentKind
     from .agent_list_response import AgentListResponse
@@ -641,6 +596,7 @@ if TYPE_CHECKING:
     from .agent_runtime_profile_response import AgentRuntimeProfileResponse
     from .agent_runtime_profile_response_config import AgentRuntimeProfileResponseConfig
     from .agent_runtime_profile_response_metadata import AgentRuntimeProfileResponseMetadata
+    from .agent_runtime_profile_test_response import AgentRuntimeProfileTestResponse
     from .agent_summary_response import AgentSummaryResponse
     from .agent_summary_response_metadata_type_0 import AgentSummaryResponseMetadataType0
     from .agent_surface_list_response import AgentSurfaceListResponse
@@ -692,6 +648,7 @@ if TYPE_CHECKING:
     from .column_schema import ColumnSchema
     from .column_schema_type_params_type_0 import ColumnSchemaTypeParamsType0
     from .connect_request_initiate_schema import ConnectRequestInitiateSchema
+    from .connect_request_initiate_schema_connection_fields_type_0 import ConnectRequestInitiateSchemaConnectionFieldsType0
     from .connect_request_response_schema import ConnectRequestResponseSchema
     from .connected_account_summary import ConnectedAccountSummary
     from .connector_auth_config_delete_response_connector_auth_config_delete import ConnectorAuthConfigDeleteResponseConnectorAuthConfigDelete
@@ -758,6 +715,8 @@ if TYPE_CHECKING:
     from .directory_tree_response import DirectoryTreeResponse
     from .display_size_request import DisplaySizeRequest
     from .display_size_response import DisplaySizeResponse
+    from .email_delivery_status_response import EmailDeliveryStatusResponse
+    from .email_delivery_test_response import EmailDeliveryTestResponse
     from .end_node import EndNode
     from .end_node_config import EndNodeConfig
     from .end_node_position_type_0 import EndNodePositionType0
@@ -832,7 +791,6 @@ if TYPE_CHECKING:
     from .home_agent_response import HomeAgentResponse
     from .home_app_response import HomeAppResponse
     from .home_pod_response import HomePodResponse
-    from .host_hello import HostHello
     from .icon_upload_request import IconUploadRequest
     from .icon_upload_response import IconUploadResponse
     from .import_plan_response import ImportPlanResponse
@@ -986,6 +944,7 @@ if TYPE_CHECKING:
     from .send_message_request import SendMessageRequest
     from .send_message_request_metadata_type_0 import SendMessageRequestMetadataType0
     from .set_default_surface_request import SetDefaultSurfaceRequest
+    from .set_organization_default_runtime_request import SetOrganizationDefaultRuntimeRequest
     from .sign_in_outcome_response import SignInOutcomeResponse
     from .signed_url_list_response import SignedUrlListResponse
     from .signed_url_revoke_response import SignedUrlRevokeResponse
@@ -1026,6 +985,7 @@ if TYPE_CHECKING:
     from .surface_slack_config_response import SurfaceSlackConfigResponse
     from .surface_system_claim import SurfaceSystemClaim
     from .surface_telegram_config_input import SurfaceTelegramConfigInput
+    from .surface_unavailable_reason import SurfaceUnavailableReason
     from .surface_update_request import SurfaceUpdateRequest
     from .table_detail_response import TableDetailResponse
     from .table_detail_response_config_type_0 import TableDetailResponseConfigType0
@@ -1116,6 +1076,8 @@ if TYPE_CHECKING:
     from .workspace_file_entry import WorkspaceFileEntry
     from .workspace_file_entry_kind import WorkspaceFileEntryKind
     from .workspace_file_list_response import WorkspaceFileListResponse
+    from .workspace_status_response import WorkspaceStatusResponse
+    from .workspace_status_response_state import WorkspaceStatusResponseState
 
 
 def __getattr__(name: str):
@@ -1150,40 +1112,14 @@ __all__ = [
     'AgentDetailResponseInputSchemaType0',
     'AgentDetailResponseMetadataType0',
     'AgentDetailResponseOutputSchemaType0',
-    'AgentHostCapacity',
-    'AgentHostCommand',
-    'AgentHostCommandKind',
-    'AgentHostCommandPayload',
-    'AgentHostCommandRejection',
-    'AgentHostConfigOption',
-    'AgentHostConfigOptionMetadata',
-    'AgentHostConfigOptionOptionsItem',
-    'AgentHostEvent',
-    'AgentHostEventAck',
-    'AgentHostEventBatch',
-    'AgentHostEventPayload',
-    'AgentHostEventType',
-    'AgentHostHarnessCapabilities',
-    'AgentHostHarnessHealth',
     'AgentHostHarnessListResponse',
-    'AgentHostHarnessPublishRequest',
-    'AgentHostHarnessPublishResponse',
     'AgentHostHarnessResponse',
     'AgentHostHarnessResponseCapabilities',
-    'AgentHostHarnessSnapshot',
     'AgentHostListResponse',
-    'AgentHostPairingComplete',
-    'AgentHostPairingCompleted',
     'AgentHostPairingCreate',
     'AgentHostPairingCreated',
-    'AgentHostPollRequest',
-    'AgentHostPollResponse',
-    'AgentHostRejectionCode',
     'AgentHostResponse',
     'AgentHostResponseCapacity',
-    'AgentHostRunCheckpoint',
-    'AgentHostRunCheckpointDetail',
-    'AgentHostRunState',
     'AgentHostStatus',
     'AgentKind',
     'AgentListResponse',
@@ -1209,6 +1145,7 @@ __all__ = [
     'AgentRuntimeProfileResponse',
     'AgentRuntimeProfileResponseConfig',
     'AgentRuntimeProfileResponseMetadata',
+    'AgentRuntimeProfileTestResponse',
     'AgentSummaryResponse',
     'AgentSummaryResponseMetadataType0',
     'AgentSurfaceListResponse',
@@ -1260,6 +1197,7 @@ __all__ = [
     'ColumnSchema',
     'ColumnSchemaTypeParamsType0',
     'ConnectRequestInitiateSchema',
+    'ConnectRequestInitiateSchemaConnectionFieldsType0',
     'ConnectRequestResponseSchema',
     'ConnectedAccountSummary',
     'ConnectorAuthConfigDeleteResponseConnectorAuthConfigDelete',
@@ -1326,6 +1264,8 @@ __all__ = [
     'DirectoryTreeResponse',
     'DisplaySizeRequest',
     'DisplaySizeResponse',
+    'EmailDeliveryStatusResponse',
+    'EmailDeliveryTestResponse',
     'EndNode',
     'EndNodeConfig',
     'EndNodePositionType0',
@@ -1400,7 +1340,6 @@ __all__ = [
     'HomeAgentResponse',
     'HomeAppResponse',
     'HomePodResponse',
-    'HostHello',
     'IconUploadRequest',
     'IconUploadResponse',
     'ImportPlanResponse',
@@ -1554,6 +1493,7 @@ __all__ = [
     'SendMessageRequest',
     'SendMessageRequestMetadataType0',
     'SetDefaultSurfaceRequest',
+    'SetOrganizationDefaultRuntimeRequest',
     'SignInOutcomeResponse',
     'SignedUrlListResponse',
     'SignedUrlRevokeResponse',
@@ -1594,6 +1534,7 @@ __all__ = [
     'SurfaceSlackConfigResponse',
     'SurfaceSystemClaim',
     'SurfaceTelegramConfigInput',
+    'SurfaceUnavailableReason',
     'SurfaceUpdateRequest',
     'TableDetailResponse',
     'TableDetailResponseConfigType0',
@@ -1684,4 +1625,6 @@ __all__ = [
     'WorkspaceFileEntry',
     'WorkspaceFileEntryKind',
     'WorkspaceFileListResponse',
+    'WorkspaceStatusResponse',
+    'WorkspaceStatusResponseState',
 ]

@@ -81,46 +81,15 @@ fn every_command_that_is_not_pure_ui_is_async() {
 }
 
 #[test]
-fn local_settings_says_which_integrations_are_set_up() {
-    // Every row's badge read "Optional" whether or not a credential had been
-    // saved, and the only signal that one had been was the placeholder
-    // inside the input -- grey, and invisible until the drawer was opened.
-    // Somebody who had just saved a Deepgram key had no way to see it land.
+fn integrations_and_channels_moved_out_of_local_settings() {
+    // The OAuth apps and bot credentials connectors and channels run with are
+    // configured where they are needed: This Mac → Advanced in the workspace,
+    // which the Connectors and Channels screens link to at the right form.
+    // Local settings keeping a copy would be two forms for one secret.
     let markup = include_str!("../../ui/control.html").replace("\r\n", "\n");
-    let script = include_str!("../../ui/control.js").replace("\r\n", "\n");
-    let style = include_str!("../../ui/control.css").replace("\r\n", "\n");
-
-    assert!(
-        !markup.contains(">Optional<"),
-        "a badge that says the same word on every row carries nothing"
-    );
-    assert!(
-        markup.contains("data-config-state"),
-        "each row has a slot for its real state"
-    );
-    // Twice: the definition, and a call. Asserting the function merely
-    // exists passes just as happily when nothing invokes it, which is how a
-    // helper ships dead.
-    assert!(
-        script.matches("paintConfigStates(presence)").count() >= 2,
-        "the painter is defined but never called from the fill pass"
-    );
-    // Read off the row's own fields, so a row added to the markup is
-    // described without anyone remembering a table in the script.
-    assert!(
-        script.contains("input[data-secret]"),
-        "presence of a saved secret is part of being configured"
-    );
-    assert!(
-        style.contains(r#"[data-config-state="configured"]"#),
-        "a configured row has to look different, not just read differently"
-    );
-    // A different axis, and it survives: these rows need a reachable URL
-    // whether or not anyone has filled them in.
-    assert!(
-        markup.contains("Public link"),
-        "the ingress requirement is not a state and should not be replaced by one"
-    );
+    assert!(!markup.contains("data-page=\"integrations\""));
+    assert!(!markup.contains("data-page=\"channels\""));
+    assert!(!markup.contains("data-secret="));
 }
 
 #[test]
@@ -129,7 +98,7 @@ fn local_settings_never_gates_a_button_on_a_webview_confirm() {
     // does not implement, so it returns false without drawing anything:
     // the click is received and discarded, and the button looks inert.
     // Destructive actions go through the native dialog command instead.
-    let script = include_str!("../../ui/control.js").replace("\r\n", "\n");
+    let script = CONTROL.replace("\r\n", "\n");
     assert!(
         !script.contains("window.confirm("),
         "a destructive button is gated on a confirm() that always says no"
@@ -176,8 +145,8 @@ fn every_command_is_granted_to_exactly_the_surfaces_that_call_it() {
     // a page calling a command only its sibling was granted is still
     // rejected at runtime. Check each bundled page against its own grants.
     for (capability, script) in [
-        ("main", include_str!("../../ui/index.html")),
-        ("control", include_str!("../../ui/control.js")),
+        ("main", SPLASH),
+        ("control", CONTROL),
         ("confirmation", include_str!("../../ui/confirmation.js")),
     ] {
         let grants = granted(capability);
@@ -409,16 +378,17 @@ fn iframes_may_render_their_own_inline_content() {
 }
 
 #[test]
-fn cloudflare_sharing_defaults_to_safe_automatic_provisioning() {
+fn local_settings_can_always_turn_sharing_off_and_nothing_else() {
+    // Choosing a mode moved to This Mac → Sharing. Turning it off stays here:
+    // a shared workspace moves this window to the shared origin, where the
+    // workspace cannot reach this computer's settings, so this page is the
+    // one that always can.
     let html = include_str!("../../ui/control.html").replace("\r\n", "\n");
-    let script = include_str!("../../ui/control.js").replace("\r\n", "\n");
-
-    assert!(html.contains("Automatic setup · recommended"));
-    assert!(html.contains("Use an existing named tunnel"));
-    assert!(html.contains("Cloudflare automatic setup stores only its generated tunnel credential"));
-    assert!(script.contains("payload.cloudflare_setup = $(\"cloudflare-setup\").value"));
-    assert!(script.contains("public_warning_confirmed: true"));
-    assert!(!script.contains("--overwrite-dns"));
+    let script = CONTROL.replace("\r\n", "\n");
+    assert!(html.contains("id=\"sharing-disable\""));
+    assert!(script.contains("action: \"disable\""));
+    assert!(!script.contains("action: \"enable\""));
+    assert!(!html.contains("cloudflare-setup"));
 }
 
 #[test]
@@ -428,4 +398,152 @@ fn local_desktop_context_disables_email_verification_before_page_scripts() {
 
     assert!(local.contains("AUTH_EMAIL_VERIFICATION_REQUIRED: \"false\""));
     assert!(!hosted.contains("AUTH_EMAIL_VERIFICATION_REQUIRED"));
+}
+
+/// One panic on a background thread must not become a crash on the next lock.
+///
+/// `lock().unwrap()` was the shell's idiom at fifty-one sites. A thread that
+/// panicked while holding `shell.ui` poisoned it, and the next menu refresh,
+/// tray update or quit then panicked too.
+#[test]
+fn a_lock_poisoned_by_a_panic_is_still_usable() {
+    use super::super::LockOrRecover;
+    use std::sync::{Arc, Mutex};
+
+    let shared = Arc::new(Mutex::new(1));
+    let poisoner = Arc::clone(&shared);
+    let _ = std::thread::spawn(move || {
+        let mut value = poisoner.lock().unwrap();
+        *value = 2;
+        panic!("a background thread failed while holding the lock");
+    })
+    .join();
+
+    assert!(shared.is_poisoned(), "the setup did not poison the lock");
+    assert_eq!(
+        *shared.lock_or_recover(),
+        2,
+        "the last value written is kept"
+    );
+    *shared.lock_or_recover() = 3;
+    assert_eq!(*shared.lock_or_recover(), 3);
+}
+
+/// `CONTROL` lists its modules by hand, because `include_str!` needs literal
+/// paths. A module added to `ui/control/` and not to that list would be
+/// invisible to every guard that reads Local settings.
+#[test]
+fn every_control_module_is_read_by_the_guards() {
+    let directory = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("ui/control");
+    let mut on_disk: Vec<String> = std::fs::read_dir(&directory)
+        .expect("ui/control exists")
+        .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+        .filter(|name| name.ends_with(".js"))
+        .collect();
+    on_disk.sort();
+    let mut listed: Vec<String> = CONTROL_MODULES
+        .iter()
+        .map(|name| (*name).to_owned())
+        .collect();
+    listed.sort();
+    assert_eq!(
+        on_disk, listed,
+        "add the new module to CONTROL in src/tests/mod.rs"
+    );
+}
+
+/// Reset Data is offered from Recovery, so it has to work from Recovery.
+///
+/// `ensure_locald` refuses while Recovery pauses services, and the reset went
+/// through it unchanged -- after it had already cleared the session. Asserted
+/// on the source because the path needs a live AppHandle and a daemon.
+#[test]
+fn reset_data_leaves_recovery_and_signs_out_only_once_the_reset_is_accepted() {
+    let source = include_str!("../local_recovery.rs").replace("\r\n", "\n");
+    let body = function_body(&source, "pub(crate) fn reset_local_data_impl(");
+    let leave = body
+        .find("recovery_mode.swap(false")
+        .expect("the reset leaves Recovery before it needs the daemon");
+    let ensure = body
+        .find("ensure_locald(&app)")
+        .expect("the reset starts the daemon");
+    let send = body
+        .find("\"local.reset-data\"")
+        .expect("the reset is sent");
+    let clear = body
+        .find("clear_local_session_data(&app)")
+        .expect("the session is still cleared");
+    assert!(leave < ensure, "{body}");
+    assert!(
+        send < clear,
+        "the session must survive a reset that never started: {body}"
+    );
+    assert!(
+        body.contains("recovery_mode.store(true"),
+        "a reset that cannot start must put Recovery back: {body}"
+    );
+}
+
+/// locald outlives the app by design, so it must not share the app's process
+/// group: launchd reaps a LaunchAgent job's whole group when the app exits.
+#[test]
+fn the_daemon_is_spawned_into_its_own_process_group() {
+    let source = include_str!("../locald_process.rs").replace("\r\n", "\n");
+    let spawn = function_body(&source, "pub(crate) fn spawn_locald(");
+    assert!(spawn.contains("command.process_group(0)"), "{spawn}");
+}
+
+/// Check for Updates… is always in the Lemma menu; an available update adds
+/// one row after it, named for the version, and both open the update panel.
+#[test]
+fn the_lemma_menu_offers_an_update_check_and_names_a_waiting_update() {
+    assert_eq!(
+        lemma_menu_update_items(None),
+        vec![("check-updates", "Check for Updates\u{2026}".to_owned())]
+    );
+    assert_eq!(
+        lemma_menu_update_items(Some("0.9.1")),
+        vec![
+            ("check-updates", "Check for Updates\u{2026}".to_owned()),
+            (
+                "install-update",
+                "Lemma 0.9.1 is available \u{2014} Install\u{2026}".to_owned()
+            ),
+        ]
+    );
+    let menus = include_str!("../menus.rs").replace("\r\n", "\n");
+    assert!(menus.contains(
+        "\"check-updates\" | \"install-update\" => {\n            let _ = show_control_center_page(&app, Some(\"updates\"));"
+    ));
+    // And the page knows what "updates" means in both modes.
+    assert_eq!(control_center_page(Some("updates")).unwrap(), "updates");
+    assert!(CONTROL.contains("\"updates\""));
+}
+
+#[test]
+fn the_launch_update_check_runs_only_where_an_update_could_be_installed() {
+    assert!(launch_update_check_wanted(true, false));
+    assert!(
+        !launch_update_check_wanted(false, false),
+        "a dev or unsigned build"
+    );
+    assert!(
+        !launch_update_check_wanted(true, true),
+        "Recovery starts nothing"
+    );
+    let app = include_str!("../app.rs").replace("\r\n", "\n");
+    assert!(app.contains("schedule_launch_update_check(&handle, recovery_launch);"));
+}
+
+#[test]
+fn leaving_local_settings_hands_over_only_to_known_sections() {
+    use crate::operator_settings::handover_section;
+    assert_eq!(handover_section(None), Ok(None));
+    assert_eq!(
+        handover_section(Some("this-mac-agents")),
+        Ok(Some("this-mac-agents"))
+    );
+    assert_eq!(handover_section(Some("models")), Ok(Some("models")));
+    assert!(handover_section(Some("this-mac-sharing")).is_err());
+    assert!(handover_section(Some("\"}));alert(1);//")).is_err());
 }

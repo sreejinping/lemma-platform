@@ -153,6 +153,8 @@ pub(crate) async fn one_turn(
     let outcome = run_with_deadline(
         AcpRunRequest {
             adapter: manifest.resolve(agent).unwrap(),
+            agent_environment: std::collections::BTreeMap::default(),
+            own_settings: false,
             run_spec: RunSpec {
                 agent_run_id: run_id,
                 conversation_id,
@@ -181,6 +183,7 @@ pub(crate) async fn one_turn(
             permission_timeout: Duration::ZERO,
             cancel: lemma_agent_host::acp::never_cancelled(),
             cancel_grace: Duration::from_secs(5),
+            steer: lemma_agent_host::acp::SteerInbox::default(),
         },
         callbacks.clone(),
     )
@@ -205,18 +208,23 @@ pub(crate) async fn one_turn(
 /// Runs one real agent through a paired Agent Host wired to `control`.
 ///
 /// This is the same in-process `HostRuntime` the paired smoke test uses, but
-/// pointed at `support::ControlPlane` so the run's MCP endpoint and its
-/// permission decisions can be scripted.
+/// pointed at `support::ControlPlane` so the run's Lemma tools and its
+/// permission decisions can be scripted. `endpoint`, when given, answers the
+/// tool calls the run makes over the link.
 pub(crate) async fn paired_real_run(
     agent: &str,
     prompt: &str,
     mcp: Value,
+    endpoint: Option<&support::LemmaMcpEndpoint>,
     answer: support::PermissionAnswer,
     budget: Duration,
 ) -> (TempDir, support::ControlPlane) {
     let source = HostPaths::under(agent_host_data_directory());
     let directory = TempDir::new().unwrap();
     let control = support::ControlPlane::start(agent, prompt, mcp, answer).await;
+    if let Some(endpoint) = endpoint {
+        control.serve_mcp(endpoint);
+    }
     let host = support::InProcessHost::start(
         directory.path(),
         &control,
@@ -251,7 +259,7 @@ pub(crate) fn assert_replay_matches_live(agent: &str, control: &support::Control
 
 pub(crate) async fn run_through_paired_agent_host(source_paths: &HostPaths, agent: &str) {
     let directory = TempDir::new().unwrap();
-    let mcp = support::LemmaMcpEndpoint::start(support::McpTransport::StatelessJson).await;
+    let mcp = support::LemmaMcpEndpoint::new();
     let control = support::ControlPlane::start(
         agent,
         "Begin your reply with LEMMA_PAIRED_AGENT_HOST_STREAM_OK, then write a detailed \
@@ -261,6 +269,7 @@ pub(crate) async fn run_through_paired_agent_host(source_paths: &HostPaths, agen
         support::PermissionAnswer::Deny,
     )
     .await;
+    control.serve_mcp(&mcp);
     let host = support::InProcessHost::start(
         directory.path(),
         &control,

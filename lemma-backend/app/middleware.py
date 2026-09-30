@@ -17,6 +17,7 @@ from app.core.domain.errors import PayloadTooLargeError
 from starlette.types import Scope
 
 from app.core.config import settings
+from app.version import API_VERSION
 from app.core.origin import origin_for_path, origin_scope, resolve_client_identity
 from app.core.log.log import get_logger
 
@@ -67,6 +68,34 @@ class TrailingSlashMiddleware:
         await self.app(scope, receive, send)
 
 
+def _is_older_cli(client: str | None, version: str | None) -> bool:
+    """Whether a caller is a ``lemma`` CLI older than this server's release.
+
+    An unparsable version is not flagged: the header is advice, and advice
+    built on a guess would tell a dev build to downgrade.
+    """
+    if client != "lemma-cli" or not version:
+        return False
+    current = _release_parts(version)
+    latest = _release_parts(API_VERSION)
+    if current is None or latest is None:
+        return False
+    return current < latest
+
+
+_RELEASE_RE = re.compile(r"^(\d+)\.(\d+)\.(\d+)")
+
+
+def _release_parts(version: str) -> tuple[int, int, int] | None:
+    """``MAJOR.MINOR.PATCH`` as integers; a suffix (``.dev1``, ``+local``) is
+    ignored, and anything else is unparsable. ``packaging`` is not a declared
+    dependency of this service, and the header needs no more than this."""
+    match = _RELEASE_RE.match(version)
+    if match is None:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
 class RequestObserverMiddleware:
     """Bind HTTP correlation, emit bounded terminal signals, and record metrics."""
 
@@ -74,18 +103,14 @@ class RequestObserverMiddleware:
     # How the work arrived, per docs/design/product-analytics.md. Resolved once
     # here so every downstream emit reads it from context rather than guessing.
     CLIENT_HEADER = b"x-lemma-client"
+    # Advice for an older ``lemma`` CLI, never a refusal: the value is the
+    # release this server runs, which the CLI may suggest upgrading to.
+    LATEST_CLI_HEADER = b"x-lemma-latest-cli"
     REQUEST_ID_RE = re.compile(r"^[A-Za-z0-9._:-]{1,128}$")
     SLOW_SECONDS = 2.0
     QUIET_PATHS = frozenset(
         {"/health", "/health/live", "/health/ready", "/health/capabilities", "/livez"}
     )
-    # Routes that are supposed to take a long time. A long poll answers when it
-    # has news or when its hold expires, so a slow one is the design working:
-    # every completed idle poll logged a warning, and on one local stack 311 of
-    # 314 slow-request warnings were healthy 25-second polls. A warning that
-    # fires on the normal case is not a signal, and it buried the three that
-    # meant something.
-    HELD_ROUTES = frozenset({"/agent-host/poll"})
 
     def __init__(self, app):
         self.app = app
@@ -134,6 +159,10 @@ class RequestObserverMiddleware:
                     "",
                 )
                 raw_headers.append((self.HEADER, request_id.encode("ascii")))
+                if older_cli:
+                    raw_headers.append(
+                        (self.LATEST_CLI_HEADER, API_VERSION.encode("ascii"))
+                    )
                 message = {**message, "headers": raw_headers}
             await send(message)
 
@@ -142,11 +171,11 @@ class RequestObserverMiddleware:
         )
         # The mount point wins over the header where the route itself settles
         # the question: an MCP caller sends no Lemma client header.
-        resolved_origin = origin_for_path(scope.get("path") or "") or (
-            resolve_client_identity(
-                client_header.decode("latin-1", "replace") if client_header else None
-            ).origin
+        identity = resolve_client_identity(
+            client_header.decode("latin-1", "replace") if client_header else None
         )
+        older_cli = _is_older_cli(identity.client, identity.version)
+        resolved_origin = origin_for_path(scope.get("path") or "") or identity.origin
 
         caught: Exception | None = None
         cancelled = False
@@ -243,10 +272,7 @@ class RequestObserverMiddleware:
                             if streaming and response_started_at is not None
                             else (finished_at - started_at)
                         )
-                        if (
-                            elapsed >= self.SLOW_SECONDS
-                            and fields["route"] not in self.HELD_ROUTES
-                        ):
+                        if elapsed >= self.SLOW_SECONDS:
                             fields["duration_ms"] = round(elapsed * 1000, 1)
                             fields["latency_kind"] = (
                                 "time_to_first_byte" if streaming else "total"

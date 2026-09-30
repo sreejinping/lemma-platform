@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 import inspect
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -15,6 +15,7 @@ from app.modules.agent.tools.toolset_selection import AgentGrantSummary
 from app.modules.agent.domain.harness_options import HarnessOptions
 from app.modules.agent.domain.value_objects import (
     AgentRuntimeConfig,
+    HarnessKind,
     AgentToolset,
     ConnectorAccessConfig,
     ConnectorMode,
@@ -1823,79 +1824,6 @@ def test_runner_keeps_last_five_agent_runs_in_full_and_elides_older_runs():
         assert len(grouped[recent_run.id]) == 5
 
 
-def _surface_conversation():
-    return Conversation(
-        pod_id=uuid4(),
-        user_id=uuid4(),
-        metadata={"surface_platform": "WHATSAPP"},
-    )
-
-
-def _run_with_age(*, run_index: int, hours_ago: float, message_count: int = 5):
-    run = _agent_run_with_messages(run_index, message_count=message_count)
-    stamp = datetime.now(timezone.utc) - timedelta(hours=hours_ago)
-    for message in run.messages:
-        message.created_at = stamp
-    return run
-
-
-def test_surface_history_window_trims_by_message_count(monkeypatch):
-    # Small budget so only the most recent run fits (5 msgs each, budget 6).
-    monkeypatch.setattr(
-        "app.modules.agent_surfaces.contracts.platforms.surface_history_limits",
-        lambda: (6, 0),
-    )
-    runs = [_agent_run_with_messages(i) for i in range(4)]
-    runner = AgentRunnerService(uow_factory=object(), harness_registry=object())
-
-    selected = runner._select_runtime_history(runs, _surface_conversation())
-    grouped = _messages_by_run(selected)
-
-    # Only the most recent run survives the count budget.
-    assert set(grouped) == {runs[-1].id}
-    # Its own five messages. The sixth is the notice saying the older runs were
-    # dropped -- the cap announces itself rather than trimming in silence.
-    real = [m for m in grouped[runs[-1].id] if m.kind is not MessageKind.NOTIFICATION]
-    assert len(real) == 5
-    assert any(
-        (m.metadata or {}).get("summary_kind") == "conversation_runs_dropped"
-        for m in grouped[runs[-1].id]
-    )
-
-
-def test_surface_history_window_drops_runs_older_than_window(monkeypatch):
-    monkeypatch.setattr(
-        "app.modules.agent_surfaces.contracts.platforms.surface_history_limits",
-        lambda: (40, 24),
-    )
-    old = _run_with_age(run_index=0, hours_ago=48)
-    recent = _run_with_age(run_index=1, hours_ago=1)
-    runner = AgentRunnerService(uow_factory=object(), harness_registry=object())
-
-    selected = runner._select_runtime_history(
-        runs=[old, recent], conversation=_surface_conversation()
-    )
-    grouped = _messages_by_run(selected)
-
-    # The 48h-old run is outside the 24h window; only the recent run remains.
-    assert set(grouped) == {recent.id}
-
-
-def test_surface_history_window_ignored_for_non_surface_conversation(monkeypatch):
-    monkeypatch.setattr(
-        "app.modules.agent_surfaces.contracts.platforms.surface_history_limits",
-        lambda: (6, 0),
-    )
-    runs = [_agent_run_with_messages(i) for i in range(4)]
-    runner = AgentRunnerService(uow_factory=object(), harness_registry=object())
-
-    # A plain (non-surface) conversation is unaffected by the surface window.
-    non_surface = Conversation(pod_id=uuid4(), user_id=uuid4())
-    selected = runner._select_runtime_history(runs, non_surface)
-    grouped = _messages_by_run(selected)
-    assert len(grouped) == 4
-
-
 def test_history_processors_compact_then_enforce_a_hard_ceiling():
     """Two processors, in this order, for two different failure modes.
 
@@ -2519,3 +2447,66 @@ async def test_ask_user_option_icons_ride_along_without_touching_the_pause():
     assert excinfo.value.kind == "ask_user"
     assert request.questions[0].options[0].icon == "🔐"
     assert request.questions[0].options[1].icon == "🔑"
+
+
+@pytest.mark.asyncio
+async def test_an_agent_host_run_is_served_the_notification_tools():
+    """An Agent Host run reaches its tools only through this list, so the
+    tools that answer a notification or a workflow form have to be in it; the
+    in-process harness gets them from its capability and must not see them
+    twice."""
+    agent = Agent(
+        pod_id=uuid4(),
+        user_id=uuid4(),
+        name="replier",
+        instruction="Answer what is owed.",
+        toolsets=[AgentToolset.USER_INTERACTION],
+    )
+    conversation = Conversation(
+        pod_id=agent.pod_id, user_id=agent.user_id, agent_id=agent.id
+    )
+
+    async def tool_names(**flags: bool) -> set[str]:
+        toolsets = await RunToolAssembler(object()).assemble(
+            agent=agent, conversation=conversation, **flags
+        )
+        names: set[str] = set()
+        for toolset in toolsets:
+            tools = getattr(toolset, "tools", None)
+            if tools is None and hasattr(toolset, "wrapped"):
+                tools = getattr(toolset.wrapped, "tools", None)
+            names.update(tools or {})
+        return names
+
+    remote = await tool_names(include_notification_tools=True)
+    assert {"respond_to_notification", "submit_workflow_form"} <= remote
+    in_process = await tool_names()
+    assert "respond_to_notification" not in in_process
+
+
+@pytest.mark.asyncio
+async def test_the_runner_decides_by_harness_which_runs_get_the_notification_tools():
+    agent = Agent(
+        pod_id=uuid4(),
+        user_id=uuid4(),
+        name="replier",
+        instruction="Answer what is owed.",
+        toolsets=[AgentToolset.USER_INTERACTION],
+    )
+    conversation = Conversation(
+        pod_id=agent.pod_id, user_id=agent.user_id, agent_id=agent.id
+    )
+
+    async def has_respond(harness_kind: HarnessKind) -> bool:
+        toolsets = await RunToolAssembler(object()).assemble(
+            agent=agent, conversation=conversation, harness_kind=harness_kind
+        )
+        return any(
+            "respond_to_notification"
+            in (getattr(getattr(t, "wrapped", t), "tools", None) or {})
+            for t in toolsets
+        )
+
+    assert await has_respond(HarnessKind.LEMMA) is False
+    remote = [kind for kind in HarnessKind if kind != HarnessKind.LEMMA]
+    assert remote and all([await has_respond(kind) for kind in remote])

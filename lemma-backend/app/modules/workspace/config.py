@@ -67,6 +67,17 @@ class WorkspaceSettings(BaseSettings):
             "sandboxes come to disagree about the code they are running."
         ),
     )
+    host_cli_root: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("WORKSPACE_HOST_CLI_ROOT"),
+        description=(
+            "Desktop only: the folder holding the `lemma` CLI shipped with this "
+            "backend (its `bin/lemma`), which host-execution commands on the "
+            "user's Mac find first on their PATH, so they run the CLI of this "
+            "release rather than whatever the user installed. Set by the host "
+            "pack; unset, commands use the user's own PATH."
+        ),
+    )
     workspace_profile_name: str = Field(
         default="workspace-python-v1",
         validation_alias=AliasChoices("WORKSPACE_PROFILE_NAME"),
@@ -247,6 +258,17 @@ class WorkspaceSettings(BaseSettings):
         validation_alias=AliasChoices("E2B_FUNCTION_TEMPLATE"),
         description="E2B template backing function runtime sandboxes",
     )
+    e2b_workspace_size_templates: dict[str, str] = Field(
+        default_factory=dict,
+        validation_alias=AliasChoices("E2B_WORKSPACE_SIZE_TEMPLATES"),
+        description=(
+            "Workspace templates by size, as JSON keyed `{cpu}x{memory_mb}`, "
+            'e.g. {"2x4096": "lemma-workspace-2x4096"}. E2B fixes CPU and '
+            "memory when a template is built, so a deployment whose plans sell "
+            "sizes builds one template per size and names them here. A size "
+            "with no entry is served from E2B_WORKSPACE_TEMPLATE."
+        ),
+    )
     e2b_domain: Optional[str] = Field(
         default=None,
         validation_alias=AliasChoices("E2B_DOMAIN"),
@@ -282,6 +304,16 @@ class WorkspaceSettings(BaseSettings):
         validation_alias=AliasChoices("WORKSPACE_LOCAL_RUNTIME_CLI"),
         description="Executable bridging to the Lemma Desktop guest runtime",
     )
+    local_tunnel_socket: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("WORKSPACE_LOCAL_TUNNEL_SOCKET"),
+        description=(
+            "Unix socket reaching the Lemma Desktop guest's sandbox ports over "
+            "vsock. When set, connections to the addresses the guest reports "
+            "for its sandboxes go through it instead of the network, which "
+            "macOS gates behind a Local Network permission."
+        ),
+    )
     local_callback_required: bool = Field(
         default=False,
         validation_alias=AliasChoices("WORKSPACE_LOCAL_CALLBACK_REQUIRED"),
@@ -315,6 +347,17 @@ class WorkspaceSettings(BaseSettings):
         description=(
             "Explicit frontend origin reachable from workspace sandboxes; "
             "no hostname rewriting is performed when absent."
+        ),
+    )
+    desktop_agent_host_config_path: Optional[str] = Field(
+        default=None,
+        validation_alias=AliasChoices("DESKTOP_AGENT_HOST_CONFIG_PATH"),
+        description=(
+            "Lemma Desktop only, set by locald: the config file of the Agent "
+            "Host running on this same Mac. The host ids of its pairings are "
+            "what tell that host apart from any other host paired to this "
+            "backend, and only a user it is paired to is given the loopback "
+            "relay. Unset means no sandbox gets the relay."
         ),
     )
 

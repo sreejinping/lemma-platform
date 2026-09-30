@@ -18,6 +18,8 @@ async fn codex_native_image_generation_creates_a_publishable_artifact() {
     let run = run_with_deadline(
         AcpRunRequest {
             adapter: manifest.resolve("codex").unwrap(),
+            agent_environment: std::collections::BTreeMap::default(),
+            own_settings: false,
             run_spec: RunSpec {
                 agent_run_id: Uuid::new_v4(),
                 conversation_id: Uuid::new_v4(),
@@ -54,6 +56,7 @@ async fn codex_native_image_generation_creates_a_publishable_artifact() {
             permission_timeout: Duration::ZERO,
             cancel: lemma_agent_host::acp::never_cancelled(),
             cancel_grace: Duration::from_secs(5),
+            steer: lemma_agent_host::acp::SteerInbox::default(),
         },
         callbacks,
     );
@@ -84,10 +87,10 @@ async fn real_agents_discover_and_call_a_lemma_mcp_tool() {
     // only a real provider can: that a commercial agent, handed the `lemma`
     // server through ACP, actually discovers `lemma_*` tools and calls one.
     //
-    // Lemma itself is still a stand-in; the endpoint here speaks the same
-    // stateless JSON-RPC-over-HTTP contract `app/mcp_server.py` mounts.
+    // Lemma itself is still a stand-in; it answers the link's `mcp` frames with
+    // the same result objects `app/mcp_server.py` produces.
     for agent in configured_agents() {
-        let endpoint = support::LemmaMcpEndpoint::start(support::McpTransport::StatelessJson).await;
+        let endpoint = support::LemmaMcpEndpoint::new();
         let (_directory, control) = paired_real_run(
             &agent,
             concat!(
@@ -97,6 +100,7 @@ async fn real_agents_discover_and_call_a_lemma_mcp_tool() {
                 "tool returned."
             ),
             endpoint.run_configuration(),
+            Some(&endpoint),
             support::PermissionAnswer::AllowOnce,
             Duration::from_secs(300),
         )
@@ -117,8 +121,8 @@ async fn real_agents_discover_and_call_a_lemma_mcp_tool() {
             "{agent} called the wrong Lemma tool"
         );
         assert_eq!(
-            call.agent_run_id.as_deref(),
-            Some(control.run_id.to_string().as_str()),
+            call.run_id,
+            control.run_id.to_string(),
             "{agent}'s tool call was not attributed to its run"
         );
         assert!(
@@ -203,9 +207,9 @@ async fn a_real_agents_native_tool_waits_for_lemmas_approval() {
             &gated.prompt(),
             json!({
                 "server_name": "lemma_tools",
-                "url": "https://unused.invalid/mcp",
-                "authorization": "Bearer unused-real-permission-e2e",
+                "token": "unused-real-permission-e2e",
             }),
+            None,
             support::PermissionAnswer::AllowOnce,
             Duration::from_secs(300),
         )
@@ -262,9 +266,9 @@ async fn a_real_agents_denied_tool_is_stopped_without_waiting_out_the_timeout() 
             &gated.prompt(),
             json!({
                 "server_name": "lemma_tools",
-                "url": "https://unused.invalid/mcp",
-                "authorization": "Bearer unused-real-permission-e2e",
+                "token": "unused-real-permission-e2e",
             }),
+            None,
             support::PermissionAnswer::Deny,
             Duration::from_secs(300),
         )
@@ -319,13 +323,14 @@ async fn a_real_agents_denied_tool_is_stopped_without_waiting_out_the_timeout() 
 /// then uses their answer — rather than treating the slow tool as a failure,
 /// giving up, or answering from its own head.
 ///
-/// The stand-in withholds the decision for two polls, so the agent genuinely
-/// waits rather than being handed an answer that happened to be ready.
+/// The stand-in withholds the decision for a moment after the wait arrives, so
+/// the agent genuinely waits rather than being handed an answer that happened
+/// to be ready.
 #[tokio::test]
 #[ignore = "requires authenticated local agents and spends real provider quota"]
 async fn a_real_agent_waits_inside_its_turn_for_a_parked_tool() {
     for agent in configured_agents() {
-        let endpoint = support::LemmaMcpEndpoint::start(support::McpTransport::StatelessJson).await;
+        let endpoint = support::LemmaMcpEndpoint::new();
         let (_directory, control) = paired_real_run(
             &agent,
             concat!(
@@ -335,6 +340,7 @@ async fn a_real_agent_waits_inside_its_turn_for_a_parked_tool() {
                 "with exactly the value it gives for the key 'Pick one'."
             ),
             endpoint.run_configuration(),
+            Some(&endpoint),
             support::PermissionAnswer::AllowOnce,
             Duration::from_secs(300),
         )
@@ -349,9 +355,8 @@ async fn a_real_agent_waits_inside_its_turn_for_a_parked_tool() {
         // The bridge really held the response open rather than handing the
         // placeholder straight to the agent.
         assert!(
-            endpoint.interaction_polls() > 2,
-            "{agent}'s bridge did not wait: {} poll(s)",
-            endpoint.interaction_polls()
+            endpoint.interaction_waits() >= 1,
+            "{agent}'s bridge never waited for the person"
         );
         // And the agent used the person's answer, which it could only have
         // received as that tool's return.
@@ -366,8 +371,9 @@ async fn a_real_agent_waits_inside_its_turn_for_a_parked_tool() {
 
 /// Waking up, with a real agent on the other end.
 ///
-/// A woken run adds no user message, so Lemma prompts it with the return it
-/// synthesized for the `snooze` call it resolved — rendered exactly as
+/// A woken run adds no user message, so Lemma prompts it with the `wait_for`
+/// result it synthesized for the wait it resolved (`woke_because` saying
+/// why) — rendered exactly as
 /// `remote_payload._render_history` writes it. The hermetic tests prove that
 /// return is chosen and rendered. Only a real provider can prove the part that
 /// decides whether the feature works: that an agent resuming its own session
@@ -381,7 +387,7 @@ async fn a_real_agent_waits_inside_its_turn_for_a_parked_tool() {
 /// about what the agent was waiting for.
 #[tokio::test]
 #[ignore = "requires authenticated local agents and spends real provider quota"]
-async fn a_real_agent_wakes_and_carries_on_where_it_slept() {
+async fn a_real_agent_wakes_and_carries_on_where_it_waited() {
     let paths = HostPaths::under(agent_host_data_directory());
     let manifest = AdapterManifest::builtin()
         .unwrap()
@@ -396,14 +402,14 @@ async fn a_real_agent_wakes_and_carries_on_where_it_slept() {
             &agent,
             conversation_id,
             "You are waiting for the Fenwick deployment to finish. It is not \
-             ready yet, so you called the snooze tool to sleep. Reply with \
-             only: sleeping.",
+             ready yet, so you called the wait_for tool with seconds=600 to \
+             wait before checking again. Reply with only: waiting.",
             None,
         )
         .await;
 
         // Exactly the shape `_render_history` produces for the return the wake
-        // writes, prompted into the session the agent slept in. Deliberately
+        // writes, prompted into the session the agent waited in. Deliberately
         // says nothing about the subject: everything the agent knows about what
         // it was doing has to come from the session it is resuming.
         let (resumed_session_id, answer) = one_turn(
@@ -411,23 +417,23 @@ async fn a_real_agent_wakes_and_carries_on_where_it_slept() {
             &workspace,
             &agent,
             conversation_id,
-            "TOOL:\nTool result snooze(lemma-mcp-1):\n{\n  \"success\": true,\n  \
-             \"woke_because\": \"TIMER\",\n  \"slept_seconds\": 600,\n  \
-             \"note_to_self\": \"name what you were waiting for, in one \
-             sentence\",\n  \"message\": \"Your time elapsed. That is all this \
-             means - check whatever you were waiting for before acting as \
-             though it happened.\"\n}",
+            "TOOL:\nTool result wait_for(lemma-mcp-1):\n{\n  \"success\": true,\n  \
+             \"error\": null,\n  \"message\": \"Your time elapsed. That is all \
+             this means - check whatever you were waiting for before acting as \
+             though it happened.\",\n  \"woke_because\": \"TIMER\",\n  \
+             \"waited_seconds\": 600,\n  \"note_to_self\": \"name what you \
+             were waiting for, in one sentence\",\n  \"exit_code\": null\n}",
             Some(session_id.clone()),
         )
         .await;
 
         assert_eq!(
             resumed_session_id, session_id,
-            "{agent} woke in a different session than the one it slept in"
+            "{agent} woke in a different session than the one it waited in"
         );
         assert!(
             answer.to_lowercase().contains("fenwick"),
-            "{agent} did not carry on from where it slept; it answered {answer:?}"
+            "{agent} did not carry on from where it waited; it answered {answer:?}"
         );
         println!("{agent}: LEMMA_REAL_WAKE_OK -> {answer:?}");
     }

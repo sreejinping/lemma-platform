@@ -214,6 +214,7 @@ class ResumeToolReturnBuilder:
             agent_run_id=paused_agent_run_id,
             tool_name=inner_tool,
             args=dict(inner_args),
+            approval_id=tool_call_id,
         )
         if executed["ok"]:
             content = RequestApprovalResponse(
@@ -319,6 +320,7 @@ class ResumeToolReturnBuilder:
         agent_run_id: UUID,
         tool_name: str,
         args: dict[str, object],
+        approval_id: str | None = None,
     ) -> dict[str, object]:
         """Run an approved tool with the user's authority; never raise."""
         deps = await self._build_resume_context(
@@ -331,6 +333,7 @@ class ResumeToolReturnBuilder:
             deps=deps,
             tool_name=tool_name,
             args=args,
+            approval_id=approval_id,
         )
 
     async def _build_resume_context(
@@ -358,6 +361,9 @@ class ResumeToolReturnBuilder:
             AgentCallableToolFactory,
         )
         from app.modules.agent.tools.context import ConversationContext
+        from app.modules.agent.services.host_execution_selection import (
+            recorded_host_workspace,
+        )
         from app.core.crypto import get_secret_cipher
         from app.modules.agent.services.workspace_location import resolve_pod_cwd
 
@@ -411,4 +417,8 @@ class ResumeToolReturnBuilder:
             workspace_cwd=workspace_location.cwd,
             workspace_repo=workspace_location.repo,
             pod_cwd=resolve_pod_cwd(conversation),
+            # The paused run's own recorded choice, never a new one: an
+            # approved command must land where the run was executing
+            # (desktop-host-execution.md §2), not silently in the VM.
+            host_workspace=await recorded_host_workspace(agent_run_id),
         )

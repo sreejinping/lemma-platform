@@ -17,8 +17,25 @@ The table below is generated from the committed OpenAPI specification by `script
 | `workspace.files.content` | GET | `/workspace/files:content` | Read workspace file content |
 | `workspace.files.list` | GET | `/workspace/files` | List workspace files |
 | `workspace.files.stat` | GET | `/workspace/files:stat` | Stat one workspace file |
+| `workspace.status` | GET | `/workspace/status` | Whether your computer is ready |
 
 <!-- /generated:operations -->
+
+## `workspace.status`
+
+What the caller's own workspace is doing, for a page waiting on it. Never
+starts or wakes anything: asking must not be what wakes a sleeping computer.
+
+- `ready`: running.
+- `downloading`: fetching its image, which the first start after an update does.
+- `starting`: coming up.
+- `asleep`: not running; starts on first use.
+- `unavailable`: the answer could not be read; poll again.
+
+`detail` is a sentence for a person while `downloading` or `starting`.
+`done_mb` and `total_mb` report download progress while `downloading`, once
+the guest has the image's manifest; before that, and on fabrics that cannot
+measure it, they are absent.
 
 ## `workspace.files.list`
 

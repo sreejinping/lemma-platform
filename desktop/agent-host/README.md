@@ -17,12 +17,28 @@ boundary for the workspace page - is in
 
 ```mermaid
 flowchart LR
-    L["Lemma control plane"] <-->|"outbound HTTPS<br/>leases + durable events"| H["Lemma Agent Host"]
+    L["Lemma"] <-->|"one outbound WebSocket<br/>commands, events, MCP"| H["Lemma Agent Host"]
     H <-->|"ACP v1 over stdio"| A["Certified local agent"]
-    A <-->|"run-scoped stdio MCP bridge"| M["Lemma MCP route"]
+    A <-->|"stdio MCP"| B["mcp-bridge"]
+    B <-->|"loopback relay"| H
     D["Lemma Desktop"] --> LD["lemma-locald"]
     LD -->|"supervise + diagnose"| H
 ```
+
+Everything between the host and Lemma travels on one WebSocket per paired
+workspace -- commands down; events, checkpoints and harnesses up; and the
+agent's calls to Lemma's own MCP tools, which the adapter-private `mcp-bridge`
+hands to the host over a loopback relay. See
+[The link](../../docs/architecture/agent-host.md#the-link) for the frames, close
+codes and delivery rules.
+
+What the host reports is already normalized: one module per adapter under
+`src/normalize` turns each agent's ACP shapes into typed events -- a tool call
+named `exec_command` whether the agent called it `Bash` or `shell`, announced
+once its input is final. See
+[Agent Host run events](../../docs/architecture/agent-host-events.md), and
+"Golden transcripts" there for how the normalizers are held to real adapter
+output.
 
 The control-plane transport is at-least-once. Before any provider side effect,
 Agent Host writes the command, lease epoch, dispatch intent, checkpoints, and
@@ -62,6 +78,18 @@ Three properties this depends on:
 
 Profile configuration and the model are re-applied to a resumed session exactly
 as to a new one, so editing a profile still takes effect on the next turn.
+
+### Messages sent while a turn is running
+
+ACP's `session/prompt` is one request per turn and v1 cannot add to it. The
+Claude Code and Codex adapters both implement the `_session/steering` extension,
+advertised in `initialize`'s `_meta`; the probe publishes it as the harness
+capability `steering`, and Lemma sends `STEER_RUN` only to a harness that has
+it. The run's driver sends each steer once its prompt is out and reports a
+`steer_result` event saying whether the adapter `injected` it. Anything short of
+that -- an adapter without steering, a turn that ended first -- is reported as
+undelivered, and Lemma's follow-up turn carries the message instead. See
+[agent-host-events.md](../../docs/architecture/agent-host-events.md#steering).
 
 ## Certified integrations
 
@@ -109,14 +137,16 @@ somewhere else.
   no usable credentials; locally the secret lives only in the owner-only
   `config.json` (mode 0600 on Unix).
 - Pairing uses a short-lived, single-use code; the issued secret is returned
-  exactly once at enrollment and all device traffic is scoped to the five
-  Agent Host device endpoints.
+  exactly once at enrollment, and all device traffic is scoped to the one
+  Agent Host link, which authenticates the secret once per connection.
 - Target URLs require HTTPS. Plain HTTP is accepted only for an explicitly
   opted-in loopback development target.
 - Provider OAuth/API credentials remain inside the provider's own local
   credential store.
-- Lemma MCP credentials are encrypted at rest, scoped to one run and lease
-  epoch, and exposed only to an adapter-private MCP bridge.
+- Lemma MCP credentials are encrypted at rest and scoped to one run and lease
+  epoch. The adapter-private MCP bridge never holds one: it reaches the host's
+  loopback relay with a random per-host token kept in an owner-only file, and
+  the relay reads the run's current credential from the journal for each call.
 - Agent Host does not advertise ACP client-side filesystem or terminal
   capabilities, permission requests fail closed, and known unrestricted or
   pre-approved provider modes are filtered and rejected again at dispatch.
@@ -206,6 +236,75 @@ lemma-agent-host disconnect --target my-workspace
 If a target is permanently unreachable, `--force-local` removes only the local
 state. The remote device must then be revoked from Lemma separately.
 
+## What each agent loads
+
+Each run starts its agent with the agent's own instructions, skills, plugins,
+hooks and MCP servers left out, where the agent has a switch for that, so that
+what it is told and can use is Lemma's (`src/acp/session_options.rs`;
+`docs/architecture/agent-host.md`, "What a coding agent loads", has the table).
+Per agent, the person can put their own back:
+
+```bash
+lemma-agent-host own-settings enable claude-code    # load ~/.claude as in a terminal
+lemma-agent-host own-settings disable claude-code   # Lemma's only (the default)
+```
+
+The setting is `own_settings` in `config.json`, read by each run as it starts.
+
+## Host execution
+
+On macOS the host can also run the paired user's Lemma agent commands on this
+computer, inside a Seatbelt sandbox, instead of in the VM -- for the pairing
+with the Lemma installed on this computer only (plain HTTP to loopback), never
+for a hosted workspace or anybody else's install. It is off until the user
+turns it on (Settings, or the CLI, which acts on that local pairing):
+
+```bash
+lemma-agent-host host-execution enable        # needs macOS and /usr/bin/sandbox-exec
+lemma-agent-host host-execution status --json
+lemma-agent-host host-execution refresh-environment   # after changing ~/.zshrc etc.
+lemma-agent-host host-execution disable       # also stops everything running
+```
+
+The setting is `host_execution` on the local pairing's target in
+`config.json` (an older host-wide `host_execution` is moved there when the
+config is read); a running host re-reads it
+within five seconds and reports it on its next `control` frame. Lemma sends
+`op` frames on the link; the host starts one **exec-server** per open workspace
+-- this same binary, `lemma-agent-host exec-server`, under
+`/usr/bin/sandbox-exec` with the profile in `resources/host-sandbox.sb`
+(compiled into the binary) -- and relays each op to it over stdio. The
+exec-server's environment is the owner's login shell's (`$SHELL -lic`, cached in
+`host-environment.json` in the data directory) with credentials removed, and
+with the `bin/` of the `lemma` CLI Lemma named in `workspace.open` first on
+`PATH` when the host accepts that folder. See
+`docs/architecture/desktop-host-execution.md` for the ops, the path policy and
+the profile.
+
+**Debugging an exec-server by hand.** It speaks one JSON object per line on
+stdin and answers one per line on stdout, in whatever order ops finish; logs go
+to stderr. Run it unconfined:
+
+```bash
+printf '%s\n' \
+  '{"id":"1","workspace":"w","method":"workspace.open","params":{"slug":"debug"}}' \
+  '{"id":"2","workspace":"w","method":"process.start","params":{"shell_command":"echo hi"}}' \
+  | lemma-agent-host exec-server --root-base /tmp/lemma-debug
+```
+
+or confined exactly as the host runs it, which is how to find out whether a
+tool fails because of the profile (`Operation not permitted` is Seatbelt):
+
+```bash
+sandbox-exec -p "$(cat desktop/agent-host/resources/host-sandbox.sb)" \
+  -D ROOT=/private/tmp/lemma-debug -D HOME="$HOME" \
+  -D TMP="$(cd "$TMPDIR" && pwd -P)" \
+  /bin/bash -c 'cd /private/tmp/lemma-debug && gh auth status'
+```
+
+`log stream --predicate 'sender == "Sandbox"'` shows each denial as it
+happens. Setuid programs (`ps`, `sudo`) cannot run under any sandbox profile.
+
 ## Direct adapter smoke tests
 
 The `run` subcommand exercises the real ACP adapter and provider authentication
@@ -255,7 +354,8 @@ Default data locations:
 | Windows | `%LOCALAPPDATA%\Lemma\agent-host` |
 
 `config.json` contains target metadata and the per-target host secret (the
-file is owner-only). `journal.sqlite3` contains durable commands, run states,
+file is owner-only). `mcp-relay/<target>.json` holds the loopback port and token
+the MCP bridge uses to reach the host, also owner-only. `journal.sqlite3` contains durable commands, run states,
 and the event outbox; run-scoped MCP configurations are journaled with their
 runs until the backend acknowledges delivery. Set
 `LEMMA_AGENT_HOST_DATA_DIR` only for development or isolated test runs.
@@ -265,13 +365,22 @@ runs until the backend acknowledges delivery. Set
 The crate has:
 
 - unit tests for manifest pinning, version gates, configuration, lease
-  heartbeats, journal replay, stream upsert synthesis, and service
-  definitions;
+  heartbeats, journal replay, stream upsert synthesis, the link and its
+  close codes, the per-adapter normalizers, and service definitions;
+- golden-transcript tests replaying real recorded adapter sessions through the
+  normalizers (`tests/normalize_golden.rs`; see "Golden transcripts" in
+  `docs/architecture/agent-host-events.md`);
 - a fake-process ACP end-to-end test using the official Rust ACP SDK;
-- a loopback HTTP end-to-end test covering pairing, polling, harness
-  publication, event replay, and self-revocation;
+- exec-server tests for every host-execution op, the output ring, chunked
+  uploads, the path policy and environment scrubbing, and link tests that
+  drive `op` frames through a relay (`src/host_exec/tests.rs`,
+  `src/link/tests.rs`);
+- on macOS, `tests/seatbelt.rs`, which runs real processes under the Seatbelt
+  profile and proves its denials and allowances;
+- a loopback link end-to-end test covering pairing, pushed commands, harness
+  publication, event replay, reconnects, and self-revocation;
 - backend PostgreSQL migration and full protocol tests; and
-- a real backend/worker/Rust-host HTTP test, with a scripted ACP provider,
+- a real backend/worker/Rust-host test over the link, with a scripted ACP provider,
   proving live conversation streaming, second turns, persistence after a
   client disconnect or provider crash, and concurrent tool approvals;
 - Desktop/locald supervision tests that verify restart and full process-tree
@@ -314,7 +423,7 @@ LEMMA_REAL_AGENT_HOST_DATA_DIR=/path/to/agent-host-data \
 Set `LEMMA_REAL_AGENT_E2E_AGENTS=codex,opencode` to select a subset. These tests
 are release qualification, not public CI: they require dedicated provider test
 accounts and spend real quota. The paired fixture exercises the real Rust host;
-the backend's HTTP integration tests separately exercise its control-plane implementation.
+the backend's link integration tests separately exercise its control-plane implementation.
 
 Run `make desktop-agent-host-e2e` from the repository root to join those halves:
 it builds the Rust host and pairs it with the real backend and worker. PostgreSQL,
@@ -327,7 +436,8 @@ backend dependencies, and Docker on macOS or Linux, with no provider credentials
 It runs in the required Desktop contracts CI job. Native Windows provider and
 packaged-app qualification remain separate.
 
-`make desktop-agent-host-browser-e2e` adds the real web chat: sending a message,
+`make desktop-agent-host-browser-e2e` adds the real web chat, in lemma-frontend
+(the workspace Desktop serves, started with `server.mjs --dev`): sending a message,
 reading the approval card, approving or denying the native tool, live Unicode
 streaming, Stop, simultaneous approvals with different decisions, a provider
 crash, closing/reopening a streaming chat, and reloading
@@ -347,18 +457,23 @@ synthetic ACP v1 exchanges, consumed by the same ACP SDK as installed providers.
 They do not replace backend endpoints or the chat UI with mocks. The streaming
 fixtures are also shared with the Rust process-level regressions.
 
-A version-1 scenario has `steps` and an optional `stopReason`. Each step has one
-action:
+A version-1 scenario has `steps`, an optional `stopReason`, and an optional
+`steering: true` that makes the agent advertise `_session/steering` in
+`initialize` the way the pinned Claude Code and Codex adapters do. Each step has
+one action:
 
 - `send`: an actual ACP JSON-RPC notification or permission request.
 - `await_permission`: wait for a response by request `id`, then replay the
   `selected[optionId]` or `cancelled` steps. Unknown responses fail the test.
 - `await_cancel`: require the host's `session/cancel` notification.
+- `await_steer`: wait for a `_session/steering` request and answer it with the
+  step's `outcome` (`injected` by default, or `startedNewTurn`); an injected
+  steer is echoed as agent text after the step's `echo` prefix.
 - `await_release`: wait until the test client has observed live output and
   creates the traffic log's sibling `.release` file.
 - `exit`: simulate a provider process failure with the given exit code.
 
-The parallel fixture sends both requests before either is answered. The HTTP
+The parallel fixture sends both requests before either is answered. The link
 test answers the second first and makes different decisions, then checks exact
 ACP responses, complete arguments, and one saved result per tool. Waiting for
 approval uses a connection-owned task so later notifications and requests can
