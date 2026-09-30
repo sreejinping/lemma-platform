@@ -66,6 +66,8 @@ async def _delivered_key(event: str, payload: dict) -> dict:
     [
         "push",
         "pull_request",
+        "pull_request_review",
+        "pull_request_review_comment",
         "issues",
         "issue_comment",
         "workflow_run",
@@ -87,6 +89,8 @@ async def test_the_stored_key_matches_the_delivered_key(event):
     payloads = {
         "push": {"after": "abc"},
         "pull_request": {"action": "opened", "pull_request": {"id": 1, "head": {}}},
+        "pull_request_review": {"action": "submitted", "review": {"id": 7}},
+        "pull_request_review_comment": {"action": "created", "comment": {"id": 8}},
         "issues": {"action": "opened", "issue": {"id": 2}},
         "issue_comment": {"action": "created", "comment": {"id": 3}},
         "workflow_run": {"workflow_run": {"id": 4, "status": "completed"}},

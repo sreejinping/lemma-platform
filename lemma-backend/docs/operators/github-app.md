@@ -16,6 +16,15 @@ the source of truth for what the App needs. It is checked in so the permission
 set is reviewable, and so a new environment is a copy rather than a memory
 exercise.
 
+**The manifest applies at creation, and only at creation.** GitHub keeps the
+event subscription list on the App itself and reads the manifest once, while the
+App is being created; nothing re-reads it afterwards. So shipping a build that
+offers a new trigger does not subscribe an existing App to its event, and the
+failure is the quiet kind: the trigger is offered, a schedule built on it is
+accepted, and no delivery ever arrives. Tick the new event under **Permissions &
+events** on the App's settings page before the build offering the trigger goes
+out. A new environment needs nothing extra -- the manifest already has it.
+
 ```bash
 uv run python scripts/create_github_app.py --name lemma-dev --base-url https://api.dev.example.com
 uv run python scripts/create_github_app.py --name Lemma --base-url https://api.lemma.work --org lemma-work
@@ -49,7 +58,7 @@ For local work `make dev-public` prints the public API URL to use for both.
 |---|---|
 | `metadata: read` | Mandatory for every App |
 | `contents: write` | Cloning, pushing, branches, and the sandbox's `git` |
-| `pull_requests: write` | Opening, reviewing and merging pull requests |
+| `pull_requests: write` | Opening, reviewing and merging pull requests, and receiving `pull_request_review` and `pull_request_review_comment` |
 | `issues: write` | Issues, comments, labels, assignees |
 | `actions: write` | Runs, re-runs, cancels, `workflow_dispatch` |
 | `checks: read` | Reacting to `check_suite` |
@@ -222,7 +231,7 @@ manifest that lists `installation` or `installation_repositories` --
 "Default events unsupported" -- and delivers them to every App regardless.
 Observed live before the rejection was known:
 `installation.new_permissions_accepted` arrived twice while the App's `events`
-contained neither. The seven trigger events do have to be subscribed; these two
+contained neither. The nine trigger events do have to be subscribed; these two
 must be left out.
 
 An `installation` delivery with `deleted` or `suspend` retires what the

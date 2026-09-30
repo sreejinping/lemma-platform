@@ -45,6 +45,8 @@ SUPPORTED_EVENTS = frozenset(
     {
         "push",
         "pull_request",
+        "pull_request_review",
+        "pull_request_review_comment",
         "issues",
         "issue_comment",
         "workflow_run",
@@ -65,6 +67,22 @@ def _pull_request_key(payload: WebhookPayload) -> str | None:
     pull_request = payload.get("pull_request") or {}
     head_sha = (pull_request.get("head") or {}).get("sha")
     return f"{pull_request.get('id')}:{payload.get('action')}:{head_sha}"
+
+
+def _pull_request_review_key(payload: WebhookPayload) -> str | None:
+    # The review, and what happened to it. Its id survives a redelivery, and
+    # the action keeps a submission, a later edit and a dismissal of the same
+    # review from collapsing onto one another -- they are three different
+    # things a schedule may be told to fire on.
+    review = payload.get("review") or {}
+    return f"{review.get('id')}:{payload.get('action')}"
+
+
+def _pull_request_review_comment_key(payload: WebhookPayload) -> str | None:
+    # The same shape as `_issue_key`: an inline review comment is a comment,
+    # and the comment is the thing that happened.
+    comment = payload.get("comment") or {}
+    return f"{comment.get('id')}:{payload.get('action')}"
 
 
 def _issue_key(payload: WebhookPayload) -> str | None:
@@ -94,6 +112,8 @@ def _release_key(payload: WebhookPayload) -> str | None:
 _EVENT_KEYS: dict[str, Callable[[WebhookPayload], str | None]] = {
     "push": _push_key,
     "pull_request": _pull_request_key,
+    "pull_request_review": _pull_request_review_key,
+    "pull_request_review_comment": _pull_request_review_comment_key,
     "issues": _issue_key,
     "issue_comment": _issue_key,
     "workflow_run": _workflow_run_key,
@@ -244,15 +264,25 @@ class GitHubWebhookSource:
         )
 
 
+#: The events whose payload carries the pull request it is about, so the branch
+#: to bind is that pull request's head rather than the repository default.
+_PULL_REQUEST_EVENTS = frozenset(
+    {"pull_request", "pull_request_review", "pull_request_review_comment"}
+)
+
+
 def _ref_for(payload: WebhookPayload, event: str) -> str | None:
     """The branch the agent should be standing on.
 
     A pull request event is about its *head*: an agent asked to review one and
-    dropped on `main` is looking at the wrong code. Everything else is about
-    wherever the repository's default branch is, which is what a clone gives you
-    without asking.
+    dropped on `main` is looking at the wrong code. A review and an inline
+    review comment carry the same `pull_request` object, so an agent woken by
+    one answers the findings where they were written -- on the branch under
+    review -- instead of on the default branch they were raised against.
+    Everything else is about wherever the repository's default branch is, which
+    is what a clone gives you without asking.
     """
-    if event == "pull_request":
+    if event in _PULL_REQUEST_EVENTS:
         return ((payload.get("pull_request") or {}).get("head") or {}).get("ref")
     if event == "push":
         # `refs/heads/topic` -> `topic`. A tag push gives `refs/tags/...`, which
