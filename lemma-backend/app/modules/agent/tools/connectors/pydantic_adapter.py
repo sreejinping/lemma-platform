@@ -20,7 +20,6 @@ from __future__ import annotations
 from typing import Any
 from uuid import UUID
 
-import jsonschema
 from pydantic_ai.tools import RunContext
 from pydantic_ai.toolsets import FunctionToolset
 
@@ -42,8 +41,9 @@ from app.modules.agent.tools.context import BaseAgentContext
 from app.modules.connectors.services.connector_operation_search import (
     search_across_auth_configs,
 )
-
-_MAX_VIOLATIONS = 10
+from app.modules.connectors.contracts.operation_payload_validation import (
+    describe_payload_mismatch,
+)
 
 
 def _error(code: str, message: str, **extra: Any) -> dict[str, Any]:
@@ -167,28 +167,50 @@ async def describe_connector_operation(
 def _validate_arguments(
     schema: dict[str, Any] | None, arguments: dict[str, Any]
 ) -> dict[str, Any] | None:
-    """Return a structured error if the arguments do not fit, else None."""
-    if not schema:
-        return None
-    validator = jsonschema.Draft202012Validator(schema)
-    errors = sorted(
-        validator.iter_errors(arguments), key=lambda e: list(e.absolute_path)
-    )
-    if not errors:
+    """Return a structured error if the arguments do not fit, else None.
+
+    The diagnosis is the connector module's own, so a model and a REST caller
+    are told the same thing about the same payload. It used to be a second
+    implementation here, which is how the tool came to name the fields while
+    every other caller was told only that the request had been rejected.
+    """
+    mismatch = describe_payload_mismatch(schema, arguments)
+    if mismatch is None:
         return None
     return _error(
         "invalid_arguments",
-        "The arguments do not match this operation's input schema.",
+        mismatch.message,
         violations=[
             {
-                "path": "/".join(str(part) for part in error.absolute_path) or "(root)",
-                "message": error.message,
+                "path": violation.field,
+                "kind": violation.kind,
+                "message": violation.message,
             }
-            for error in errors[:_MAX_VIOLATIONS]
+            for violation in mismatch.violations
         ],
         # Handed back so the model can correct itself without another round trip.
         input_schema=schema,
     )
+
+
+def _connector_error_text(exc: DomainError) -> str:
+    """An error's own words, redacted -- except when they are the provider's.
+
+    `safe_error_text` exists because `httpx` stringifies with the whole URL, and
+    a signed storage link or a callback token in a query would land in the
+    model's context and in the transcript a person reads back. A connector
+    error's message is not that: it is the provider's own sentence about the
+    request, or the connector module's diagnosis of it, and the connector module
+    is where the decision about what it may say is made.
+
+    So the provider's words are recognised the way that module marks them -- it
+    files them under `upstream_message` -- and pass through here as they came.
+    Everything else keeps the redaction.
+    """
+    details = getattr(exc, "details", None)
+    if isinstance(details, dict) and isinstance(details.get("upstream_message"), str):
+        return str(exc)
+    return safe_error_text(exc)
 
 
 @connectors_toolset.tool
@@ -276,5 +298,5 @@ async def run_connector_operation(
     except DomainError as exc:
         # Connector failures are information for the model (wrong argument,
         # account needs reconnecting), not a reason to end the run.
-        return _error(exc.code or "connector_error", safe_error_text(exc))
+        return _error(exc.code or "connector_error", _connector_error_text(exc))
     return bounded_tool_payload(to_json_value(response), what="connector response")

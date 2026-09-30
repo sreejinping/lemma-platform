@@ -22,7 +22,7 @@ def _safe_connector_details(details: object | None) -> dict | None:
             "upstream_code",
             # What the provider itself said. Hiding it left a caller holding a
             # status code and no way to tell "invalid_scope" from "repository
-            # not found". Scrubbed of secret-shaped text where it is built.
+            # not found". The one detail that leaves unredacted; see below.
             "upstream_message",
             # Which connector and operation, and when to come back. The circuit
             # breaker builds both and they were dropped here, so a caller got
@@ -33,7 +33,18 @@ def _safe_connector_details(details: object | None) -> dict | None:
             "retry_after",
         }
     }
-    return redact_value(allowed) if allowed else None
+    if not allowed:
+        return None
+    # The provider's own sentence leaves as the provider wrote it. It is the one
+    # value here that explains the failure, and rewriting it -- paraphrasing it,
+    # or swapping a token-shaped word inside it for `[REDACTED]` -- hands the
+    # caller a message it cannot act on. Every other value keeps `redact_value`,
+    # and the logging pipeline's own pass over these events is untouched.
+    upstream_message = allowed.pop("upstream_message", None)
+    safe = redact_value(allowed)
+    if isinstance(upstream_message, str):
+        safe["upstream_message"] = upstream_message
+    return safe
 
 
 class ConnectorDomainError(DomainError):
@@ -331,9 +342,19 @@ class OperationExecutionTimeoutError(OperationExecutionError):
 
 
 class OperationExecutionValidationError(OperationExecutionError):
+    """The caller's request was refused before or by the provider.
+
+    The caller's own message is kept when it has one. Two things arrive that
+    way: our diagnosis of a payload that does not fit the operation's input
+    schema, which names the fields that are wrong and where they belong, and the
+    provider's own words about a request it refused. Both say more than the
+    fixed sentence below, which is now the fallback for the paths that have
+    nothing to add.
+    """
+
     def __init__(self, message: str, details: object | None = None):
         super().__init__(
-            message="Connector rejected the operation request.",
+            message=message or "Connector rejected the operation request.",
             code="OPERATION_EXECUTION_VALIDATION_ERROR",
             status_code=422,
             details=_safe_connector_details(details),

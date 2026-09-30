@@ -30,7 +30,6 @@ from app.modules.connectors.domain.results import BinaryContentResult
 
 from app.core.log.log import get_logger
 from app.core.net.url_guard import UnsafeUrlError, assert_safe_url
-from app.core.redaction import redact_text
 from app.modules.connectors.domain.errors import (
     OperationExecutionInfrastructureError,
     OperationExecutionValidationError,
@@ -41,6 +40,14 @@ logger = get_logger(__name__)
 # Matches `plumbing._UPSTREAM_MESSAGE_LIMIT`: enough of the provider's own words
 # to debug with, not enough to be a payload dump.
 _UPSTREAM_MESSAGE_LIMIT = 2000
+
+
+def _bounded(text: str) -> str:
+    """The server's own words, capped. Not redacted: see `raise_on_tool_error`."""
+    stripped = text.strip()
+    if len(stripped) > _UPSTREAM_MESSAGE_LIMIT:
+        return stripped[:_UPSTREAM_MESSAGE_LIMIT] + "…"
+    return stripped
 
 
 # What a call to a remote MCP server can realistically fail with: the server
@@ -246,9 +253,14 @@ def raise_on_tool_error(
     """
     if not getattr(result, "is_error", False):
         return
-    text = _collect_text(getattr(result, "content", None) or [])
+    # The tool's own sentence, as the message and as the detail. It travels as
+    # the server wrote it: a refusal this caller has to act on -- a missing
+    # argument, a project key that does not exist -- is worth nothing paraphrased
+    # or with a word of it replaced, and the tool is the only thing that knows
+    # what it wanted.
+    text = _bounded(_collect_text(getattr(result, "content", None) or []))
     raise OperationExecutionValidationError(
-        "",
+        text,
         details={
             "provider": "mcp",
             "reason": "session_setup_failed" if during_setup else "tool_error",
@@ -256,7 +268,7 @@ def raise_on_tool_error(
             # detail allowlist lets through; for a setup step it is the step's
             # tool, which is the whole point of saying it.
             "operation_name": tool_name,
-            "upstream_message": redact_text(text)[:_UPSTREAM_MESSAGE_LIMIT],
+            "upstream_message": text,
         },
     )
 
@@ -321,14 +333,14 @@ class McpExecutor:
             # Belt and braces: `raise_on_error=False` covers the direct path,
             # but a transport that wraps a tool error still must not be read as
             # the server being down.
-            message = _flatten_message(exc)
+            message = _bounded(_flatten_message(exc))
             raise OperationExecutionValidationError(
-                "",
+                message,
                 details={
                     "provider": "mcp",
                     "reason": "tool_error",
                     "operation_name": tool_name,
-                    "upstream_message": redact_text(message)[:_UPSTREAM_MESSAGE_LIMIT],
+                    "upstream_message": message,
                 },
             ) from exc
         except (*_MCP_TRANSPORT_ERRORS, BaseExceptionGroup, RuntimeError) as exc:

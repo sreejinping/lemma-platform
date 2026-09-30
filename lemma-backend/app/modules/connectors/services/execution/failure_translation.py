@@ -18,8 +18,6 @@ from typing import Any
 
 import httpx
 
-from app.core.redaction import redact_text
-
 
 def _upstream_status(exc: Exception) -> int | None:
     """The provider's status code, however this exception happens to carry it.
@@ -66,40 +64,43 @@ def upstream_message(exc: Exception) -> str | None:
     expired" -- and dropping it left a caller with a status code and no way to
     tell those apart.
 
-    It goes through `redact_text` on the way, which is the same pass the log
-    pipeline already makes. It only matches token-shaped text, so a normal
-    provider error arrives unchanged; it is here for the gateway that echoes a
-    request header back in its error page.
+    It travels as it came. Rewriting it -- paraphrase, truncate to a summary, or
+    replace a token-shaped word inside it with `[REDACTED]` -- is how a caller
+    ends up with a sentence it cannot act on, and the caller here is often a
+    model that has to correct its own request. What stays bounded is the length,
+    because a provider may answer with a whole HTML page.
+
+    Two things that look like the provider's words are not. `httpx`'s own
+    sentence about a response is a status and the request URL, and a connector
+    authenticated by query parameter has its credential in that URL -- so an
+    empty body means there is nothing here that may leave, and the status
+    travels separately in `upstream_status`. And an exception with no status at
+    all is one of ours: its text would only leak how we are built.
     """
     body = _response_text(exc)
     if isinstance(body, str) and body.strip():
-        text = body
-    elif _upstream_status(exc) is not None:
-        # An executor raised it and attached the provider's status, so its
-        # message is the provider's answer rather than ours.
-        text = str(exc)
-    else:
-        # Nothing says this came from upstream, so it is one of ours and its
-        # text stays here. That is the whole distinction: a provider's error
-        # explains the failure, ours would only leak how we are built.
+        return bounded_upstream_text(body)
+    if isinstance(exc, httpx.HTTPError):
         return None
-    return redacted_upstream_text(text)
+    if _upstream_status(exc) is None:
+        return None
+    # Our executor raised it and attached the provider's status, so its message
+    # is built around the provider's answer rather than around ours.
+    return bounded_upstream_text(str(exc))
 
 
-def redacted_upstream_text(text: str | None) -> str | None:
-    """Provider text as it may leave the system: redacted, then bounded.
+def bounded_upstream_text(text: str | None) -> str | None:
+    """Provider text as it may leave the system: as it came, and bounded.
 
-    Shared with the vendored-package gateway, which reaches its own decision
-    about *whether* an exception carries the provider's answer -- its clients
-    do not attach a status code -- but must scrub and cap it the same way when
-    it does.
+    The bound is against a provider answering with an entire HTML error page,
+    not against what the provider said. Nothing here rewrites the text.
     """
     if not text or not text.strip():
         return None
-    redacted = redact_text(text.strip())
-    if len(redacted) > _UPSTREAM_MESSAGE_LIMIT:
-        redacted = redacted[:_UPSTREAM_MESSAGE_LIMIT] + "…"
-    return redacted
+    stripped = text.strip()
+    if len(stripped) > _UPSTREAM_MESSAGE_LIMIT:
+        stripped = stripped[:_UPSTREAM_MESSAGE_LIMIT] + "…"
+    return stripped
 
 
 def _upstream_details(exc: Exception) -> dict[str, Any]:
@@ -162,9 +163,10 @@ def _status_classified(exc: Exception):
         error_cls = OperationExecutionInfrastructureError
     if error_cls is None:
         return None
-    # The message is fixed by the error class; the exception's own text may
-    # carry provider request bodies or credentials and never travels.
-    return error_cls("", details=_upstream_details(exc))
+    # The provider's own words, which is what the caller needs to act on. Only
+    # the error classes that have somewhere better to put them use it; the rest
+    # fix their own sentence and let these words travel in the details.
+    return error_cls(upstream_message(exc) or "", details=_upstream_details(exc))
 
 
 @contextlib.contextmanager

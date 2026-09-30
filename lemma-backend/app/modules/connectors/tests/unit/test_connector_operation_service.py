@@ -624,9 +624,13 @@ async def test_execute_operation_keeps_the_status_an_executor_reported():
         # the several things a 404 might mean actually happened.
         "upstream_message": "GitHub said: Not Found for /repos/acme/crm",
     }
-    # The top-level message stays fixed and ours; the provider's words travel in
-    # the details, where they are scrubbed of anything secret-shaped.
+    # A 404 keeps the fixed top-level sentence -- only the validation error
+    # speaks with the provider's voice -- and the provider's own words travel in
+    # the details as the provider wrote them.
     assert "acme/crm" not in str(exc_info.value)
+    assert exc_info.value.details["upstream_message"] == (
+        "GitHub said: Not Found for /repos/acme/crm"
+    )
 
 
 class _BinaryResult(BaseModel):
