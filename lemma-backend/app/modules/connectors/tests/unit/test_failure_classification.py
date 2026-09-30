@@ -134,6 +134,31 @@ def test_a_provider_refusal_without_a_sentence_keeps_the_fixed_message():
     assert caught.value.message == "Connector rejected the operation request."
 
 
+def test_an_empty_body_does_not_carry_the_request_url_out_with_it():
+    """The one thing on this path that can leak a credential now that
+    `redact_text` is gone from it, and the reason it does not.
+
+    `httpx`'s own sentence about a response is a status and the *request URL* --
+    and a connector authenticated by query parameter has its credential in that
+    URL, which is ours rather than anything the provider said. With no body to
+    read, there is nothing here that may leave: the status travels in
+    `upstream_status` and the URL does not travel at all.
+    """
+    request = httpx.Request(
+        "POST", "https://provider.example/thing?api_key=sk-test-4f9a2b7c8d1e"
+    )
+    response = httpx.Response(422, request=request, text="")
+    with pytest.raises(OperationExecutionValidationError) as caught:
+        with execution_failures_translated():
+            raise httpx.HTTPStatusError("boom", request=request, response=response)
+
+    assert "sk-test-4f9a2b7c8d1e" not in caught.value.message
+    assert "sk-test-4f9a2b7c8d1e" not in str(caught.value.details)
+    assert "upstream_message" not in caught.value.details
+    assert caught.value.details["upstream_status"] == 422
+    assert caught.value.message == "Connector rejected the operation request."
+
+
 @pytest.fixture
 def refusing_server():
     """An in-memory MCP server whose tool refuses the call it is given.
