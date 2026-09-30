@@ -86,7 +86,8 @@ def test_a_misspelling_inside_the_body_is_left_to_the_provider():
     payload = {
         "owner": "octocat-owner",
         "repo": "hello-world-repo",
-        "body": {"titel": "Add a pull request title"},
+        # The misspelling is the fixture, not a mistake.
+        "body": {"titel": "Add a pull request title"},  # typos: ignore
     }
 
     assert describe_payload_mismatch(PULLS_CREATE, payload) is None
